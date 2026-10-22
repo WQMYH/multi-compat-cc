@@ -10,6 +10,7 @@ mod codex_editor;
 mod codex_login;
 pub(crate) mod codex_official_models;
 mod editor_toml;
+pub(crate) mod dsh_direct;
 mod endpoints;
 mod gemini_auth;
 pub(crate) mod gemini_direct;
@@ -74,8 +75,9 @@ fn desktop_needs_routing_error() -> AppError {
 }
 
 pub fn official_provider_supports_proxy_takeover(app_type: &AppType, provider: &Provider) -> bool {
-    matches!(app_type, AppType::Codex)
-        && crate::proxy::providers::is_codex_official_provider(provider)
+    (matches!(app_type, AppType::Codex)
+        && crate::proxy::providers::is_codex_official_provider(provider))
+        || (matches!(app_type, AppType::Dsh) && dsh_direct::needs_routing(provider))
 }
 
 /// 统一会话开关变更后，立即按新开关状态重写当前官方 Codex 供应商的选路（关键字段），
@@ -5607,6 +5609,7 @@ impl ProviderService {
         // 还没有当前供应商时这一家会被写进 live：和进入代理、切换互斥（同 `update`）。
         let _switch_guard = crate::mode::controller::lock_settled_blocking(state, &app_type)?;
 
+
         // Save to database
         state.db.save_provider(app_type.as_str(), &provider)?;
 
@@ -5646,6 +5649,12 @@ impl ProviderService {
                 }
                 AppType::GrokBuild => {
                     grok_direct::switch_to(state.db.as_ref(), None, &provider)?;
+                    return Ok(true);
+                }
+                AppType::Dsh => {
+                    if !crate::mode::current::is_proxy(&app_type) && !dsh_direct::needs_routing(&provider) {
+                        dsh_direct::switch_to(state.db.as_ref(), &provider)?;
+                    }
                     return Ok(true);
                 }
                 AppType::ClaudeDesktop => {
@@ -6305,6 +6314,9 @@ impl ProviderService {
                 is_direct_current,
             );
         }
+        if matches!(app_type, AppType::Dsh) && is_direct_current && !mode.is_proxy() && dsh_direct::needs_routing(&provider) {
+            return Err(AppError::Message("DSH_MANAGED_ACCOUNT_REQUIRES_ROUTING".into()));
+        }
         // Desktop 直连模式下正在用的这张卡改成了要经路由的（模型映射、托管账号）：直连写不
         // 进去，存了行也同步不到 Desktop。先进入路由模式再改。
         if matches!(app_type, AppType::ClaudeDesktop)
@@ -6688,6 +6700,10 @@ impl ProviderService {
         if matches!(app_type, AppType::ClaudeDesktop) {
             return Self::switch_desktop_direct(state, provider);
         }
+        if matches!(app_type, AppType::Dsh) {
+            dsh_direct::switch_to(state.db.as_ref(), provider)?;
+            return Ok(SwitchResult::default());
+        }
 
         // OMO ↔ OMO Slim are mutually exclusive; activating one removes the other's config file.
         if matches!(app_type, AppType::OpenCode) {
@@ -7010,7 +7026,7 @@ impl ProviderService {
 
         match app_type {
             AppType::Claude => Self::extract_claude_common_config(&provider.settings_config),
-            AppType::ClaudeDesktop => Ok(String::new()),
+            AppType::ClaudeDesktop | AppType::Dsh => Ok(String::new()),
             AppType::Codex => Self::extract_codex_common_config(&provider.settings_config),
             AppType::Gemini => Self::extract_gemini_common_config(&provider.settings_config),
             AppType::GrokBuild => Ok(String::new()),
@@ -7028,7 +7044,7 @@ impl ProviderService {
     ) -> Result<String, AppError> {
         match app_type {
             AppType::Claude => Self::extract_claude_common_config(settings_config),
-            AppType::ClaudeDesktop => Ok(String::new()),
+            AppType::ClaudeDesktop | AppType::Dsh => Ok(String::new()),
             AppType::Codex => Self::extract_codex_common_config(settings_config),
             AppType::Gemini => Self::extract_gemini_common_config(settings_config),
             AppType::GrokBuild => Ok(String::new()),
@@ -7668,9 +7684,10 @@ impl ProviderService {
         .await
     }
 
-    fn validate_provider_settings(app_type: &AppType, provider: &Provider) -> Result<(), AppError> {
+    pub(crate) fn validate_provider_settings(app_type: &AppType, provider: &Provider) -> Result<(), AppError> {
         icon::validate_icon(provider.icon.as_deref())?;
         match app_type {
+            AppType::Dsh => return dsh_direct::validate(provider),
             AppType::Claude => {
                 if !provider.settings_config.is_object() {
                     return Err(AppError::localized(
@@ -7883,6 +7900,7 @@ impl ProviderService {
                     })?;
                 Ok((api_key, base_url))
             }
+            AppType::Dsh => Err(AppError::Message("DSH_USAGE_CREDENTIAL_QUERY_UNSUPPORTED".into())),
             AppType::ClaudeDesktop => {
                 let credentials =
                     crate::claude_desktop_config::direct_gateway_credentials(provider)?;
@@ -8150,11 +8168,12 @@ impl ProviderService {
         // 获取统一供应商（用于删除生成的子供应商）
         let provider = state.db.get_universal_provider(id)?;
 
-        // 删除统一供应商
-        state.db.delete_universal_provider(id)?;
-
         // 删除生成的子供应商
         if let Some(p) = provider {
+            for app in ["qoder", "dsh"] {
+                if app == "dsh" { Self::delete(state, AppType::Dsh, &format!("universal-{app}-{id}"))?; }
+                else { crate::commands::delete_managed(state, app, &format!("universal-{app}-{id}")).map_err(AppError::Config)?; }
+            }
             if p.apps.claude {
                 let claude_id = format!("universal-claude-{id}");
                 let _ = state.db.delete_provider("claude", &claude_id);
@@ -8168,6 +8187,8 @@ impl ProviderService {
                 let _ = state.db.delete_provider("gemini", &gemini_id);
             }
         }
+
+        state.db.delete_universal_provider(id)?;
 
         Ok(true)
     }
@@ -8185,6 +8206,25 @@ impl ProviderService {
         // one broken config file must not prevent the other two apps from being
         // updated, but it must still be reported instead of returning success.
         let mut live_failures = Vec::new();
+
+        for (app, enabled) in [("qoder", provider.apps.qoder), ("dsh", provider.apps.dsh)] {
+            if enabled {
+                let mut child = provider.to_native_provider(app).ok_or_else(|| AppError::Message(format!("{app} 需要明确选择模型")))?;
+                Self::validate_provider_settings(&AppType::Codex, &child)?;
+                if let Some(existing) = state.db.get_provider_by_id(&child.id, app)? {
+                    child.created_at = existing.created_at;
+                    child.sort_index = existing.sort_index;
+                }
+                let update = state.db.get_provider_by_id(&child.id, app)?.is_some();
+                if app == "dsh" {
+                    if update { Self::update(state, AppType::Dsh, None, child)?; }
+                    else { Self::add(state, AppType::Dsh, child, false)?; }
+                } else { crate::commands::save_managed(state, app, &child, update).map_err(AppError::Config)?; }
+            } else {
+                if app == "dsh" { Self::delete(state, AppType::Dsh, &format!("universal-{app}-{id}"))?; }
+                else { crate::commands::delete_managed(state, app, &format!("universal-{app}-{id}")).map_err(AppError::Config)?; }
+            }
+        }
 
         // 同步到 Claude
         if let Some(mut claude_provider) = provider.to_claude_provider() {

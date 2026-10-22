@@ -50,10 +50,12 @@ import { usePiCurrentState } from "@/lib/query/pi";
 import { isHermesReadOnlyProvider } from "@/config/hermesProviderPresets";
 import {
   buildAdditiveSections,
+  buildNativeSections,
   buildSwitchSections,
   type CardPresentation,
   type ProviderSection,
   type SwitchModeInput,
+  isDshNativeRef,
 } from "@/components/providers/presentation";
 
 /** 切换式应用（Claude Code / Codex / Gemini CLI / Grok Build）的模式状态和动作，由供应商页传入。 */
@@ -308,6 +310,14 @@ export function ProviderList({
   }, [isSearchOpen, searchTerm, searchIndex, sortedProviders]);
 
   const sections = useMemo<ProviderSection[]>(() => {
+    if (appId === "qoder") {
+      return buildNativeSections(
+        filteredProviders,
+        onSwitch,
+        appId,
+        currentProviderId,
+      );
+    }
     if (switchMode) {
       // 队列按没过滤的全部供应商剔掉已不存在的 id：序号和上下移要按完整队列算，
       // 搜索只决定画哪些卡
@@ -419,7 +429,10 @@ export function ProviderList({
           appId={appId}
           onCreate={appId === "pi" ? undefined : onCreate}
           onImport={
-            appId === "pi" || appId === "mcode"
+            appId === "pi" ||
+            appId === "mcode" ||
+            appId === "qoder" ||
+            appId === "dsh"
               ? undefined
               : () => importMutation.mutate()
           }
@@ -430,6 +443,10 @@ export function ProviderList({
 
   // 「当前」只用来决定额度自动刷新：Pi 没有当前项，OMO / Hermes 各看自己的当前项
   const isCurrentFor = (provider: Provider) => {
+    if (appId === "dsh" && switchMode?.directIds)
+      return (
+        switchMode.active === "direct" && switchMode.directIds.has(provider.id)
+      );
     if (appId === "pi") return false;
     if (provider.category === "omo") return provider.id === currentOmoId;
     if (provider.category === "omo-slim")
@@ -448,13 +465,21 @@ export function ProviderList({
       isInConfig={isInConfig(provider)}
       onEdit={onEdit}
       onDelete={onDelete}
-      onDuplicate={onDuplicate}
+      onDuplicate={
+        appId === "dsh" && provider.settingsConfig.nativeRef
+          ? undefined
+          : onDuplicate
+      }
       onConfigureUsage={
         onConfigureUsage ? (item) => onConfigureUsage(item) : () => undefined
       }
       onOpenWebsite={onOpenWebsite}
       onOpenTerminal={onOpenTerminal}
-      onTest={handleTest}
+      onTest={
+        appId === "dsh" && provider.settingsConfig.nativeRef
+          ? undefined
+          : handleTest
+      }
       isTesting={isChecking(provider.id)}
     />
   );
@@ -605,7 +630,7 @@ interface SortableProviderCardProps {
   isInConfig: boolean;
   onEdit: (provider: Provider) => void;
   onDelete: (provider: Provider) => void;
-  onDuplicate: (provider: Provider) => void;
+  onDuplicate?: (provider: Provider) => void;
   onConfigureUsage: (provider: Provider) => void;
   onOpenWebsite: (url: string) => void;
   onOpenTerminal?: (provider: Provider) => void;
@@ -614,6 +639,7 @@ interface SortableProviderCardProps {
 }
 
 function SortableProviderCard(props: SortableProviderCardProps) {
+  const nativeRef = props.appId === "dsh" && isDshNativeRef(props.provider);
   const {
     setNodeRef,
     attributes,
@@ -621,7 +647,13 @@ function SortableProviderCard(props: SortableProviderCardProps) {
     transform,
     transition,
     isDragging,
-  } = useSortable({ id: props.provider.id });
+  } = useSortable({
+    id: props.provider.id,
+    disabled:
+      nativeRef ||
+      (props.appId === "qoder" &&
+        props.provider.id.startsWith("native-current:")),
+  });
 
   const style: CSSProperties = {
     transform: CSS.Translate.toString(transform),
@@ -634,7 +666,9 @@ function SortableProviderCard(props: SortableProviderCardProps) {
     <div ref={setNodeRef} style={style}>
       <ProviderCard
         {...props}
-        dragHandleProps={{ attributes, listeners, isDragging }}
+        dragHandleProps={
+          nativeRef ? undefined : { attributes, listeners, isDragging }
+        }
       />
     </div>
   );

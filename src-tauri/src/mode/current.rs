@@ -58,7 +58,17 @@ pub fn provider_for(
             return Ok(Some(route.id));
         }
     }
-    crate::settings::get_effective_current_provider(db, app)
+    let direct = crate::settings::get_effective_current_provider(db, app)?;
+    if *app == AppType::Dsh {
+        if let Some(id) = &direct {
+            if db.get_provider_by_id(id, app.as_str())?
+                .is_some_and(|provider| crate::services::provider::dsh_direct::needs_routing(&provider))
+            {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(direct)
 }
 
 /// 正在用的那一行（见 [`Purpose::InUse`]）。

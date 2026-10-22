@@ -13,6 +13,12 @@ const authState = vi.hoisted(() => ({
 const toastMocks = vi.hoisted(() => ({
   error: vi.fn(),
 }));
+const qoderModelFetch = vi.hoisted(() => vi.fn());
+
+vi.mock("@/lib/api/model-fetch", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/api/model-fetch")>()),
+  fetchCodexOauthModels: qoderModelFetch,
+}));
 
 vi.mock("sonner", () => ({
   toast: {
@@ -162,7 +168,208 @@ describe("ProviderForm Codex Official managed account", () => {
   beforeEach(() => {
     authState.codexReauthRequired = false;
     toastMocks.error.mockReset();
+    qoderModelFetch.mockReset();
   });
+
+  it("fetches Qoder BYOK model choices from the explicitly selected managed account", async () => {
+    Element.prototype.scrollIntoView = vi.fn();
+    qoderModelFetch.mockResolvedValue([
+      { id: "gpt-6.1-sol", ownedBy: "OpenAI" },
+    ]);
+    const onSubmit = vi.fn();
+    render(
+      <QueryClientProvider client={createTestQueryClient()}>
+        <ProviderForm
+          appId="qoder"
+          submitLabel="save-provider"
+          onSubmit={onSubmit}
+          onCancel={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /OpenAI Official/ }));
+    const fetchModels = screen.getByRole("button", {
+      name: /fetchModels|获取模型列表/,
+    });
+    fireEvent.click(fetchModels);
+    expect(qoderModelFetch).not.toHaveBeenCalled();
+    fireEvent.click(
+      screen.getByRole("button", { name: "select-managed-account" }),
+    );
+    fireEvent.click(fetchModels);
+    await waitFor(() =>
+      expect(qoderModelFetch).toHaveBeenCalledWith("acct-managed"),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: /Select model|选择模型|searchModelAriaLabel/,
+      }),
+    );
+    fireEvent.click(await screen.findByRole("option", { name: "gpt-6.1-sol" }));
+    expect(screen.getByRole("textbox", { name: "默认模型" })).toHaveValue(
+      "gpt-6.1-sol",
+    );
+    expect(onSubmit).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "save-provider" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce());
+    expect(
+      JSON.parse(onSubmit.mock.calls[0][0].settingsConfig).config,
+    ).toContain('model = "gpt-6.1-sol"');
+    expect(JSON.parse(onSubmit.mock.calls[0][0].settingsConfig).auth).toEqual(
+      {},
+    );
+  });
+
+  it("discards in-flight Qoder model choices when their managed account is cleared", async () => {
+    let resolveModels!: (models: { id: string; ownedBy: string }[]) => void;
+    qoderModelFetch.mockReturnValue(
+      new Promise((resolve) => {
+        resolveModels = resolve;
+      }),
+    );
+    render(
+      <QueryClientProvider client={createTestQueryClient()}>
+        <ProviderForm
+          appId="qoder"
+          submitLabel="save-provider"
+          onSubmit={vi.fn()}
+          onCancel={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /OpenAI Official/ }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "select-managed-account" }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: /fetchModels|获取模型列表/ }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "invalidate-selected-account" }),
+    );
+    resolveModels([{ id: "stale-account-model", ownedBy: "OpenAI" }]);
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: /fetchModels|获取模型列表/ }),
+      ).not.toBeDisabled(),
+    );
+    expect(
+      screen.queryByRole("button", {
+        name: /Select model|选择模型|searchModelAriaLabel/,
+      }),
+    ).not.toBeInTheDocument();
+  });
+
+  it.each(["qoder", "dsh"] as const)(
+    "reuses the existing managed account chooser for %s without another login",
+    async (appId) => {
+      const onSubmit = vi.fn();
+      render(
+        <QueryClientProvider client={createTestQueryClient()}>
+          <ProviderForm
+            appId={appId}
+            submitLabel="save-provider"
+            onSubmit={onSubmit}
+            onCancel={vi.fn()}
+          />
+        </QueryClientProvider>,
+      );
+      fireEvent.click(screen.getByRole("button", { name: /OpenAI Official/ }));
+      fireEvent.click(screen.getByRole("button", { name: "save-provider" }));
+      await waitFor(() =>
+        expect(toastMocks.error).toHaveBeenCalledWith(
+          appId === "qoder"
+            ? "请先选择 Qoder BYOK 默认模型"
+            : "请先选择 DSH 默认模型",
+        ),
+      );
+      expect(onSubmit).not.toHaveBeenCalled();
+      fireEvent.change(screen.getByRole("textbox", { name: "默认模型" }), {
+        target: { value: "gpt-6.1-sol" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "save-provider" }));
+      await waitFor(() =>
+        expect(toastMocks.error).toHaveBeenCalledWith(
+          "请先选择 CC 已托管的 Codex 账号",
+        ),
+      );
+      expect(onSubmit).not.toHaveBeenCalled();
+      fireEvent.click(
+        await screen.findByRole("button", { name: "select-managed-account" }),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "save-provider" }));
+      await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce());
+      const value = onSubmit.mock.calls[0][0] as ProviderFormValues;
+      expect(value.meta?.authBinding?.accountId).toBe("acct-managed");
+      expect(JSON.parse(value.settingsConfig).auth).toEqual({});
+      expect(JSON.parse(value.settingsConfig).config).toContain(
+        'model = "gpt-6.1-sol"',
+      );
+    },
+  );
+
+  it("does not offer an ambient Codex login for Qoder BYOK", () => {
+    render(
+      <QueryClientProvider client={createTestQueryClient()}>
+        <ProviderForm
+          appId="qoder"
+          submitLabel="save-provider"
+          onSubmit={vi.fn()}
+          onCancel={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /OpenAI Official/ }));
+    expect(
+      screen.queryByRole("button", { name: "select-native-login" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByTestId("allow-unbound-without-status"),
+    ).toHaveTextContent("false");
+  });
+
+  it.each(["qoder", "dsh"] as const)(
+    "repairs an existing %s managed account row with no model through the shared editor",
+    async (appId) => {
+      const onSubmit = vi.fn();
+      render(
+        <QueryClientProvider client={createTestQueryClient()}>
+          <ProviderForm
+            appId={appId}
+            providerId={`existing-${appId}`}
+            submitLabel="save-provider"
+            onSubmit={onSubmit}
+            onCancel={vi.fn()}
+            initialData={{
+              name: `Existing ${appId} account`,
+              category: "official",
+              settingsConfig: { auth: {}, config: "" },
+              meta: {
+                providerType: "codex_oauth",
+                authBinding: {
+                  source: "managed_account",
+                  authProvider: "codex_oauth",
+                  accountId: "acct-managed",
+                },
+              },
+            }}
+          />
+        </QueryClientProvider>,
+      );
+      fireEvent.change(
+        await screen.findByRole("textbox", { name: "默认模型" }),
+        { target: { value: "gpt-6.1-sol" } },
+      );
+      fireEvent.click(screen.getByRole("button", { name: "save-provider" }));
+      await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce());
+      const submitted = onSubmit.mock.calls[0][0] as ProviderFormValues;
+      expect(submitted.meta?.authBinding?.accountId).toBe("acct-managed");
+      expect(JSON.parse(submitted.settingsConfig).auth).toEqual({});
+      expect(JSON.parse(submitted.settingsConfig).config).toContain(
+        'model = "gpt-6.1-sol"',
+      );
+    },
+  );
 
   it("persists the selected managed account while stripping OAuth secrets", async () => {
     const onSubmit = vi.fn();

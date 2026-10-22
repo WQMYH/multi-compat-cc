@@ -87,7 +87,7 @@ export function AddProviderDialog({
     };
   }, []);
   const stepState = useMemo<PresetStepState>(
-    () => ({ appId, step, setStep, host: pickerHost, registerSelector }),
+    () => ({ appId: appId === "qoder" || appId === "dsh" ? "codex" : appId, step, setStep, host: pickerHost, registerSelector }),
     [appId, step, pickerHost, registerSelector],
   );
   const [universalFormOpen, setUniversalFormOpen] = useState(false);
@@ -324,7 +324,7 @@ export function AddProviderDialog({
                 preset.endpointCandidates.forEach(addUrl);
               }
             }
-          } else if (appId === "codex") {
+          } else if (appId === "codex" || appId === "qoder" || appId === "dsh") {
             const presets = codexProviderPresets;
             const presetIndex = parseInt(values.presetId.replace("codex-", ""));
             if (
@@ -381,7 +381,7 @@ export function AddProviderDialog({
           if (env?.ANTHROPIC_BASE_URL) {
             addUrl(env.ANTHROPIC_BASE_URL);
           }
-        } else if (appId === "codex") {
+        } else if (appId === "codex" || appId === "qoder" || appId === "dsh") {
           const config = parsedConfig.config as string | undefined;
           if (config) {
             const extractedBaseUrl = extractCodexBaseUrl(config);
@@ -580,6 +580,7 @@ export function AddProviderDialog({
           onClose={handleUniversalFormClose}
           onSave={handleUniversalProviderSave}
           initialPreset={selectedUniversalPreset}
+          targetApp={appId === "qoder" || appId === "dsh" ? appId : undefined}
         />
       )}
 

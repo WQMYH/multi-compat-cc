@@ -15,6 +15,8 @@ export const APP_DISPLAY_NAME: Record<AppId, string> = {
   hermes: "Hermes",
   pi: "Pi",
   mcode: "MiniMax Code",
+  qoder: "Qoder CN",
+  dsh: "DSH",
 };
 
 const APP_ICON_NAME: Record<AppId, string> = {
@@ -28,6 +30,8 @@ const APP_ICON_NAME: Record<AppId, string> = {
   hermes: "hermes",
   pi: "pi",
   mcode: "minimax",
+  qoder: "qwen",
+  dsh: "deepseek",
 };
 
 // Claude Code 和 Claude Desktop 用同一个图标，靠右下角的小角标区分终端与桌面

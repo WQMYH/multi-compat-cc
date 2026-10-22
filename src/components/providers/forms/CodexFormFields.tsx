@@ -66,6 +66,7 @@ import {
   type CopilotModel,
 } from "@/lib/api/copilot";
 import {
+  fetchCodexOauthModels,
   fetchModelsForConfig,
   fetchXaiOauthModels,
   modelFetchRequestHeaders,
@@ -628,6 +629,8 @@ export function CodexFormFields({
     isCopilotAuthenticated,
     selectedGitHubAccountId,
     localProxyHeadersOverride,
+    isCodexOauthPreset,
+    selectedCodexAccountId,
     isXaiOauthPreset,
     isXaiOauthAuthenticated,
     selectedXaiAccountId,
@@ -806,6 +809,22 @@ export function CodexFormFields({
   );
 
   const handleFetchModels = useCallback(() => {
+    if (appId === "qoder" && isCodexOauthPreset) {
+      if (!selectedCodexAccountId) {
+        toast.error(
+          t("providerForm.dshManagedAccountRequired", {
+            defaultValue: "请先选择 CC 已托管的 Codex 账号",
+          }),
+        );
+        return;
+      }
+      runModelFetch(
+        () => fetchCodexOauthModels(selectedCodexAccountId),
+        receiveFetchedModels,
+        "[CodexOAuth] Failed to fetch models:",
+      );
+      return;
+    }
     if (isCopilotPreset) {
       if (!isCopilotAuthenticated) {
         toast.error(
@@ -916,6 +935,9 @@ export function CodexFormFields({
       "[ModelFetch] Failed:",
     );
   }, [
+    appId,
+    isCodexOauthPreset,
+    selectedCodexAccountId,
     runModelFetch,
     receiveFetchedModels,
     codexBaseUrl,
@@ -1864,20 +1886,32 @@ export function CodexFormFields({
   // 默认模型 —— config.toml 顶层 model，Codex 启动时默认请求的模型。实时写回 TOML；留空则删行。
   // 有模型列表时第一行就是它，不显示这个框（Grok Build 没有列表，一直显示）；列表为空时
   // 两种布局都显示，聚合模式下发布的就是它。
-  const defaultModelField = category !== "official" &&
+  const defaultModelField = (category !== "official" ||
+    appId === "dsh" ||
+    appId === "qoder") &&
     onModelChange &&
     (!firstRowIsDefault || catalogRows.length === 0) && (
       <div className="space-y-1.5">
         {labelWithHelp(
           t("codexConfig.defaultModelLabel", { defaultValue: "默认模型" }),
-          isGrokBuild
-            ? t("grokBuild.defaultModelHint", {
-                defaultValue: "Grok Build 默认请求的模型，随时可改。",
-              })
-            : t("codexConfig.defaultModelHint", {
+          appId === "qoder"
+            ? t("providerForm.qoderByokModelHint", {
                 defaultValue:
-                  "Codex 默认请求的模型。添加模型列表后，列表第一行就是默认模型。",
-              }),
+                  "同步到 Qoder 的 BYOK 供应商内默认模型；桌面全局模型仍由 Qoder 原生选择器决定。",
+              })
+            : appId === "dsh"
+              ? t("providerForm.dshDefaultModelHint", {
+                  defaultValue:
+                    "DSH 新会话使用的默认模型，请选择当前供应商或托管账号支持的模型。",
+                })
+              : isGrokBuild
+                ? t("grokBuild.defaultModelHint", {
+                    defaultValue: "Grok Build 默认请求的模型，随时可改。",
+                  })
+                : t("codexConfig.defaultModelHint", {
+                    defaultValue:
+                      "Codex 默认请求的模型。添加模型列表后，列表第一行就是默认模型。",
+                  }),
           "codexDefaultModel",
         )}
         <div className="flex gap-1">
@@ -1897,7 +1931,7 @@ export function CodexFormFields({
             className="flex-1"
           />
           {/* 有模型列表时用列表上的「获取模型列表」，这里不再放一个。 */}
-          {!canEditCatalog && (
+          {(!canEditCatalog || (appId === "qoder" && isCodexOauthPreset)) && (
             <HoverTip content={t("providerForm.fetchModels")}>
               <Button
                 aria-label={t("providerForm.fetchModels")}

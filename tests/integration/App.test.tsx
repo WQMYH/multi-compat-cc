@@ -10,6 +10,7 @@ import {
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { http, HttpResponse } from "msw";
 import { providersApi } from "@/lib/api/providers";
+import { qoderAuthApi } from "@/lib/api/qoderAuth";
 import {
   resetProviderState,
   setCurrentProviderId,
@@ -21,6 +22,7 @@ import { server } from "../msw/server";
 
 const toastSuccessMock = vi.fn();
 const toastErrorMock = vi.fn();
+const toastInfoMock = vi.fn();
 const skillsPanelMocks = vi.hoisted(() => ({
   initialViews: [] as string[],
 }));
@@ -29,6 +31,7 @@ vi.mock("sonner", () => ({
   toast: {
     success: (...args: unknown[]) => toastSuccessMock(...args),
     error: (...args: unknown[]) => toastErrorMock(...args),
+    info: (...args: unknown[]) => toastInfoMock(...args),
   },
 }));
 
@@ -210,10 +213,77 @@ describe("App integration with MSW", () => {
     resetProviderState();
     toastSuccessMock.mockReset();
     toastErrorMock.mockReset();
+    toastInfoMock.mockReset();
     skillsPanelMocks.initialViews = [];
     localStorage.removeItem("cc-switch-last-view");
     localStorage.removeItem("cc-switch-last-app");
   });
+
+  it("source23 opens current Qoder CLI only from its explicit application menu action", async () => {
+    const openCli = vi
+      .spyOn(qoderAuthApi, "openCli")
+      .mockResolvedValue(undefined);
+    localStorage.setItem("cc-switch-last-app", "qoder");
+    const { default: App } = await import("@/App");
+    renderApp(App);
+    expect(openCli).not.toHaveBeenCalled();
+    fireEvent.keyDown(
+      screen.getByRole("button", { name: "appPage.moreActions", hidden: true }),
+      { key: "Enter" },
+    );
+    fireEvent.click(
+      await screen.findByRole("menuitem", {
+        name: "settings.qoderAuth.openCli",
+        hidden: true,
+      }),
+    );
+    await waitFor(() => expect(openCli).toHaveBeenCalledTimes(1));
+    expect(openCli).toHaveBeenCalledWith();
+    expect(toastInfoMock).toHaveBeenCalledWith(
+      "settings.qoderAuth.nativeCliRequested",
+    );
+    expect(toastErrorMock).not.toHaveBeenCalled();
+    openCli.mockRestore();
+  }, 15000);
+
+  it("source23 reports CLI launch failure without retrying or offering it for Codex", async () => {
+    const openCli = vi
+      .spyOn(qoderAuthApi, "openCli")
+      .mockRejectedValue("QODER_SDK_RUNTIME_AMBIGUOUS");
+    localStorage.setItem("cc-switch-last-app", "qoder");
+    const { default: App } = await import("@/App");
+    renderApp(App);
+    fireEvent.keyDown(
+      screen.getByRole("button", { name: "appPage.moreActions", hidden: true }),
+      { key: "Enter" },
+    );
+    fireEvent.click(
+      await screen.findByRole("menuitem", {
+        name: "settings.qoderAuth.openCli",
+        hidden: true,
+      }),
+    );
+    await waitFor(() =>
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "settings.qoderAuth.cliOpenFailed",
+        { description: "QODER_SDK_RUNTIME_AMBIGUOUS" },
+      ),
+    );
+    expect(openCli).toHaveBeenCalledTimes(1);
+    expect(toastInfoMock).not.toHaveBeenCalled();
+    fireEvent.click(sidebarApp("Codex"));
+    fireEvent.keyDown(
+      screen.getByRole("button", { name: "appPage.moreActions", hidden: true }),
+      { key: "Enter" },
+    );
+    expect(
+      screen.queryByRole("menuitem", {
+        name: "settings.qoderAuth.openCli",
+        hidden: true,
+      }),
+    ).not.toBeInTheDocument();
+    openCli.mockRestore();
+  }, 15000);
 
   it("covers basic provider flows via real hooks", async () => {
     const { default: App } = await import("@/App");

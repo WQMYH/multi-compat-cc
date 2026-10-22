@@ -39,6 +39,7 @@ import { useProviderActions } from "@/hooks/useProviderActions";
 import { openclawKeys, useOpenClawHealth } from "@/hooks/useOpenClaw";
 import { hermesKeys, useOpenHermesWebUI } from "@/hooks/useHermes";
 import { hermesApi } from "@/lib/api/hermes";
+import { qoderAuthApi } from "@/lib/api/qoderAuth";
 import type { ProviderEditorSave } from "@/lib/api/providers";
 import { useProxyStatus } from "@/hooks/useProxyStatus";
 import { useUsageCacheBridge } from "@/hooks/useUsageCacheBridge";
@@ -132,7 +133,12 @@ import OpenClawHealthBanner from "@/components/openclaw/OpenClawHealthBanner";
 import HermesMemoryPanel, {
   HermesMemorySaveButton,
 } from "@/components/hermes/HermesMemoryPanel";
-import { APP_IDS, DEFAULT_VISIBLE_APPS, isModeAppId } from "@/config/appConfig";
+import {
+  APP_IDS,
+  DEFAULT_VISIBLE_APPS,
+  isModeAppId,
+  isNativeProviderApp,
+} from "@/config/appConfig";
 
 interface SyncStatusUpdatedPayload {
   source?: string;
@@ -158,6 +164,16 @@ function App() {
   const [activeApp, setActiveApp] = useState<AppId>(getInitialApp);
   const sharedFeatureApp = sharedFeatureAppOf(activeApp);
   const [currentView, setCurrentView] = useState<View>(readStoredView);
+  useEffect(() => {
+    void invoke<boolean>("native_application_preview_mode")
+      .then((readonly) => {
+        if (readonly) {
+          setActiveApp("dsh");
+          setCurrentView("providers");
+        }
+      })
+      .catch(() => undefined);
+  }, []);
   const [settingsSection, setSettingsSection] =
     useState<SettingsSection>("general");
   const [appConfigScrollTarget, setAppConfigScrollTarget] = useState<AppId>();
@@ -227,7 +243,7 @@ function App() {
     if (!settingsData || providersPrefetchedRef.current) return;
     providersPrefetchedRef.current = true;
     for (const app of APP_IDS) {
-      if (app !== activeApp && visibleApps[app]) {
+      if (app !== activeApp && visibleApps[app] && !isNativeProviderApp(app)) {
         void queryClient.prefetchQuery(providersQueryOptions(app));
       }
     }
@@ -588,7 +604,7 @@ function App() {
   useEffect(() => {
     const checkEnvOnSwitch = async () => {
       try {
-        if (activeApp === "mcode") return;
+        if (activeApp === "mcode" || isNativeProviderApp(activeApp)) return;
         const conflicts = await checkEnvConflicts(activeApp);
 
         if (conflicts.length > 0) {
@@ -692,7 +708,11 @@ function App() {
     }
     setCurrentView(page);
   };
-  useTrayAppPageSeen(currentView === "providers" ? activeApp : null);
+  useTrayAppPageSeen(
+    currentView === "providers" && !isNativeProviderApp(activeApp)
+      ? activeApp
+      : null,
+  );
 
   useTrayNavigation((navigation) => {
     const navigate = () => {
@@ -1100,7 +1120,28 @@ function App() {
         </DropdownMenuTrigger>
       </HoverTip>
       <DropdownMenuContent align="end" className="min-w-[180px]">
-        <DropdownMenuItem onSelect={() => openPage("sessions")}>
+        {activeApp === "qoder" && (
+          <DropdownMenuItem
+            onSelect={() => {
+              void qoderAuthApi
+                .openCli()
+                .then(() => {
+                  toast.info(t("settings.qoderAuth.nativeCliRequested"));
+                })
+                .catch((error) => {
+                  toast.error(t("settings.qoderAuth.cliOpenFailed"), {
+                    description: extractErrorMessage(error) || undefined,
+                  });
+                });
+            }}
+          >
+            {t("settings.qoderAuth.openCli")}
+          </DropdownMenuItem>
+        )}
+        <DropdownMenuItem
+          disabled={isNativeProviderApp(activeApp)}
+          onSelect={() => openPage("sessions")}
+        >
           {t("appPage.viewSessions")}
         </DropdownMenuItem>
         {activeUsageApp && (
@@ -1113,7 +1154,10 @@ function App() {
             {t("appPage.viewUsage")}
           </DropdownMenuItem>
         )}
-        <DropdownMenuItem onSelect={() => openSettings("appConfig", activeApp)}>
+        <DropdownMenuItem
+          disabled={isNativeProviderApp(activeApp)}
+          onSelect={() => openSettings("appConfig", activeApp)}
+        >
           {t("appPage.configDirectory")}
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={() => openPage("apps")}>
@@ -1152,6 +1196,7 @@ function App() {
       actions={
         <>
           {currentView === "providers" &&
+            !isNativeProviderApp(activeApp) &&
             activeApp !== "mcode" &&
             (settingsData?.showProfileSwitcher ?? false) && (
               <ProfileSwitcher activeApp={activeApp} />
@@ -1243,11 +1288,20 @@ function App() {
 
   const listCallbacks = {
     onEdit: (provider: Provider) => {
+      if (isNativeProviderApp(activeApp) && provider.id.startsWith("native-current:")) {
+        toast.info("这是原生配置的只读识别结果，不是额外添加的供应商。");
+        return;
+      }
       setFormModeView(currentModeView);
       setEditingProvider(provider);
     },
-    onDelete: (provider: Provider) =>
-      setConfirmAction({ provider, action: "delete" }),
+    onDelete: (provider: Provider) => {
+      if (isNativeProviderApp(activeApp) && provider.id.startsWith("native-current:")) {
+        toast.info("保留原生配置；检测项不能从 CC 删除。");
+        return;
+      }
+      setConfirmAction({ provider, action: "delete" });
+    },
     onDuplicate: handleDuplicateProvider,
     onConfigureUsage: setUsageProvider,
     onOpenWebsite: handleOpenWebsite,
@@ -1570,28 +1624,30 @@ function App() {
         </main>
       </div>
 
-      <AddProviderDialog
-        open={isAddOpen}
-        onOpenChange={setIsAddOpen}
-        appId={activeApp}
-        onSubmit={addProvider}
-        modeView={formModeView}
-      />
+      <>
+          <AddProviderDialog
+            open={isAddOpen}
+            onOpenChange={setIsAddOpen}
+            appId={activeApp}
+            onSubmit={addProvider}
+            modeView={formModeView}
+          />
 
-      <EditProviderDialog
-        open={Boolean(editingProvider)}
-        provider={effectiveEditingProvider}
-        onOpenChange={(open) => {
-          if (!open) {
-            setEditingProvider(null);
-          }
-        }}
-        onSubmit={handleEditProvider}
-        appId={activeApp}
-        isProxyTakeover={isCurrentAppTakeoverActive}
-        isCurrent={effectiveEditingProvider?.id === currentProviderId}
-        modeView={formModeView}
-      />
+          <EditProviderDialog
+            open={Boolean(editingProvider)}
+            provider={effectiveEditingProvider}
+            onOpenChange={(open) => {
+              if (!open) {
+                setEditingProvider(null);
+              }
+            }}
+            onSubmit={handleEditProvider}
+            appId={activeApp}
+            isProxyTakeover={isCurrentAppTakeoverActive}
+            isCurrent={effectiveEditingProvider?.id === currentProviderId}
+            modeView={formModeView}
+          />
+      </>
 
       {effectiveUsageProvider && (
         <UsageScriptModal

@@ -395,7 +395,7 @@ impl tokio::io::AsyncWrite for ProxyStream {
 /// When `proxy_url` is provided, establishes an HTTP CONNECT tunnel through
 /// the proxy first, then performs TLS + raw write through the tunnel.
 /// This preserves header casing even when an upstream proxy is configured.
-async fn send_raw_request(
+pub(super) async fn send_raw_request(
     uri: &http::Uri,
     method: &http::Method,
     headers: &http::HeaderMap,

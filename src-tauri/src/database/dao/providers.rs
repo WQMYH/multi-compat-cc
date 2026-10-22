@@ -515,6 +515,25 @@ impl Database {
         Ok(())
     }
 
+    // The catalog fetch must not overwrite a provider/account edited while it awaited HTTP.
+    pub(crate) fn cache_dsh_model_catalog(
+        &self,
+        expected: &Provider,
+        catalog: &serde_json::Value,
+    ) -> Result<bool, AppError> {
+        let mut meta = expected.meta.clone().unwrap_or_default();
+        std::mem::take(&mut meta.custom_endpoints);
+        let conn = lock_conn!(self.conn);
+        let changed = conn.execute(
+            "UPDATE providers SET settings_config = json_insert(settings_config, '$.modelCatalog', json(?1))
+             WHERE app_type = 'dsh' AND id = ?2 AND settings_config = ?3 AND meta = ?4
+               AND json_type(settings_config, '$.modelCatalog') IS NULL",
+            params![catalog.to_string(), expected.id, expected.settings_config.to_string(),
+                serde_json::to_string(&meta).map_err(|e| AppError::Database(e.to_string()))?],
+        ).map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(changed == 1)
+    }
+
     pub fn add_custom_endpoint(
         &self,
         app_type: &str,

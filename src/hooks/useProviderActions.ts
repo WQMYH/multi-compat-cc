@@ -215,6 +215,34 @@ export function useProviderActions(
 
       try {
         const result = await switchProviderMutation.mutateAsync(provider.id);
+        if (activeApp === "qoder") {
+          const readbackUnknown = result?.warnings?.includes(
+            "QODER_BYOK_RECONCILED_SELECTION_UNKNOWN",
+          );
+          const readback =
+            readbackUnknown ||
+            result?.warnings?.includes("QODER_BYOK_RECONCILED");
+          if (readback) {
+            toast.success(t("notifications.qoderReadback"), {
+              description: t(
+                readbackUnknown
+                  ? "notifications.qoderReadbackUnknown"
+                  : "notifications.qoderReadbackKnown",
+              ),
+              duration: 8000,
+            });
+            return;
+          }
+          toast.success("Qoder BYOK 已同步", {
+            description: result?.warnings
+              ?.map((w) =>
+                w.replace(/^QODER_BYOK_PROVIDER_DEFAULT_SYNCED: /, ""),
+              )
+              .join("\n"),
+            duration: 8000,
+          });
+          return;
+        }
         await syncClaudePlugin(provider);
 
         // Surface switch warnings by code — a generic "backfill failed"

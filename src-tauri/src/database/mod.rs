@@ -94,6 +94,18 @@ fn register_db_change_hook(conn: &Connection) {
 }
 
 impl Database {
+    pub(crate) fn open_preview() -> Result<Self, AppError> {
+        let conn = Connection::open_with_flags(
+            get_app_config_dir().join("cc-switch.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|error| AppError::Database(error.to_string()))?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+            log_count_cache: Mutex::new(None),
+        })
+    }
+
     /// 初始化数据库连接并创建表
     ///
     /// 数据库文件位于 `~/.cc-switch/cc-switch.db`

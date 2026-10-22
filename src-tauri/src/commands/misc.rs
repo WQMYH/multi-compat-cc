@@ -170,8 +170,8 @@ pub struct ToolVersion {
     update_blocked_by_node: Option<tool_node_requirement::NodeRequirementGap>,
 }
 
-const VALID_TOOLS: [&str; 9] = [
-    "claude", "codex", "gemini", "grok", "opencode", "openclaw", "hermes", "pi", "mcode",
+const VALID_TOOLS: [&str; 11] = [
+    "claude", "codex", "gemini", "grok", "opencode", "openclaw", "hermes", "pi", "mcode", "qodercn", "dsh",
 ];
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -626,6 +626,8 @@ fn tool_display_name(tool: &str) -> &'static str {
         "hermes" => "Hermes",
         "pi" => "Pi",
         "mcode" => "MiniMax Code",
+        "qodercn" => "Qoder CN",
+        "dsh" => "DSH",
         _ => "Unknown",
     }
 }
@@ -840,6 +842,8 @@ fn npm_install_command_for(tool: &str) -> Option<&'static str> {
         "opencode" => Some("npm i -g opencode-ai@latest"),
         "openclaw" => Some("npm i -g openclaw@latest"),
         "pi" => Some("npm i -g @earendil-works/pi-coding-agent@latest"),
+        "qodercn" => Some("npm i -g @qodercn-ai/qoderclicn@latest"),
+        "dsh" => Some("npm i -g @deepseek-ai/dsh@latest"),
         "mcode" => Some(
             "npm i -g @minimax-ai/code@latest --ignore-scripts=false --include=optional \"--allow-scripts=@minimax-ai/code,better-sqlite3\"",
         ),
@@ -1212,6 +1216,8 @@ async fn get_single_tool_version_impl(
             fetch_npm_latest_for_tool(&client, "@earendil-works/pi-coding-agent", tool, local).await
         }
         "mcode" => fetch_npm_latest_for_tool(&client, "@minimax-ai/code", tool, local).await,
+        "qodercn" => fetch_npm_latest_for_tool(&client, "@qodercn-ai/qoderclicn", tool, local).await,
+        "dsh" => fetch_npm_latest_for_tool(&client, "@deepseek-ai/dsh", tool, local).await,
         _ => None,
     };
 
@@ -2325,7 +2331,7 @@ fn merge_path_segments_win(parts: &[&str]) -> String {
 /// 构建某工具的候选搜索目录（原生安装优先，PATH 兜底）。
 /// 单探兜底 (`scan_cli_version`) 与全量枚举 (`enumerate_tool_installations`) 共用，
 /// 确保两条路径看到的是同一组安装位置。
-fn build_tool_search_paths(tool: &str) -> Vec<std::path::PathBuf> {
+pub(super) fn build_tool_search_paths(tool: &str) -> Vec<std::path::PathBuf> {
     let home = dirs::home_dir().unwrap_or_default();
 
     // 常见的安装路径（原生安装优先）
@@ -2866,7 +2872,7 @@ fn login_shell_path() -> Option<String> {
 /// 用与 `try_get_version` 相同的登录 shell 解析 PATH 默认命中的可执行文件路径，
 /// canonicalize 后作为"命令行默认 / 升级目标"的锚点（与升级会作用的那处对齐）。
 #[cfg(not(target_os = "windows"))]
-fn resolve_path_default(
+pub(super) fn resolve_path_default(
     tool: &str,
     deadline: Option<CommandDeadline>,
 ) -> Result<Option<std::path::PathBuf>, String> {
@@ -2931,7 +2937,7 @@ fn windows_path_lookup_command(
 }
 
 #[cfg(target_os = "windows")]
-fn resolve_path_default(
+pub(super) fn resolve_path_default(
     tool: &str,
     deadline: Option<CommandDeadline>,
 ) -> Result<Option<std::path::PathBuf>, String> {
@@ -3120,6 +3126,8 @@ fn npm_package_for(tool: &str) -> Option<&'static str> {
         "openclaw" => Some("openclaw"),
         "pi" => Some("@earendil-works/pi-coding-agent"),
         "mcode" => Some("@minimax-ai/code"),
+        "qodercn" => Some("@qodercn-ai/qoderclicn"),
+        "dsh" => Some("@deepseek-ai/dsh"),
         _ => None,
     }
 }
@@ -3804,7 +3812,7 @@ fn default_install(installs: &[ToolInstallation]) -> Option<&ToolInstallation> {
     })
 }
 
-fn locate_default_tool(
+pub(super) fn locate_default_tool(
     tool: &str,
     deadline: Option<CommandDeadline>,
 ) -> Result<std::path::PathBuf, String> {
@@ -3841,13 +3849,13 @@ fn locate_default_tool(
 }
 
 #[derive(Clone, Copy)]
-struct CommandDeadline {
+pub(super) struct CommandDeadline {
     expires_at: std::time::Instant,
     limit: std::time::Duration,
 }
 
 impl CommandDeadline {
-    fn from_timeout(timeout: Option<std::time::Duration>) -> Option<Self> {
+    pub(super) fn from_timeout(timeout: Option<std::time::Duration>) -> Option<Self> {
         timeout.map(|limit| Self {
             expires_at: std::time::Instant::now() + limit,
             limit,
@@ -3888,7 +3896,7 @@ fn terminate_child_tree(child: &mut std::process::Child) -> bool {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn isolate_child_process_group(cmd: &mut std::process::Command) {
+pub(super) fn isolate_child_process_group(cmd: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
 
     // setsid 而非 process_group(0)：新会话自带新进程组（组长=自身，
@@ -3908,7 +3916,7 @@ fn isolate_child_process_group(cmd: &mut std::process::Command) {
     }
 }
 
-fn wait_child_output(
+pub(super) fn wait_child_output(
     mut child: std::process::Child,
     deadline: Option<CommandDeadline>,
 ) -> Result<std::process::Output, String> {
@@ -5418,17 +5426,16 @@ fn run_windows_start_command_with_env(
     terminal_name: &str,
     envs: &[(&str, &str)],
 ) -> Result<(), String> {
-    let output = windows_start_command(args, envs, &effective_path_string())
-        .output()
+    // Captured pipes may be inherited by the terminal and stay open after `start` exits.
+    let status = windows_start_command(args, envs, &effective_path_string())
+        .status()
         .map_err(|e| format!("启动 {} 失败: {e}", terminal_name))?;
 
-    if !output.status.success() {
-        let stderr = decode_command_output(&output.stderr);
+    if !status.success() {
         return Err(format!(
-            "{} 启动失败 (exit code: {:?}): {}",
+            "{} 启动失败 (exit code: {:?})",
             terminal_name,
-            output.status.code(),
-            stderr
+            status.code(),
         ));
     }
 
@@ -5959,6 +5966,56 @@ mod tests {
             "{restored:?}"
         );
         assert_eq!(std::env::var_os("PATH"), parent_path);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn source24_terminal_launch_does_not_wait_for_running_or_cancelled_child() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use std::{sync::mpsc, time::{Duration, Instant}};
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("ready");
+        let release = root.path().join("cancel");
+        let exited = root.path().join("exited");
+        let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "''"));
+        let script = format!(
+            "$ErrorActionPreference='Stop'; [IO.File]::WriteAllText({},'ready'); $clock=[Diagnostics.Stopwatch]::StartNew(); while (!(Test-Path -LiteralPath {}) -and $clock.Elapsed.TotalSeconds -lt 15) {{ Start-Sleep -Milliseconds 20 }}; [IO.File]::WriteAllText({},'130'); exit 130",
+            quote(&ready), quote(&release), quote(&exited),
+        );
+        let encoded = STANDARD.encode(script.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>());
+        let shell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let (tx, rx) = mpsc::channel();
+        let launcher = std::thread::spawn(move || {
+            let result = run_windows_start_command_with_env(
+                &["", "/B", shell.to_str().unwrap(), "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded],
+                "synthetic terminal", &[],
+            );
+            let _ = tx.send(result);
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() && Instant::now() < deadline { std::thread::sleep(Duration::from_millis(20)); }
+        let returned = rx.recv_timeout(Duration::from_secs(2));
+        let alive_before_cancel = ready.exists() && !exited.exists();
+        // Release even on RED so a failed assertion cannot strand the synthetic child.
+        std::fs::write(&release, "cancel").unwrap();
+        launcher.join().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !exited.exists() && Instant::now() < deadline { std::thread::sleep(Duration::from_millis(20)); }
+        assert!(alive_before_cancel, "fixture must still be running when launch returns");
+        assert!(matches!(returned, Ok(Ok(()))), "launch must return before terminal exit: {returned:?}");
+        assert_eq!(std::fs::read_to_string(exited).unwrap(), "130");
+        assert!(!root.path().join("settings.json").exists());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn source24_terminal_launch_preserves_launcher_failure_status() {
+        let failure = run_windows_start_command_with_env(
+            &["/CC_SWITCH_SOURCE24_INVALID_OPTION"],
+            "synthetic failure", &[],
+        ).unwrap_err();
+        assert!(failure.contains("synthetic failure") && failure.contains("exit code"), "{failure}");
     }
 
     #[cfg(target_os = "windows")]

@@ -99,6 +99,11 @@
     "windowClose": "關閉視窗"
   },
   "provider": {
+    "dshNativeDefault": "原生預設",
+    "dshDeepseekApi": "DeepSeek 官方 API",
+    "dshDeepseekAccount": "DeepSeek 平台帳號",
+    "nativeManagedReadOnly": "由原生應用管理；可在此選擇，帳號憑證在 DSH 中編輯。",
+    "nativeDefaultsReadFailed": "無法讀取 DSH 預設模型",
     "connectivityCheck": "檢測連通",
     "tabProvider": "供應商",
     "tabUniversal": "通用供應商",
@@ -293,6 +298,9 @@
     }
   },
   "notifications": {
+    "qoderReadback": "Qoder BYOK 目錄已讀回",
+    "qoderReadbackUnknown": "目前設定相符；保留原請求記錄，未重新寫入。桌面目前選擇的關聯尚未確認。",
+    "qoderReadbackKnown": "目前設定相符；保留原請求記錄，未重新寫入。桌面預設及執行中的對話未變更。",
     "providerAdded": "供應商已新增",
     "providerSaved": "供應商設定已儲存",
     "providerDeleted": "供應商刪除成功",
@@ -384,6 +392,11 @@
     }
   },
   "settings": {
+    "qoderAuth": {
+      "openCli": "開啟官方帳號 CLI",
+      "nativeCliRequested": "已要求開啟官方 CLI。請在終端輸入 /login 完成登入，使用 /status 核實後再手動同步供應商；不會自動登入或切換桌面帳號。",
+      "cliOpenFailed": "無法開啟 Qoder 官方 CLI"
+    },
     "title": "設定",
     "general": {
       "appearance": "外觀",
@@ -1552,6 +1565,11 @@
     "openReleaseNotesFailed": "開啟更新日誌失敗："
   },
   "providerForm": {
+    "dshDefaultModelHint": "DSH 新對話使用的預設模型，請選擇目前供應商或託管帳號支援的模型。",
+    "dshDefaultModelRequired": "請先選擇 DSH 預設模型",
+    "qoderByokModelRequired": "請先選擇 Qoder BYOK 預設模型",
+    "qoderByokModelHint": "同步至 Qoder 的 BYOK 供應商內預設模型；桌面全域模型仍由 Qoder 原生選擇器決定。",
+    "dshManagedAccountRequired": "請先選擇 CC 已託管的 Codex 帳號",
     "supplierName": "供應商名稱",
     "supplierNameRequired": "供應商名稱 *",
     "supplierNamePlaceholder": "例如：Anthropic 官方",
@@ -4281,6 +4299,7 @@
       "exitTitle": "把 {{app}} 從「{{from}}」切回直連？",
       "exitLead": "{{app}} 會直接連線 {{provider}}，請求不再經過 CC Switch。",
       "exitNoteFile": "會把 {{file}} 裡的位址和金鑰改回 {{provider}} 的，其他設定不動。",
+      "exitNoteNativeSelection": "在 {{file}} 恢復各端的 {{provider}} 預設選擇；憑證與歷史保留在原位置。",
       "exitNoteRouteKept": "路由目標、故障轉移佇列和設定都會保留，下次開始路由時恢復。",
       "desktopExitNoteRouteKept": "路由目標會保留，下次開始路由時恢復。",
       "confirmDirect": "回到直連",

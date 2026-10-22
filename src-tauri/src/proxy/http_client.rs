@@ -294,6 +294,35 @@ fn base_builder() -> reqwest::ClientBuilder {
         .no_zstd()
 }
 
+/// A single-dispatch proxy client must not follow redirects or replay protocol NACKs.
+pub(crate) fn single_dispatch_client_for(url: &str) -> Result<Client, String> {
+    let mut builder = base_builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never());
+    if let Some(proxy) = proxy_url_for(url) {
+        builder = builder
+            .no_proxy()
+            .proxy(reqwest::Proxy::all(&proxy).map_err(|_| "Invalid upstream proxy".to_string())?);
+    } else if is_loopback_url(url) || system_proxy_points_to_loopback() {
+        builder = builder.no_proxy();
+    }
+    builder
+        .build()
+        .map_err(|_| "Failed to build upstream client".to_string())
+}
+
+/// Explicit-proxy variant for the single-dispatch Qoder transport.
+pub(super) fn single_dispatch_proxy_client(proxy_url: &str) -> Result<Client, String> {
+    let proxy = reqwest::Proxy::all(proxy_url).map_err(|_| "Invalid upstream proxy".to_string())?;
+    base_builder()
+        .no_proxy()
+        .proxy(proxy)
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .build()
+        .map_err(|_| "Failed to build upstream client".to_string())
+}
+
 /// 构建 HTTP 客户端
 fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
     let mut builder = base_builder();

@@ -73,6 +73,10 @@ export interface ClaudeDesktopDefaultRoute {
 }
 
 export const providersApi = {
+  async getDshNativeDefaults(): Promise<Provider[]> {
+    return invoke("get_dsh_native_defaults");
+  },
+
   async getAll(appId: AppId): Promise<Record<string, Provider>> {
     return await invoke("get_providers", { app: appId });
   },

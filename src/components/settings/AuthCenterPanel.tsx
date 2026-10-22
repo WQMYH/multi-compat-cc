@@ -15,7 +15,7 @@ interface AuthCenterPanelProps {
 }
 
 /**
- * 授权中心（v7 Auth 画板）：GitHub Copilot、ChatGPT、xAI 三组账号，一组一张卡片。
+ * 授权中心：托管订阅账号，一组一张卡片。
  * 侧栏的「授权中心」页和供应商表单里「管理账号」打开的全屏页共用。
  */
 export function AuthCenterPanel({

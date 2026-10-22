@@ -1,4 +1,4 @@
-// 前端统一使用 AppId 作为应用标识（与后端命令参数 `app` 一致）
+// 应用导航标识；Qoder/DSH 使用各自原生 RPC，不传给文件投影型 provider 命令。
 export type AppId =
   | "claude"
   | "claude-desktop"
@@ -9,4 +9,6 @@ export type AppId =
   | "openclaw"
   | "hermes"
   | "pi"
-  | "mcode";
+  | "mcode"
+  | "qoder"
+  | "dsh";

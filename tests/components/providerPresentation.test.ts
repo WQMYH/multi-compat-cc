@@ -4,6 +4,7 @@ import type { Provider } from "@/types";
 import type { AppMode } from "@/types/proxy";
 import {
   buildAdditiveSections,
+  buildNativeSections,
   buildSwitchSections,
   queueMoveSortUpdates,
   type ProviderSection,
@@ -25,6 +26,49 @@ const provider = (id: string, overrides: Partial<Provider> = {}): Provider => ({
 const official = provider("official", { category: "official" });
 const relay = provider("relay");
 const backup = provider("backup");
+
+describe("native default and explicitly added provider presentation", () => {
+  it("does not describe detected defaults as imported, removable or already applied entries", () => {
+    const sections = buildNativeSections(
+      [provider("native-current:desktop"), provider("extra")],
+      vi.fn(),
+    );
+    expect(sections[0].title).toBe("当前默认 · 1");
+    expect(sections[0].items[0].presentation.buttons).toEqual([]);
+    expect(sections[0].items[0].presentation.deleteDisabledReason).toBeTruthy();
+    expect(sections[1].title).toBe("已添加 · 1");
+    expect(sections[1].items[0].provider.id).toBe("extra");
+    expect(sections.every((section) => !section.help)).toBe(true);
+    expect(
+      sections[1].items[0].presentation.buttons[0].disabledReason,
+    ).toContain("官方 SDK");
+  });
+  it("exposes DSH apply through the shared switch action and protects the read-back current provider", () => {
+    const apply = vi.fn();
+    const sections = buildNativeSections(
+      [provider("extra")],
+      apply,
+      "dsh",
+      "extra",
+    );
+    const row = sections[1].items[0];
+    expect(row.presentation.buttons[0].disabledReason).toBeUndefined();
+    row.presentation.buttons[0].onClick?.();
+    expect(apply).toHaveBeenCalledWith(row.provider);
+    expect(row.presentation.status?.label).toBe("当前默认");
+    expect(row.presentation.deleteDisabledReason).toBeTruthy();
+  });
+  it("routes Qoder BYOK sync through the shared action without claiming a desktop default switch", () => {
+    const sync = vi.fn();
+    const row = buildNativeSections([provider("extra")], sync, "qoder")[1]
+      .items[0];
+    expect(row.presentation.buttons[0].label).toBe("同步 BYOK");
+    expect(row.presentation.buttons[0].disabledReason).toBeUndefined();
+    expect(row.presentation.status).toBeUndefined();
+    row.presentation.buttons[0].onClick();
+    expect(sync).toHaveBeenCalledWith(row.provider);
+  });
+});
 /** Claude 下走 OpenAI 格式：需要路由 */
 const converted = provider("converted", { meta: { apiFormat: "openai_chat" } });
 
@@ -77,6 +121,42 @@ const button = (sections: ProviderSection[], id: string, key: string) => {
   return found;
 };
 
+it("uses common in-use and switch actions for each DSH profile rather than a configured status", () => {
+  const desktop = provider("native-current:desktop", {
+    settingsConfig: { nativeRef: true, profile: "desktop" },
+  });
+  const web = provider("native-current:web", {
+    settingsConfig: { nativeRef: true, profile: "web" },
+  });
+  const { input } = build({
+    app: "dsh",
+    active: "direct",
+    view: "direct",
+    providers: [desktop, web, relay],
+    directId: null,
+  });
+  const nativeInput = { ...input, directIds: new Set([desktop.id, web.id]) };
+  const native = buildSwitchSections(nativeInput);
+  expect(item(native, desktop.id).status?.label).toBe(
+    "providerCard.status.inUse",
+  );
+  expect(item(native, web.id).status?.label).toBe("providerCard.status.inUse");
+  button(native, relay.id, "switch").onClick();
+  expect(input.actions.switchDirect).toHaveBeenCalledWith(relay);
+  const managed = buildSwitchSections({
+    ...nativeInput,
+    directId: relay.id,
+    directIds: new Set([relay.id]),
+  });
+  expect(item(managed, relay.id).status?.label).toBe(
+    "providerCard.status.inUse",
+  );
+  expect(item(managed, desktop.id).status).toBeUndefined();
+  expect(item(managed, web.id).status).toBeUndefined();
+  button(managed, desktop.id, "switch").onClick();
+  expect(input.actions.switchDirect).toHaveBeenCalledWith(desktop);
+});
+
 /** 「更多」菜单里的「设为默认」 */
 const setDefaultItem = (sections: ProviderSection[], id: string) => {
   const found = item(sections, id).menuItems?.find(
@@ -85,6 +165,53 @@ const setDefaultItem = (sections: ProviderSection[], id: string) => {
   if (!found) throw new Error(`no setDefault menu item on ${id}`);
   return found;
 };
+
+describe("DSH identity chips", () => {
+  it.each(["direct", "route", "stack"] as const)(
+    "keeps actual identity and routing requirements visible in %s without duplicate chips",
+    (mode) => {
+      const nativeApi = provider("native-api", { category: "official" });
+      const managed = provider("managed", {
+        category: "official",
+        meta: {
+          providerType: "codex_oauth",
+          authBinding: {
+            source: "managed_account",
+            authProvider: "codex_oauth",
+            accountId: "fixture-account",
+          },
+        },
+      });
+      const { sections } = build({
+        app: "dsh",
+        active: mode,
+        view: mode,
+        providers: [nativeApi, managed],
+        directId: nativeApi.id,
+        routeId: managed.id,
+        stackMembers: new Map([
+          [nativeApi.id, 2],
+          [managed.id, 1],
+        ]),
+      });
+      const managedKeys = item(sections, managed.id).chips.map(
+        (chip) => chip.key,
+      );
+      expect(managedKeys.filter((key) => key === "official")).toHaveLength(1);
+      expect(managedKeys.filter((key) => key === "needsRoute")).toHaveLength(1);
+      expect(
+        item(sections, nativeApi.id).chips.filter(
+          (chip) => chip.key === "official",
+        ),
+      ).toHaveLength(1);
+      expect(
+        item(sections, nativeApi.id).chips.some(
+          (chip) => chip.key === "needsRoute",
+        ),
+      ).toBe(false);
+    },
+  );
+});
 
 describe("buildSwitchSections — direct", () => {
   it("marks the direct provider in use and asks before switching to one that needs routing", () => {

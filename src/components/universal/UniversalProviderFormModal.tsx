@@ -25,6 +25,7 @@ interface UniversalProviderFormModalProps {
   onSaveAndSync?: (provider: UniversalProvider) => void;
   editingProvider?: UniversalProvider | null;
   initialPreset?: UniversalProviderPreset | null;
+  targetApp?: "qoder" | "dsh";
 }
 
 export function UniversalProviderFormModal({
@@ -34,6 +35,7 @@ export function UniversalProviderFormModal({
   onSaveAndSync,
   editingProvider,
   initialPreset,
+  targetApp,
 }: UniversalProviderFormModalProps) {
   const isDarkMode = useDarkMode();
   const { t } = useTranslation();
@@ -53,6 +55,8 @@ export function UniversalProviderFormModal({
   const [claudeEnabled, setClaudeEnabled] = useState(true);
   const [codexEnabled, setCodexEnabled] = useState(true);
   const [geminiEnabled, setGeminiEnabled] = useState(true);
+  const [qoderEnabled, setQoderEnabled] = useState(false);
+  const [dshEnabled, setDshEnabled] = useState(false);
 
   // 模型配置
   const [models, setModels] = useState<UniversalProviderModels>({});
@@ -74,6 +78,8 @@ export function UniversalProviderFormModal({
       setClaudeEnabled(editingProvider.apps.claude);
       setCodexEnabled(editingProvider.apps.codex);
       setGeminiEnabled(editingProvider.apps.gemini);
+      setQoderEnabled(editingProvider.apps.qoder ?? false);
+      setDshEnabled(editingProvider.apps.dsh ?? false);
       setModels(editingProvider.models || {});
 
       // 尝试匹配预设
@@ -90,12 +96,14 @@ export function UniversalProviderFormModal({
       setApiKey("");
       setWebsiteUrl(defaultPreset.websiteUrl || "");
       setNotes("");
-      setClaudeEnabled(defaultPreset.defaultApps.claude);
-      setCodexEnabled(defaultPreset.defaultApps.codex);
-      setGeminiEnabled(defaultPreset.defaultApps.gemini);
+      setClaudeEnabled(!targetApp && defaultPreset.defaultApps.claude);
+      setCodexEnabled(!targetApp && defaultPreset.defaultApps.codex);
+      setGeminiEnabled(!targetApp && defaultPreset.defaultApps.gemini);
+      setQoderEnabled(targetApp === "qoder");
+      setDshEnabled(targetApp === "dsh");
       setModels(deepClone(defaultPreset.defaultModels));
     }
-  }, [editingProvider, initialPreset, isOpen]);
+  }, [editingProvider, initialPreset, isOpen, targetApp]);
 
   // 选择预设
   const handlePresetSelect = useCallback(
@@ -103,18 +111,20 @@ export function UniversalProviderFormModal({
       setSelectedPreset(preset);
       if (!isEditMode) {
         setName(preset.name);
-        setClaudeEnabled(preset.defaultApps.claude);
-        setCodexEnabled(preset.defaultApps.codex);
-        setGeminiEnabled(preset.defaultApps.gemini);
+        setClaudeEnabled(!targetApp && preset.defaultApps.claude);
+        setCodexEnabled(!targetApp && preset.defaultApps.codex);
+        setGeminiEnabled(!targetApp && preset.defaultApps.gemini);
+        setQoderEnabled(targetApp === "qoder");
+        setDshEnabled(targetApp === "dsh");
         setModels(deepClone(preset.defaultModels));
       }
     },
-    [isEditMode],
+    [isEditMode, targetApp],
   );
 
   // 更新模型配置
   const updateModel = useCallback(
-    (app: "claude" | "codex" | "gemini", field: string, value: string) => {
+    (app: "claude" | "codex" | "gemini" | "qoder" | "dsh", field: string, value: string) => {
       setModels((prev) => ({
         ...prev,
         [app]: {
@@ -203,6 +213,8 @@ requires_openai_auth = true`;
             claude: claudeEnabled,
             codex: codexEnabled,
             gemini: geminiEnabled,
+            qoder: qoderEnabled,
+            dsh: dshEnabled,
           },
           models,
         }
@@ -220,6 +232,8 @@ requires_openai_auth = true`;
         claude: claudeEnabled,
         codex: codexEnabled,
         gemini: geminiEnabled,
+        qoder: qoderEnabled,
+        dsh: dshEnabled,
       };
       provider.models = models;
       provider.websiteUrl = websiteUrl.trim() || undefined;
@@ -238,6 +252,8 @@ requires_openai_auth = true`;
     claudeEnabled,
     codexEnabled,
     geminiEnabled,
+    qoderEnabled,
+    dshEnabled,
     models,
     selectedPreset,
     onSave,
@@ -262,6 +278,8 @@ requires_openai_auth = true`;
             claude: claudeEnabled,
             codex: codexEnabled,
             gemini: geminiEnabled,
+            qoder: qoderEnabled,
+            dsh: dshEnabled,
           },
           models,
         }
@@ -279,6 +297,8 @@ requires_openai_auth = true`;
         claude: claudeEnabled,
         codex: codexEnabled,
         gemini: geminiEnabled,
+        qoder: qoderEnabled,
+        dsh: dshEnabled,
       };
       provider.models = models;
       provider.websiteUrl = websiteUrl.trim() || undefined;
@@ -296,6 +316,8 @@ requires_openai_auth = true`;
     claudeEnabled,
     codexEnabled,
     geminiEnabled,
+    qoderEnabled,
+    dshEnabled,
     models,
     selectedPreset,
   ]);
@@ -521,6 +543,24 @@ requires_openai_auth = true`;
           <Label>
             {t("universalProvider.modelConfig", { defaultValue: "模型配置" })}
           </Label>
+
+          {(["qoder", "dsh"] as const).map((app) => {
+            const enabled = app === "qoder" ? qoderEnabled : dshEnabled;
+            const setEnabled = app === "qoder" ? setQoderEnabled : setDshEnabled;
+            return (
+              <div key={app} className="space-y-3 rounded-lg border p-4">
+                <div className="flex items-center justify-between">
+                  <Label>{app === "qoder" ? "Qoder CN" : "DSH"}</Label>
+                  <Switch checked={enabled} onCheckedChange={setEnabled} />
+                </div>
+                {enabled && <div className="space-y-1">
+                  <Label>{t("universalProvider.model", { defaultValue: "模型" })}</Label>
+                  <Input value={models[app]?.model ?? ""}
+                    onChange={(event) => updateModel(app, "model", event.target.value)} />
+                </div>}
+              </div>
+            );
+          })}
 
           {/* Claude 模型 */}
           {claudeEnabled && (

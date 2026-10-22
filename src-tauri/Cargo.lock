@@ -795,6 +795,7 @@ dependencies = [
  "png 0.18.1",
  "regex",
  "reqwest 0.12.28",
+ "ring",
  "rquickjs",
  "rusqlite",
  "rust_decimal",

@@ -35,6 +35,7 @@ mod prompt;
 mod prompt_files;
 mod provider;
 mod proxy;
+mod qoder_gateway;
 mod services;
 mod session_manager;
 mod settings;
@@ -426,6 +427,9 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init())
         // 拦截窗口关闭：根据设置决定是否最小化到托盘
         .on_window_event(|window, event| {
+            if readonly_provider_preview() {
+                return;
+            }
             // 托盘面板自己处理关闭（只隐藏），不走主窗口的「最小化到托盘 / 退出」
             if window.label() == tray_panel::PANEL_LABEL {
                 return;
@@ -478,6 +482,24 @@ pub fn run() {
 
             // 预先刷新 Store 覆盖配置，确保后续路径读取正确（日志/数据库等）
             app_store::refresh_app_config_dir_override(app.handle());
+            if readonly_provider_preview() {
+                // Show the real managed catalog without startup migrations, takeover or sync.
+                let state = AppState::new(Arc::new(Database::open_preview()?));
+                app.manage(commands::CodexOAuthState(state.codex_oauth_manager.clone()));
+                app.manage(commands::CopilotAuthState(Arc::new(tokio::sync::RwLock::new(
+                    crate::proxy::providers::copilot_auth::CopilotAuthManager::new(crate::config::get_app_config_dir()),
+                ))));
+                app.manage(commands::XaiOAuthState(Arc::new(tokio::sync::RwLock::new(
+                    crate::proxy::providers::xai_oauth_auth::XaiOAuthManager::new(crate::config::get_app_config_dir()),
+                ))));
+                app.manage(state);
+                if let Some(window) = app.get_webview_window("main") {
+                    window.set_title("CC Switch · 供应商复用初验（只读）")?;
+                    window.show()?;
+                    window.set_focus()?;
+                }
+                return Ok(());
+            }
             panic_hook::init_app_config_dir(crate::config::get_app_config_dir());
 
             // 初始化日志（输出到 <app_config_dir>/logs/cc-switch.log）
@@ -1240,6 +1262,13 @@ pub fn run() {
                 log::info!("✓ XaiOAuthManager initialized");
             }
 
+            // Public plan registrations never borrow native Codex credentials or defaults.
+            app.manage(commands::ChatgptPlanAuthState(
+                crate::proxy::providers::chatgpt_plan_auth::accounts::PlanAccounts::open(
+                    crate::config::get_app_config_dir().join("chatgpt_plan_auth.json"),
+                ),
+            ));
+
             // 初始化全局出站代理 HTTP 客户端
             {
                 let db = &app.state::<AppState>().db;
@@ -1432,7 +1461,8 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
+        .invoke_handler({
+            let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
             commands::get_providers,
             commands::get_current_provider,
             commands::add_provider,
@@ -1782,6 +1812,28 @@ pub fn run() {
             commands::auth_poll_for_account,
             commands::auth_cancel_login,
             commands::auth_list_accounts,
+            commands::qoder_auth_list_profiles,
+            commands::qoder_auth_detect_runtime,
+            commands::native_application_status,
+            commands::get_dsh_native_defaults,
+            commands::native_application_select_provider,
+            commands::native_application_preview_mode,
+            commands::chatgpt_plan_status,
+            commands::chatgpt_plan_start_login,
+            commands::chatgpt_plan_cancel_login,
+            commands::chatgpt_plan_select,
+            commands::chatgpt_plan_sign_out,
+            commands::qoder_auth_save_profile,
+            commands::qoder_auth_select_profile,
+            commands::qoder_auth_remove_profile,
+            commands::qoder_auth_verify_profile,
+            commands::qoder_auth_open_cli,
+            commands::qoder_gateway_status,
+            commands::qoder_gateway_save,
+            commands::qoder_gateway_select,
+            commands::qoder_gateway_remove,
+            commands::qoder_gateway_prepare_key,
+            commands::qoder_gateway_plan_models,
             commands::auth_get_status,
             commands::auth_remove_account,
             commands::auth_set_default_account,
@@ -1823,13 +1875,29 @@ pub fn run() {
             commands::enter_lightweight_mode,
             commands::exit_lightweight_mode,
             commands::is_lightweight_mode,
-        ]);
+          ];
+          move |invoke: tauri::ipc::Invoke<tauri::Wry>| {
+            if readonly_provider_preview() && (
+                !readonly_preview_command(invoke.message.command())
+                || (matches!(invoke.message.command(), "auth_list_accounts" | "auth_get_status")
+                    && !matches!(invoke.message.payload(), tauri::ipc::InvokeBody::Json(body)
+                        if body.get("authProvider").and_then(serde_json::Value::as_str) == Some("codex_oauth")))
+            ) {
+                invoke.resolver.reject("READONLY_PREVIEW_NO_SIDE_EFFECTS");
+                return true;
+            }
+            handler(invoke)
+          }
+        });
 
     let app = builder
         .build(tauri::generate_context!())
         .expect("error while running tauri application");
 
     app.run(|app_handle, event| {
+        if readonly_provider_preview() {
+            return;
+        }
         // 处理退出请求（所有平台）
         if let RunEvent::ExitRequested { api, code, .. } = &event {
             match classify_exit_request(*code) {
@@ -2225,6 +2293,47 @@ enum ExitRequestAction {
 }
 
 /// 收到过重启请求。重启时 Tauri 也会发 `RunEvent::Exit`，靠它跳过系统终止那条清理。
+pub(crate) fn readonly_provider_preview() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var_os("CC_SWITCH_READONLY_PREVIEW").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+}
+
+fn readonly_preview_command(command: &str) -> bool {
+    matches!(
+        command,
+        "get_providers"
+            | "get_dsh_native_defaults"
+            | "queryProviderUsage"
+            | "get_current_provider"
+            | "get_settings"
+            | "get_app_config_dir_override"
+            | "get_init_error"
+            | "get_custom_icons"
+            | "get_proxy_status"
+            | "get_proxy_config"
+            | "get_proxy_config_for_app"
+            | "get_app_mode"
+            | "get_app_mode_config"
+            | "get_startup_attach_failures"
+            | "get_app_modes"
+            | "get_usage_cache"
+            | "get_profile_list"
+            | "list_profiles"
+            | "provider_editor_view"
+            | "get_common_config_snippet"
+            | "get_config_snippet"
+            | "auth_list_accounts"
+            | "auth_get_status"
+            | "copilot_list_accounts"
+            | "get_app_config_dir"
+            | "is_portable_mode"
+            | "get_tool_versions"
+            | "native_application_status"
+            | "native_application_preview_mode"
+    )
+}
+
 static RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 fn classify_exit_request(code: Option<i32>) -> ExitRequestAction {

@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { http, HttpResponse } from "msw";
+import i18n from "i18next";
 import { toast } from "sonner";
 import type { Provider } from "@/types";
 import type { ModeAppId } from "@/config/appConfig";
@@ -24,6 +25,11 @@ vi.mock("sonner", () => ({
 vi.mock("@/components/providers/ProviderCard", () => ({
   ProviderCard: ({ provider, presentation }: any) => (
     <div data-testid={`card-${provider.id}`}>
+      {presentation.status && (
+        <span data-testid={`status-${provider.id}`}>
+          {presentation.status.label}
+        </span>
+      )}
       {presentation.buttons.map((button: any) => (
         <button
           key={button.key}
@@ -110,6 +116,321 @@ beforeEach(() => {
   vi.mocked(toast.success).mockClear();
   // jsdom 没有 scrollIntoView，确认框里的下拉打开时会调
   Element.prototype.scrollIntoView = vi.fn();
+});
+
+describe("SwitchModePanel — DSH native default", () => {
+  it.each([false, true])(
+    "keeps the common CC current provider when native observation fails instead of trusting cached native status (cached directory %s)",
+    async (cachedDirectory) => {
+      mockMode("direct", null, "api-a");
+      const api = provider("api-a");
+      const native = (profile: string): Provider => ({
+        ...provider(`native-current:${profile}`),
+        category: "official",
+        settingsConfig: {
+          nativeRef: true,
+          profile,
+          provider: "deepseek-official",
+          model: "deepseek-flash",
+          nativeIsCurrent: true,
+        },
+      });
+      const desktop = native("desktop"),
+        web = native("web");
+      server.use(
+        http.post(`${TAURI_ENDPOINT}/get_dsh_native_defaults`, () =>
+          HttpResponse.json("DSH_NODE_NOT_FOUND", { status: 500 }),
+        ),
+      );
+      const { queryClient } = renderPanel("dsh", {
+        [api.id]: api,
+        [desktop.id]: desktop,
+        [web.id]: web,
+      });
+      if (cachedDirectory)
+        queryClient.setQueryData(
+          ["providers", "dsh", "nativeDefaults"],
+          [desktop, web],
+        );
+      await screen.findByText("provider.nativeDefaultsReadFailed");
+      expect(await screen.findByTestId("status-api-a")).toHaveTextContent(
+        "providerCard.status.inUse",
+      );
+      expect(screen.getByTestId(`switch-${desktop.id}`)).toBeEnabled();
+      expect(screen.getByTestId(`switch-${web.id}`)).toBeEnabled();
+      expect(
+        screen.queryByTestId(`status-${desktop.id}`),
+      ).not.toBeInTheDocument();
+    },
+  );
+
+  it.each([null, "managed"])(
+    "names both native targets at the public exit CTA when directId is %s",
+    async (directId) => {
+      const user = userEvent.setup();
+      mockMode("route", "managed", directId);
+      const managed: Provider = {
+        ...provider("managed"),
+        meta: {
+          authBinding: {
+            source: "managed_account",
+            authProvider: "codex_oauth",
+            accountId: "fixture",
+          },
+        },
+      };
+      const native = (profile: string, name: string): Provider => ({
+        ...provider(`native-current:${profile}`),
+        name,
+        category: "official",
+        settingsConfig: {
+          nativeRef: true,
+          profile,
+          provider: `fixture-${profile}`,
+          model: "native-model",
+          nativeIsCurrent: false,
+        },
+      });
+      const writes = vi.fn();
+      server.use(
+        http.post(`${TAURI_ENDPOINT}/get_dsh_native_defaults`, () =>
+          HttpResponse.json([
+            native("desktop", "Native Desktop"),
+            native("web", "Native Web"),
+          ]),
+        ),
+        http.post(`${TAURI_ENDPOINT}/set_proxy_takeover_for_app`, () => {
+          writes();
+          return HttpResponse.json(null);
+        }),
+      );
+      const previous = i18n.getResource(
+        "zh",
+        "translation",
+        "mode.dialog.exitLead",
+      );
+      i18n.addResource(
+        "zh",
+        "translation",
+        "mode.dialog.exitLead",
+        "Using {{provider}}",
+      );
+      const previousNote = i18n.getResource(
+        "zh",
+        "translation",
+        "mode.dialog.exitNoteNativeSelection",
+      );
+      i18n.addResource(
+        "zh",
+        "translation",
+        "mode.dialog.exitNoteNativeSelection",
+        "Restore {{provider}} in {{file}}; credentials and history unchanged.",
+      );
+      try {
+        renderPanel("dsh", { managed });
+        await screen.findByTestId("card-native-current:web");
+        await waitFor(() =>
+          expect(
+            screen.getByRole("button", { name: /mode\.names\.route/ }),
+          ).toHaveAttribute("aria-pressed", "true"),
+        );
+        await user.click(
+          screen.getByRole("button", { name: /mode\.names\.direct/ }),
+        );
+        await user.click(
+          await screen.findByRole("button", { name: "mode.activate.direct" }),
+        );
+        expect(await screen.findByText(/^Using /)).toHaveTextContent(
+          /Native Desktop.*Native Web/,
+        );
+        expect(screen.getByText(/^Restore /)).toHaveTextContent(
+          /Native Desktop.*Native Web.*credentials and history unchanged/,
+        );
+        await user.click(screen.getByRole("button", { name: "common.cancel" }));
+        expect(writes).not.toHaveBeenCalled();
+      } finally {
+        i18n.addResource(
+          "zh",
+          "translation",
+          "mode.dialog.exitNoteNativeSelection",
+          previousNote ?? "mode.dialog.exitNoteNativeSelection",
+        );
+        i18n.addResource(
+          "zh",
+          "translation",
+          "mode.dialog.exitLead",
+          previous ?? "mode.dialog.exitLead",
+        );
+      }
+    },
+  );
+
+  it("selects a native DSH reference through the public exit-and-use confirmation instead of a separate restore area", async () => {
+    const user = userEvent.setup();
+    mockMode("route", "managed", "managed");
+    const native: Provider = {
+      ...provider("native-current:desktop"),
+      category: "official",
+      settingsConfig: {
+        nativeRef: true,
+        profile: "desktop",
+        provider: "deepseek-official",
+        model: "deepseek-flash",
+        nativeIsCurrent: false,
+      },
+    };
+    const managed: Provider = {
+      ...provider("managed"),
+      meta: {
+        authBinding: {
+          source: "managed_account",
+          authProvider: "codex_oauth",
+          accountId: "fixture-account",
+        },
+      },
+    };
+    const writes: unknown[] = [];
+    server.use(
+      http.post(`${TAURI_ENDPOINT}/get_dsh_native_defaults`, () =>
+        HttpResponse.json([native]),
+      ),
+      http.post(
+        `${TAURI_ENDPOINT}/set_proxy_takeover_for_app`,
+        async ({ request }) => {
+          writes.push({ mode: await request.json() });
+          return HttpResponse.json(null);
+        },
+      ),
+      http.post(`${TAURI_ENDPOINT}/switch_provider`, async ({ request }) => {
+        writes.push({ switch: await request.json() });
+        return HttpResponse.json({ warnings: [] });
+      }),
+    );
+    renderPanel("dsh", { managed });
+    await screen.findByTestId("card-managed");
+    expect(
+      screen.queryByRole("button", {
+        name: "provider.dshRestoreNativeDefault",
+      }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("provider.dshCcModeStatus"),
+    ).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: /mode\.names\.route/ }),
+      ).toHaveAttribute("aria-pressed", "true"),
+    );
+    await user.click(
+      screen.getByRole("button", { name: /mode\.names\.direct/ }),
+    );
+    await user.click(await screen.findByTestId(`exitAndUse-${native.id}`));
+    expect(writes).toEqual([]);
+    expect(
+      await screen.findByText("mode.dialog.exitNoteNativeSelection"),
+    ).toBeVisible();
+    fireEvent.click(
+      screen.getByRole("button", { name: "mode.dialog.confirmDirect" }),
+    );
+    await waitFor(() =>
+      expect(writes).toEqual([
+        { mode: { appType: "dsh", enabled: false, stack: false, route: null } },
+        { switch: { app: "dsh", id: native.id } },
+      ]),
+    );
+  });
+  it.each(["direct", "route", "stack"] as const)(
+    "hides the DSH aggregation entry without rewriting an existing %s mode",
+    async (active) => {
+      mockMode(active, "route");
+      const writes = vi.fn();
+      server.use(
+        http.post(`${TAURI_ENDPOINT}/get_dsh_native_defaults`, () =>
+          HttpResponse.json([]),
+        ),
+        http.post(`${TAURI_ENDPOINT}/get_proxy_stack`, () =>
+          HttpResponse.json({ active: active === "stack", members: [] }),
+        ),
+        http.post(`${TAURI_ENDPOINT}/set_proxy_takeover_for_app`, () => {
+          writes();
+          return HttpResponse.json(null);
+        }),
+      );
+      renderPanel("dsh", { route: provider("route") });
+      await screen.findByTestId("card-route");
+      expect(
+        screen.queryByRole("button", { name: /mode\.names\.stack/ }),
+      ).not.toBeInTheDocument();
+      expect(writes).not.toHaveBeenCalled();
+    },
+  );
+
+  it("cancels native DSH selection without switching or leaving routing", async () => {
+    const user = userEvent.setup();
+    mockMode("route", "managed", "managed");
+    const managed: Provider = {
+      ...provider("managed"),
+      meta: {
+        authBinding: {
+          source: "managed_account",
+          authProvider: "codex_oauth",
+          accountId: "fixture-account",
+        },
+      },
+    };
+    const takeovers: unknown[] = [];
+    const switches: unknown[] = [];
+    server.use(
+      http.post(`${TAURI_ENDPOINT}/get_dsh_native_defaults`, () =>
+        HttpResponse.json([
+          {
+            ...provider("native-current:desktop"),
+            category: "official",
+            settingsConfig: {
+              provider: "deepseek-official",
+              model: "deepseek-flash",
+              profile: "desktop",
+              nativeBalanceAuth: "api-key",
+              nativeRef: true,
+              nativeIsCurrent: false,
+            },
+          },
+        ]),
+      ),
+      http.post(
+        `${TAURI_ENDPOINT}/set_proxy_takeover_for_app`,
+        async ({ request }) => {
+          takeovers.push(await request.json());
+          return HttpResponse.json(null);
+        },
+      ),
+      http.post(`${TAURI_ENDPOINT}/switch_provider`, async ({ request }) => {
+        switches.push(await request.json());
+        return HttpResponse.json(null);
+      }),
+    );
+    const onSwitch = vi.fn();
+    renderPanel("dsh", { managed }, onSwitch);
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: /mode\.names\.route/ }),
+      ).toHaveAttribute("aria-pressed", "true"),
+    );
+    await user.click(
+      await screen.findByRole("button", { name: /mode\.names\.direct/ }),
+    );
+    await user.click(
+      await screen.findByTestId("exitAndUse-native-current:desktop"),
+    );
+    expect(
+      await screen.findByText("mode.dialog.exitNoteNativeSelection"),
+    ).toBeVisible();
+    expect(takeovers).toEqual([]);
+    fireEvent.click(screen.getByRole("button", { name: "common.cancel" }));
+    expect(takeovers).toEqual([]);
+    expect(switches).toEqual([]);
+    expect(onSwitch).not.toHaveBeenCalled();
+  });
 });
 
 describe("SwitchModePanel — Stack mode", () => {

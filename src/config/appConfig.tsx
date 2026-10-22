@@ -27,6 +27,8 @@ export const APP_IDS: AppId[] = [
   "hermes",
   "pi",
   "mcode",
+  "qoder",
+  "dsh",
 ];
 
 export const DEFAULT_VISIBLE_APPS: VisibleApps = {
@@ -40,10 +42,21 @@ export const DEFAULT_VISIBLE_APPS: VisibleApps = {
   hermes: true,
   pi: true,
   mcode: true,
+  qoder: true,
+  dsh: true,
 };
 
+/** These applications keep their provider configuration behind their native APIs. */
+export function isNativeProviderApp(appId: AppId): appId is "qoder" {
+  return appId === "qoder";
+}
+
 /** App IDs shown in Skills panels. */
-export const SKILLS_APP_IDS: AppId[] = [
+export type SkillsAppId = Exclude<
+  AppId,
+  "claude-desktop" | "openclaw" | "qoder" | "dsh"
+>;
+export const SKILLS_APP_IDS: SkillsAppId[] = [
   "claude",
   "codex",
   "gemini",
@@ -75,9 +88,13 @@ export function isProxyAppId(appId: string): appId is ProxyAppId {
  * 有直连 / 路由模式的应用（后端 `AppType::has_route_mode`）：上面四个，加上 Claude Desktop。
  * Desktop 经同一个路由服务转发，但没有故障转移和路由设置（不在 `PROXY_APP_IDS` 里）。
  */
-export type ModeAppId = ProxyAppId | "claude-desktop";
+export type ModeAppId = ProxyAppId | "claude-desktop" | "dsh";
 
-export const MODE_APP_IDS: ModeAppId[] = [...PROXY_APP_IDS, "claude-desktop"];
+export const MODE_APP_IDS: ModeAppId[] = [
+  ...PROXY_APP_IDS,
+  "claude-desktop",
+  "dsh",
+];
 
 export function isModeAppId(appId: string): appId is ModeAppId {
   return (MODE_APP_IDS as string[]).includes(appId);
@@ -86,13 +103,14 @@ export function isModeAppId(appId: string): appId is ModeAppId {
 /** 支持 Stack 模式的应用（后端 `mode::stack::supports_stack` 的镜像）。 */
 export type StackAppId = Extract<
   ModeAppId,
-  "claude" | "codex" | "claude-desktop"
+  "claude" | "codex" | "claude-desktop" | "dsh"
 >;
 
 export const STACK_APP_IDS: StackAppId[] = [
   "claude",
   "codex",
   "claude-desktop",
+  "dsh",
 ];
 
 export function isStackAppId(appId: string): appId is StackAppId {
@@ -132,7 +150,10 @@ export function usesEditorView(appId: AppId): boolean {
 }
 
 /** Claude Desktop、OpenClaw 不由 CC Switch 管理 MCP；Pi 1.0 起内置 MCP（`~/.pi/agent/mcp.json`） */
-export type McpAppId = Exclude<AppId, "claude-desktop" | "openclaw">;
+export type McpAppId = Exclude<
+  AppId,
+  "claude-desktop" | "openclaw" | "qoder" | "dsh"
+>;
 export const MCP_APP_IDS: McpAppId[] = [
   "claude",
   "codex",
@@ -149,6 +170,20 @@ export function isMcpAppId(appId: string): appId is McpAppId {
 }
 
 export const APP_ICON_MAP: Record<AppId, AppConfig> = {
+  qoder: {
+    label: "Qoder CN",
+    icon: <ProviderIcon icon="qwen" name="Qoder CN" size={14} />,
+    activeClass: "bg-violet-500/10 text-violet-600 dark:text-violet-400",
+    badgeClass:
+      "bg-violet-500/10 text-violet-700 dark:text-violet-300 border-0 gap-1.5",
+  },
+  dsh: {
+    label: "DSH",
+    icon: <ProviderIcon icon="deepseek" name="DSH" size={14} />,
+    activeClass: "bg-blue-500/10 text-blue-600 dark:text-blue-400",
+    badgeClass:
+      "bg-blue-500/10 text-blue-700 dark:text-blue-300 border-0 gap-1.5",
+  },
   claude: {
     label: "Claude",
     icon: <ClaudeIcon size={14} />,

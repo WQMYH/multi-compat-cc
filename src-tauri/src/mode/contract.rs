@@ -79,6 +79,10 @@ pub fn claude_desktop(profile: &Value) -> Contract {
     }
 }
 
+pub(crate) fn dsh(projection: &crate::services::provider::dsh_direct::Projection) -> Contract {
+    Contract { version: CONTRACT_VERSION, key: key_of(&json!({"app":"dsh", "version":CONTRACT_VERSION, "projection":projection})), exclusive: Map::new() }
+}
+
 fn sorted(map: &Map<String, Value>) -> Value {
     let mut entries: Vec<_> = map.iter().collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));

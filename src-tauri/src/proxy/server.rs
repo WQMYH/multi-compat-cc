@@ -46,6 +46,10 @@ pub struct ProxyState {
     pub codex_chat_history: Arc<CodexChatHistoryStore>,
     /// AppHandle，用于发射事件和更新托盘菜单
     pub app_handle: Option<tauri::AppHandle>,
+    pub chatgpt_plan_accounts:
+        Option<Arc<super::providers::chatgpt_plan_auth::accounts::PlanAccounts>>,
+    #[cfg(test)]
+    pub chatgpt_plan_fixture_base: Option<String>,
     /// 故障转移切换管理器
     pub failover_manager: Arc<FailoverSwitchManager>,
 }
@@ -68,6 +72,17 @@ impl ProxyState {
 }
 
 impl ProxyServer {
+    #[cfg(test)]
+    pub(crate) fn with_plan_fixture(
+        mut self,
+        accounts: Arc<super::providers::chatgpt_plan_auth::accounts::PlanAccounts>,
+        base: &str,
+    ) -> Self {
+        self.state.chatgpt_plan_accounts = Some(accounts);
+        self.state.chatgpt_plan_fixture_base = Some(base.into());
+        self
+    }
+
     pub fn new(
         config: ProxyConfig,
         db: Arc<Database>,
@@ -88,6 +103,9 @@ impl ProxyServer {
             gemini_shadow: Arc::new(GeminiShadowStore::default()),
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
             app_handle,
+            chatgpt_plan_accounts: None,
+            #[cfg(test)]
+            chatgpt_plan_fixture_base: None,
             failover_manager,
         };
 
@@ -296,8 +314,10 @@ impl ProxyServer {
         );
     }
 
-    fn build_router(&self) -> Router {
+    pub(super) fn build_router(&self) -> Router {
         Router::new()
+            .merge(super::qoder::routes())
+            .merge(super::dsh::routes())
             // 健康检查
             .route("/health", get(handlers::health_check))
             .route("/status", get(handlers::get_status))

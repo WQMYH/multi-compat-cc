@@ -32,6 +32,48 @@ const renderExit = (
 };
 
 describe("ModeDialog exit", () => {
+  it.each([
+    { directId: "kimi", useProviderId: undefined },
+    { directId: "kimi", useProviderId: "deepseek" },
+  ])(
+    "uses the common DSH exit confirmation for the selected provider: %s",
+    async ({ directId, useProviderId }) => {
+      const props = renderExit({
+        app: "dsh",
+        directId,
+        state: { kind: "exit", useProviderId },
+      });
+      expect(screen.getByText("mode.dialog.exitNoteFile")).toBeVisible();
+      expect(
+        screen.queryByText("provider.dshRestoreNativeNote"),
+      ).not.toBeInTheDocument();
+      fireEvent.click(
+        screen.getByRole("button", { name: "mode.dialog.confirmDirect" }),
+      );
+      await waitFor(() =>
+        expect(props.onExit).toHaveBeenCalledWith(useProviderId),
+      );
+    },
+  );
+
+  it("uses the common file confirmation when the saved DSH choice requires routing", () => {
+    const managed: Provider = {
+      ...provider("managed", "Managed account"),
+      meta: {
+        authBinding: {
+          source: "managed_account",
+          authProvider: "codex_oauth",
+          accountId: "fixture",
+        },
+      },
+    };
+    renderExit({ app: "dsh", providers: [managed], directId: managed.id });
+    expect(screen.getByText("mode.dialog.exitNoteFile")).toBeVisible();
+    expect(
+      screen.queryByText("provider.dshUseDirectDefaultNote"),
+    ).not.toBeInTheDocument();
+  });
+
   it("asks before going back to direct and closes after confirming", async () => {
     const props = renderExit();
 
@@ -55,9 +97,7 @@ describe("ModeDialog exit", () => {
       screen.getByRole("button", { name: "mode.dialog.confirmDirect" }),
     );
 
-    await waitFor(() =>
-      expect(props.onExit).toHaveBeenCalledWith("deepseek"),
-    );
+    await waitFor(() => expect(props.onExit).toHaveBeenCalledWith("deepseek"));
   });
 
   it("keeps the dialog open and shows the error when leaving fails", async () => {

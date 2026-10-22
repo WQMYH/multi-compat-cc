@@ -195,6 +195,92 @@ describe("ProviderList Component", () => {
     expect(container.querySelectorAll(".border-dashed")).toHaveLength(3);
   });
 
+  it("routes DSH native providers through the same current and switch presentations without a restore section", async () => {
+    const observed = createProvider({
+      id: "native-current:desktop",
+      name: "deepseek-official · deepseek-flash",
+      category: "official",
+      settingsConfig: {
+        provider: "deepseek-official",
+        model: "deepseek-flash",
+        profile: "desktop",
+        nativeRef: true,
+        nativeIsCurrent: true,
+      },
+    });
+    const managed = createProvider({ id: "managed" });
+    useDragSortMock.mockReturnValue({
+      sortedProviders: [observed, managed],
+      sensors: [],
+      handleDragEnd: vi.fn(),
+    });
+    renderWithQueryClient(
+      <ProviderList
+        {...baseProps}
+        providers={{ [observed.id]: observed, [managed.id]: managed }}
+        appId="dsh"
+        switchMode={switchMode({ directIds: new Set([observed.id]) })}
+      />,
+    );
+    await waitFor(() => expect(lastProps(observed.id)).toBeDefined());
+    expect(
+      screen.queryByRole("region", { name: "provider.dshNativeDefault" }),
+    ).not.toBeInTheDocument();
+    const props = lastProps(observed.id);
+    expect(props.presentation.chips).toEqual([
+      { key: "official", label: "providerCard.chip.official", tone: "outline" },
+    ]);
+    expect(props.presentation.buttons).toEqual([]);
+    expect(props.presentation.status.label).toBe("providerCard.status.inUse");
+    expect(lastProps(managed.id).presentation.buttons[0].key).toBe("switch");
+    expect(props.presentation.editDisabledReason).toBeTruthy();
+    expect(props.presentation.deleteDisabledReason).toBeTruthy();
+    expect(props.onDuplicate).toBeUndefined();
+    expect(props.onTest).toBeUndefined();
+    expect(useDragSortMock).toHaveBeenLastCalledWith(
+      { [observed.id]: observed, [managed.id]: managed },
+      "dsh",
+    );
+    expect(baseProps.onSwitch).not.toHaveBeenCalled();
+  });
+
+  it("returns native cards to the public switch action after a CC direct provider is selected", async () => {
+    const direct = createProvider({ id: "api-a", name: "Saved API" });
+    const observed = createProvider({
+      id: "native-current:desktop",
+      settingsConfig: {
+        profile: "desktop",
+        provider: "deepseek-official",
+        model: "deepseek-flash",
+        nativeRef: true,
+      },
+    });
+    useDragSortMock.mockReturnValue({
+      sortedProviders: [observed, direct],
+      sensors: [],
+      handleDragEnd: vi.fn(),
+    });
+    const mode = switchMode({
+      directId: direct.id,
+      directIds: new Set([direct.id]),
+    });
+    renderWithQueryClient(
+      <ProviderList
+        {...baseProps}
+        providers={{ [direct.id]: direct, [observed.id]: observed }}
+        appId="dsh"
+        switchMode={mode}
+      />,
+    );
+    await waitFor(() => expect(lastProps(observed.id)).toBeDefined());
+    expect(lastProps(observed.id).presentation.status).toBeUndefined();
+    fireEvent.click(screen.getByTestId(`switch-${observed.id}`));
+    expect(mode.actions.switchDirect).toHaveBeenCalledWith(observed);
+    expect(lastProps(direct.id).presentation.status.label).toBe(
+      "providerCard.status.inUse",
+    );
+  });
+
   it("should show empty state and trigger create callback when no providers exist", () => {
     const handleCreate = vi.fn();
 

@@ -1,5 +1,9 @@
 import { useRef } from "react";
-import { useQuery, type UseQueryResult } from "@tanstack/react-query";
+import {
+  useQuery,
+  useQueryClient,
+  type UseQueryResult,
+} from "@tanstack/react-query";
 import {
   providersApi,
   settingsApi,
@@ -49,6 +53,7 @@ export interface UseProvidersQueryOptions {
  */
 export const providersQueryOptions = (appId: AppId) => ({
   queryKey: ["providers", appId] as const,
+  enabled: true,
   // 列表很小：没人订阅时也一直留在缓存里，过了默认的 5 分钟再切过去也不画骨架
   gcTime: Infinity,
   queryFn: async (): Promise<ProvidersQueryData> => {
@@ -249,6 +254,7 @@ export const useUsageQuery = (
   options?: UseUsageQueryOptions,
 ) => {
   const { enabled = true, autoQueryInterval = 0 } = options || {};
+  const queryClient = useQueryClient();
 
   // 计算 staleTime：如果有自动刷新间隔，使用该间隔；否则默认 5 分钟
   // 这样可以避免切换 app 页面时重复触发查询
@@ -259,7 +265,19 @@ export const useUsageQuery = (
 
   const query = useQuery<UsageResult>({
     queryKey: usageKeys.script(providerId, appId),
-    queryFn: async () => usageApi.query(providerId, appId),
+    queryFn: async () => {
+      const result = await usageApi.query(providerId, appId);
+      if (
+        appId === "dsh" &&
+        providerId.startsWith("native-current:") &&
+        result.error === "DSH_NATIVE_BALANCE_IDENTITY_CHANGED"
+      ) {
+        void queryClient.invalidateQueries({
+          queryKey: ["providers", "dsh", "nativeDefaults"],
+        });
+      }
+      return result;
+    },
     enabled: enabled && !!providerId,
     refetchInterval:
       autoQueryInterval > 0

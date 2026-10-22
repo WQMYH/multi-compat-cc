@@ -178,7 +178,7 @@ impl Provider {
         let (base_url, api_key) = match app_type {
             // Codex keeps its key in `auth.OPENAI_API_KEY` and its base URL
             // inside a TOML `config` string, not in an `env` map.
-            AppType::Codex => {
+            AppType::Codex | AppType::Dsh => {
                 let auth = settings.get("auth");
                 let config_text = settings.get("config").and_then(|v| v.as_str());
                 let api_key = crate::codex_config::extract_codex_api_key(auth, config_text)
@@ -705,6 +705,10 @@ pub struct UniversalProviderApps {
     pub codex: bool,
     #[serde(default)]
     pub gemini: bool,
+    #[serde(default)]
+    pub qoder: bool,
+    #[serde(default)]
+    pub dsh: bool,
 }
 
 /// Claude 模型配置
@@ -756,6 +760,10 @@ pub struct UniversalProviderModels {
     pub codex: Option<CodexModelConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gemini: Option<GeminiModelConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qoder: Option<CodexModelConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dsh: Option<CodexModelConfig>,
 }
 
 /// 统一供应商（跨应用共享配置）
@@ -807,6 +815,21 @@ pub struct UniversalProvider {
 }
 
 impl UniversalProvider {
+    pub fn to_native_provider(&self, app: &str) -> Option<Provider> {
+        let models = match app {
+            "qoder" if self.apps.qoder => self.models.qoder.as_ref(),
+            "dsh" if self.apps.dsh => self.models.dsh.as_ref(),
+            _ => return None,
+        }?;
+        if models.model.as_deref().unwrap_or_default().trim().is_empty() { return None; }
+        // Reuse the existing OpenAI provider representation, not another application's rows.
+        let mut source = self.clone();
+        source.apps.codex = true;
+        source.models.codex = Some(models.clone());
+        let mut provider = source.to_codex_provider()?;
+        provider.id = format!("universal-{app}-{}", self.id);
+        Some(provider)
+    }
     /// 创建新的统一供应商
     pub fn new(
         id: String,
@@ -1633,6 +1656,22 @@ mod tests {
                 "https://api.deepseek.com".to_string(),
                 "sk-codex".to_string()
             )
+        );
+    }
+
+    #[test]
+    fn source11_dsh_reuses_existing_deepseek_balance_credentials() {
+        let provider = provider_with(json!({
+            "auth": { "OPENAI_API_KEY": "fixture-deepseek-key" },
+            "config": "model_provider = \"deepseek\"\n[model_providers.deepseek]\nbase_url = \"https://api.deepseek.com\"\n",
+        }));
+        assert_eq!(
+            provider.resolve_usage_credentials(&AppType::Dsh),
+            provider.resolve_usage_credentials(&AppType::Codex),
+        );
+        assert_eq!(
+            provider.resolve_usage_credentials(&AppType::Dsh),
+            ("https://api.deepseek.com".into(), "fixture-deepseek-key".into()),
         );
     }
 

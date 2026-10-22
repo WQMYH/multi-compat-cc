@@ -1,5 +1,6 @@
 node_modules/
 dist/
+src-tauri/resources/qoder/
 release/
 .DS_Store
 *.log
@@ -29,3 +30,7 @@ copilot-api
 .history
 CODEBUDDY.md
 mainWindow.js
+/src-tauri/resources/dsh/
+/.runtime/dsh-native-control-*/
+/.runtime/
+/.codegraph/

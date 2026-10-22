@@ -141,6 +141,50 @@ beforeEach(() => {
 });
 
 describe("useProviderActions", () => {
+  it("source25 reports read-only Qoder reconciliation instead of a successful resubmission", async () => {
+    switchProviderMutateAsync.mockResolvedValueOnce({
+      warnings: ["QODER_BYOK_RECONCILED_SELECTION_UNKNOWN"],
+    });
+    const { wrapper } = createWrapper();
+    const { result } = renderHook(() => useProviderActions("qoder"), { wrapper });
+    await act(async () => {
+      await result.current.switchProvider(createProvider({ category: "custom" }));
+    });
+    expect(toastSuccessMock).toHaveBeenCalledWith(
+      "notifications.qoderReadback",
+      expect.objectContaining({
+        description: "notifications.qoderReadbackUnknown",
+      }),
+    );
+    expect(toastSuccessMock.mock.calls[0]?.[0]).not.toBe("Qoder BYOK 已同步");
+    expect(switchProviderMutateAsync).toHaveBeenCalledTimes(1);
+    expect(settingsApiApplyMock).not.toHaveBeenCalled();
+  });
+  it("reports the exact native scope for qoder without a generic switch/backfill success", async () => {
+    const warning = "QODER_BYOK_PROVIDER_DEFAULT_SYNCED: 供应商内默认已回读；桌面当前模型未改动。";
+    switchProviderMutateAsync.mockResolvedValueOnce({ warnings: [warning] });
+    const { wrapper } = createWrapper();
+    const { result } = renderHook(() => useProviderActions("qoder"), { wrapper });
+    await act(async () => { await result.current.switchProvider(createProvider({ category: "custom" })); });
+    expect(toastSuccessMock).toHaveBeenCalledWith("Qoder BYOK 已同步", expect.objectContaining({
+      description: warning.replace(/^QODER_BYOK_PROVIDER_DEFAULT_SYNCED: /, ""),
+    }));
+    expect(toastWarningMock).not.toHaveBeenCalled();
+    expect(settingsApiGetMock).not.toHaveBeenCalled();
+    expect(settingsApiApplyMock).not.toHaveBeenCalled();
+  });
+  it("uses the shared provider switch flow for dsh without a parallel native success contract", async () => {
+    switchProviderMutateAsync.mockResolvedValueOnce({ warnings: [] });
+    const { wrapper } = createWrapper();
+    const { result } = renderHook(() => useProviderActions("dsh"), { wrapper });
+    await act(async () => { await result.current.switchProvider(createProvider({ category: "custom" })); });
+    expect(switchProviderMutateAsync).toHaveBeenCalledTimes(1);
+    expect(switchProviderMutateAsync).toHaveBeenCalledWith("provider-1");
+    expect(toastSuccessMock).toHaveBeenCalledWith("切换成功！", { closeButton: true });
+    expect(toastWarningMock).not.toHaveBeenCalled();
+    expect(settingsApiGetMock).not.toHaveBeenCalled();
+    expect(settingsApiApplyMock).not.toHaveBeenCalled();
+  });
   it("should trigger mutation when calling addProvider", async () => {
     addProviderMutateAsync.mockResolvedValueOnce(undefined);
     const { wrapper } = createWrapper();
