@@ -141,6 +141,18 @@ beforeEach(() => {
 });
 
 describe("useProviderActions", () => {
+  it("uses the shared provider switch flow for dsh without a parallel native success contract", async () => {
+    switchProviderMutateAsync.mockResolvedValueOnce({ warnings: [] });
+    const { wrapper } = createWrapper();
+    const { result } = renderHook(() => useProviderActions("dsh"), { wrapper });
+    await act(async () => { await result.current.switchProvider(createProvider({ category: "custom" })); });
+    expect(switchProviderMutateAsync).toHaveBeenCalledTimes(1);
+    expect(switchProviderMutateAsync).toHaveBeenCalledWith("provider-1");
+    expect(toastSuccessMock).toHaveBeenCalledWith("切换成功！", { closeButton: true });
+    expect(toastWarningMock).not.toHaveBeenCalled();
+    expect(settingsApiGetMock).not.toHaveBeenCalled();
+    expect(settingsApiApplyMock).not.toHaveBeenCalled();
+  });
   it("should trigger mutation when calling addProvider", async () => {
     addProviderMutateAsync.mockResolvedValueOnce(undefined);
     const { wrapper } = createWrapper();

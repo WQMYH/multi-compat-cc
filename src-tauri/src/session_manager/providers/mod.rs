@@ -2,6 +2,7 @@ pub mod agy;
 mod blocks;
 pub mod claude;
 pub mod codex;
+pub mod dsh;
 mod codex_items;
 pub mod gemini;
 pub mod grokbuild;

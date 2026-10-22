@@ -288,6 +288,8 @@ describe("SessionManagerPage", () => {
         hermes: false,
         pi: false,
         mcode: false,
+        qoder: false,
+        dsh: false,
         agy: false,
       },
     });

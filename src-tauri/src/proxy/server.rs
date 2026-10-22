@@ -296,8 +296,9 @@ impl ProxyServer {
         );
     }
 
-    fn build_router(&self) -> Router {
+    pub(super) fn build_router(&self) -> Router {
         Router::new()
+            .merge(super::dsh::routes())
             // 健康检查
             .route("/health", get(handlers::health_check))
             .route("/status", get(handlers::get_status))

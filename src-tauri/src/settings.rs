@@ -54,6 +54,10 @@ pub struct VisibleApps {
     #[serde(default = "default_true")]
     pub mcode: bool,
     #[serde(default = "default_true")]
+    pub qoder: bool,
+    #[serde(default = "default_true")]
+    pub dsh: bool,
+    #[serde(default = "default_true")]
     pub agy: bool,
 }
 
@@ -70,6 +74,8 @@ impl Default for VisibleApps {
             hermes: false, // 默认不显示，需用户手动启用
             pi: true,
             mcode: true,
+            qoder: true,
+            dsh: true,
             agy: true,
         }
     }
@@ -80,6 +86,7 @@ impl VisibleApps {
     pub fn is_visible(&self, app: &AppType) -> bool {
         match app {
             AppType::Claude => self.claude,
+            AppType::Dsh => self.dsh,
             AppType::ClaudeDesktop => self.claude_desktop,
             AppType::Codex => self.codex,
             AppType::Gemini => self.gemini,
@@ -560,6 +567,8 @@ pub struct AppSettings {
     /// 当前 Hermes 供应商 ID（本地存储，保持结构一致）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_provider_hermes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_provider_dsh: Option<String>,
     /// 当前 Antigravity CLI 供应商 ID
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_provider_agy: Option<String>,
@@ -677,6 +686,7 @@ impl Default for AppSettings {
             current_provider_opencode: None,
             current_provider_openclaw: None,
             current_provider_hermes: None,
+            current_provider_dsh: None,
             current_provider_agy: None,
             proxy_client_host: None,
             skill_sync_method: SyncMethod::default(),
@@ -1336,6 +1346,7 @@ pub fn get_current_provider(app_type: &AppType) -> Option<String> {
         AppType::OpenCode => settings.current_provider_opencode.clone(),
         AppType::OpenClaw => settings.current_provider_openclaw.clone(),
         AppType::Hermes => settings.current_provider_hermes.clone(),
+        AppType::Dsh => settings.current_provider_dsh.clone(),
         AppType::Agy => settings.current_provider_agy.clone(),
         AppType::Pi | AppType::Mcode => None,
     }
@@ -1356,6 +1367,7 @@ pub fn set_current_provider(app_type: &AppType, id: Option<&str>) -> Result<(), 
         AppType::OpenCode => settings.current_provider_opencode = id_owned.clone(),
         AppType::OpenClaw => settings.current_provider_openclaw = id_owned.clone(),
         AppType::Hermes => settings.current_provider_hermes = id_owned.clone(),
+        AppType::Dsh => settings.current_provider_dsh = id_owned.clone(),
         AppType::Agy => settings.current_provider_agy = id_owned.clone(),
         AppType::Pi | AppType::Mcode => {}
     })

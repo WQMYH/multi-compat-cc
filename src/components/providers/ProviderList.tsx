@@ -56,6 +56,7 @@ import {
   type CardPresentation,
   type ProviderSection,
   type SwitchModeInput,
+  isDshNativeRef,
 } from "@/components/providers/presentation";
 
 /** 切换式应用（Claude Code / Codex / Gemini CLI / Grok Build）的模式状态和动作，由供应商页传入。 */
@@ -446,7 +447,7 @@ export function ProviderList({
           appId={appId}
           onCreate={appId === "pi" ? undefined : onCreate}
           onImport={
-            appId === "pi" || appId === "mcode"
+            appId === "pi" || appId === "mcode" || appId === "dsh"
               ? undefined
               : () => importMutation.mutate()
           }
@@ -458,6 +459,10 @@ export function ProviderList({
   // 「当前」只用来决定额度显示和自动刷新：Pi 没有当前项，OMO / Hermes 各看自己的当前项；
   // Antigravity 没有「启用」，每张卡都随时能打开，额度一律照常显示
   const isCurrentFor = (provider: Provider) => {
+    if (appId === "dsh" && switchMode?.directIds)
+      return (
+        switchMode.active === "direct" && switchMode.directIds.has(provider.id)
+      );
     if (appId === "pi") return false;
     if (appId === "agy") return true;
     if (provider.category === "omo") return provider.id === currentOmoId;
@@ -477,14 +482,22 @@ export function ProviderList({
       isInConfig={isInConfig(provider)}
       onEdit={onEdit}
       onDelete={onDelete}
-      onDuplicate={onDuplicate}
+      onDuplicate={
+        appId === "dsh" && provider.settingsConfig.nativeRef
+          ? undefined
+          : onDuplicate
+      }
       onConfigureUsage={
         onConfigureUsage ? (item) => onConfigureUsage(item) : () => undefined
       }
       onOpenWebsite={onOpenWebsite}
       // Antigravity 的「打开终端」已经是主按钮，「更多」菜单里不再重复
       onOpenTerminal={appId === "agy" ? undefined : onOpenTerminal}
-      onTest={handleTest}
+      onTest={
+        appId === "dsh" && provider.settingsConfig.nativeRef
+          ? undefined
+          : handleTest
+      }
       isTesting={isChecking(provider.id)}
     />
   );
@@ -635,7 +648,7 @@ interface SortableProviderCardProps {
   isInConfig: boolean;
   onEdit: (provider: Provider) => void;
   onDelete: (provider: Provider) => void;
-  onDuplicate: (provider: Provider) => void;
+  onDuplicate?: (provider: Provider) => void;
   onConfigureUsage: (provider: Provider) => void;
   onOpenWebsite: (url: string) => void;
   onOpenTerminal?: (provider: Provider) => void;
@@ -644,6 +657,7 @@ interface SortableProviderCardProps {
 }
 
 function SortableProviderCard(props: SortableProviderCardProps) {
+  const nativeRef = props.appId === "dsh" && isDshNativeRef(props.provider);
   const {
     setNodeRef,
     attributes,
@@ -651,7 +665,10 @@ function SortableProviderCard(props: SortableProviderCardProps) {
     transform,
     transition,
     isDragging,
-  } = useSortable({ id: props.provider.id });
+  } = useSortable({
+    id: props.provider.id,
+    disabled: nativeRef,
+  });
 
   const style: CSSProperties = {
     transform: CSS.Translate.toString(transform),
@@ -664,7 +681,9 @@ function SortableProviderCard(props: SortableProviderCardProps) {
     <div ref={setNodeRef} style={style}>
       <ProviderCard
         {...props}
-        dragHandleProps={{ attributes, listeners, isDragging }}
+        dragHandleProps={
+          nativeRef ? undefined : { attributes, listeners, isDragging }
+        }
       />
     </div>
   );

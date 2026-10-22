@@ -99,6 +99,11 @@
     "windowClose": "ウィンドウを閉じる"
   },
   "provider": {
+    "dshNativeDefault": "ネイティブの既定",
+    "dshDeepseekApi": "DeepSeek 公式 API",
+    "dshDeepseekAccount": "DeepSeek プラットフォームアカウント",
+    "nativeManagedReadOnly": "ネイティブアプリで管理されています。ここで選択し、認証情報は DSH で編集します。",
+    "nativeDefaultsReadFailed": "DSH の既定モデルを読み込めません",
     "connectivityCheck": "接続チェック",
     "tabProvider": "プロバイダー",
     "tabUniversal": "統一プロバイダー",
@@ -1568,6 +1573,9 @@
     "openReleaseNotesFailed": "リリースノートを開けませんでした:"
   },
   "providerForm": {
+    "dshDefaultModelHint": "DSH の新しいセッションの既定モデルです。このプロバイダーまたは管理対象アカウントが対応するモデルを選択してください。",
+    "dshDefaultModelRequired": "先に DSH の既定モデルを選択してください",
+    "dshManagedAccountRequired": "先に CC で管理している Codex アカウントを選択してください",
     "supplierName": "プロバイダー名",
     "supplierNameRequired": "プロバイダー名 *",
     "supplierNamePlaceholder": "例: Anthropic Official",
@@ -4305,6 +4313,7 @@
       "exitTitle": "{{app}} を「{{from}}」から直接接続に戻しますか？",
       "exitLead": "{{app}} は {{provider}} に直接接続し、リクエストは CC Switch を経由しなくなります。",
       "exitNoteFile": "{{file}} のアドレスとキーを {{provider}} のものに書き戻します。ほかの設定は変わりません。",
+      "exitNoteNativeSelection": "{{file}} で各クライアントの既定の {{provider}} 選択を復元します。認証情報と履歴は元の場所に保持します。",
       "exitNoteRouteKept": "ルーティング先、フェイルオーバーのキューと設定は保持され、次にルーティングを開始すると復元されます。",
       "desktopExitNoteRouteKept": "ルーティング先は保持され、次にルーティングを開始すると復元されます。",
       "confirmDirect": "直接接続に戻す",

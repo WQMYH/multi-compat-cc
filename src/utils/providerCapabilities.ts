@@ -114,6 +114,11 @@ export function supportsOfficialProxyTakeover(
   appId: AppId,
   provider: Pick<Provider, "id" | "category" | "meta" | "settingsConfig">,
 ): boolean {
+  if (appId === "dsh") {
+    return Boolean(
+      resolveManagedAccountId(provider.meta, "codex_oauth")?.trim(),
+    );
+  }
   const identity = resolveCodexOfficialIdentity(appId, provider);
   if (!identity || identity === "api_key") return false;
   if (
@@ -142,6 +147,13 @@ export function providerNeedsRouting(
   appId: AppId,
   provider: Provider,
 ): boolean {
+  if (appId === "dsh") {
+    return (
+      Boolean(resolveManagedAccountId(provider.meta, "codex_oauth")?.trim()) ||
+      isOAuthProviderType(provider.meta?.providerType) ||
+      provider.meta?.isFullUrl === true
+    );
+  }
   if (isOfficialAccount(appId, provider)) return false;
 
   const isManagedOAuth = isOAuthProviderType(provider.meta?.providerType);

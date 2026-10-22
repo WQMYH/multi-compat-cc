@@ -302,7 +302,8 @@ fn settings_contain_common_config(app_type: &AppType, settings: &Value, snippet:
         | AppType::Pi
         | AppType::Mcode
         | AppType::Agy
-        | AppType::ClaudeDesktop => false,
+        | AppType::ClaudeDesktop
+        | AppType::Dsh => false,
     }
 }
 
@@ -379,7 +380,8 @@ pub(crate) fn remove_common_config_from_settings(
         | AppType::Pi
         | AppType::Mcode
         | AppType::ClaudeDesktop
-        | AppType::Agy => Ok(settings.clone()),
+        | AppType::Agy
+        | AppType::Dsh => Ok(settings.clone()),
     }
 }
 
@@ -391,6 +393,7 @@ pub(crate) fn write_live_for_state(
     provider: &Provider,
 ) -> Result<(), AppError> {
     let db = state.db.as_ref();
+    if matches!(app_type, AppType::Dsh) { super::dsh_direct::reapply(db, provider)?; return Ok(()); }
     if matches!(app_type, AppType::Claude) {
         // Claude 不再整份写，也不合并片段：只替换关键字段和独有字段。live 当前对应的
         // 就是这个供应商（同步、退出代理写回），它带进来的独有字段按同一行比对。
@@ -537,7 +540,7 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
                 "Claude Code configuration must be written through the key-field write flow",
             ));
         }
-        AppType::ClaudeDesktop => {
+        AppType::Dsh | AppType::ClaudeDesktop => {
             return Err(AppError::localized(
                 "claude_desktop.live.requires_db_context",
                 "Claude Desktop 配置写入需要通过供应商切换流程执行",
@@ -910,6 +913,7 @@ pub fn read_live_settings(app_type: AppType) -> Result<Value, AppError> {
             }
             read_json_file(&path)
         }
+        AppType::Dsh => super::dsh_direct::read_live(),
         AppType::ClaudeDesktop => Err(AppError::localized(
             "claude_desktop.live.read_unsupported",
             "Claude Desktop 3P 配置不支持作为通用 live 配置导入，请使用“从 Claude 导入兼容供应商”。",
@@ -1032,6 +1036,7 @@ pub fn import_default_config(state: &AppState, app_type: AppType) -> Result<bool
     }
 
     let settings_config = match app_type {
+        AppType::Dsh => super::dsh_direct::read_live()?,
         AppType::Codex => crate::codex_config::read_codex_live_settings()?,
         AppType::GrokBuild => {
             let mut settings = crate::grok_config::read_grok_live_settings()?;
@@ -1184,7 +1189,7 @@ pub fn should_import_default_config_on_startup(
     state: &AppState,
     app_type: &AppType,
 ) -> Result<bool, AppError> {
-    if app_type.is_additive_mode() {
+    if app_type.is_additive_mode() || matches!(app_type, AppType::Dsh) {
         return Ok(false);
     }
 

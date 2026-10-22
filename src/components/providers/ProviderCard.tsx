@@ -4,6 +4,8 @@ import {
   GripVertical,
   ChevronDown,
   ChevronUp,
+  Monitor,
+  Globe,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useQuery } from "@tanstack/react-query";
@@ -37,6 +39,7 @@ import { resolveProviderIcon } from "@/utils/providerIcon";
 import { isAdditiveAppId, isProxyAppId } from "@/config/appConfig";
 import { ProviderCardActions } from "./ProviderCardActions";
 import type { CardChip, CardPresentation, CardTone } from "./presentation";
+import { isDshNativeRef, providerDisplayName } from "./presentation";
 
 interface DragHandleProps {
   attributes: DraggableAttributes;
@@ -188,6 +191,23 @@ export function ProviderCard({
   dragHandleProps,
 }: ProviderCardProps) {
   const { t } = useTranslation();
+  const nativeDshProfile =
+    appId === "dsh" && isDshNativeRef(provider)
+      ? provider.settingsConfig.profile
+      : undefined;
+  const profileLabel =
+    nativeDshProfile === "desktop"
+      ? t("provider.nativeDesktop")
+      : nativeDshProfile === "web"
+        ? t("provider.nativeWeb")
+        : undefined;
+  const ProfileIcon = nativeDshProfile === "desktop" ? Monitor : Globe;
+  const nativeDeepSeek =
+    nativeDshProfile &&
+    ["deepseek-official", "deepseek-account"].includes(
+      provider.settingsConfig.provider,
+    );
+  const displayName = providerDisplayName(appId, provider, t);
   const codexOfficialIdentity = resolveCodexOfficialIdentity(appId, provider);
   const managedCodexAccountId = resolveManagedAccountId(
     provider.meta,
@@ -281,9 +301,20 @@ export function ProviderCard({
 
   // 脚本用量只在「已启用 + 非官方 + 非官方订阅模板」时才查询；展开判定必须复用同一谓词，
   // 因为禁用的 React Query observer 仍会返回同 key 的旧缓存。
+  const isNativeDshBalance =
+    appId === "dsh" &&
+    isDshNativeRef(provider) &&
+    provider.meta?.providerType === "dsh-native-balance";
   const scriptUsageActive =
-    usageEnabled && !isOfficial && !isOfficialSubscriptionUsage;
-  const { data: usage } = useUsageQuery(provider.id, appId, {
+    usageEnabled &&
+    (!isOfficial || isNativeDshBalance) &&
+    !isOfficialSubscriptionUsage;
+  const usageProviderId =
+    isNativeDshBalance &&
+    typeof provider.settingsConfig.nativeBalanceId === "string"
+      ? provider.settingsConfig.nativeBalanceId
+      : provider.id;
+  const { data: usage } = useUsageQuery(usageProviderId, appId, {
     enabled: scriptUsageActive,
     autoQueryInterval,
   });
@@ -344,8 +375,12 @@ export function ProviderCard({
         )}
 
         <ProviderIconBox
-          icon={resolveProviderIcon(appId, provider.icon, provider.iconColor)}
-          name={provider.name}
+          icon={resolveProviderIcon(
+            appId,
+            provider.icon ?? (nativeDeepSeek ? "deepseek" : undefined),
+            provider.iconColor,
+          )}
+          name={displayName}
           color={provider.iconColor}
           className={cn(
             // 底色固定为白，图标颜色也要固定：单色（currentColor）图标和首字母
@@ -357,15 +392,21 @@ export function ProviderCard({
         />
 
         <div className="min-w-0 flex-1">
+          {profileLabel && (
+            <div className="mb-1 inline-flex items-center gap-1.5 rounded-control border border-border-strong bg-surface px-2 py-0.5 text-body font-semibold text-fg-1">
+              <ProfileIcon className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>{profileLabel}</span>
+            </div>
+          )}
           <div className="flex min-w-0 items-center gap-1.5">
             <h3
               className={cn(
                 "m-0 min-w-0 truncate text-strong",
                 presentation.dim ? "text-fg-2" : "text-fg-1",
               )}
-              title={provider.name}
+              title={displayName}
             >
-              {provider.name}
+              {displayName}
             </h3>
             {presentation.chips.map((chip) => (
               <CardChipBadge key={chip.key} chip={chip} />
@@ -497,7 +538,7 @@ export function ProviderCard({
                   inline={true}
                   isCurrent={isCurrent}
                 />
-              ) : isOfficial ? (
+              ) : isOfficial && !isNativeDshBalance ? (
                 officialSubscriptionEnabled ? (
                   agyBoundAccountId ? (
                     <AgyAccountQuotaFooter
@@ -529,7 +570,7 @@ export function ProviderCard({
               ) : (
                 <UsageFooter
                   provider={provider}
-                  providerId={provider.id}
+                  providerId={usageProviderId}
                   appId={appId}
                   usageEnabled={usageEnabled}
                   isCurrent={isCurrent}
@@ -591,7 +632,7 @@ export function ProviderCard({
         <div className="mx-4 mb-3 border-t border-border pt-3">
           <UsageFooter
             provider={provider}
-            providerId={provider.id}
+            providerId={usageProviderId}
             appId={appId}
             usageEnabled={usageEnabled}
             isCurrent={isCurrent}

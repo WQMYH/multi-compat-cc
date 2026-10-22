@@ -71,12 +71,13 @@ fn make_auth_error(status: reqwest::StatusCode) -> UsageResult {
 // ── DeepSeek ────────────────────────────────────────────────
 // GET https://api.deepseek.com/user/balance
 // Response: { balance_infos: [{ currency, total_balance, granted_balance, topped_up_balance }], is_available }
+pub(crate) const DEEPSEEK_BALANCE_URL: &str = "https://api.deepseek.com/user/balance";
 
 async fn query_deepseek(api_key: &str) -> Result<UsageResult, String> {
     let client = crate::proxy::http_client::get();
 
     let resp = client
-        .get("https://api.deepseek.com/user/balance")
+        .get(DEEPSEEK_BALANCE_URL)
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Accept", "application/json")
         .timeout(Duration::from_secs(15))
@@ -111,7 +112,7 @@ async fn query_deepseek(api_key: &str) -> Result<UsageResult, String> {
     Ok(parse_deepseek_balance(&body))
 }
 
-fn parse_deepseek_balance(body: &serde_json::Value) -> UsageResult {
+pub(crate) fn parse_deepseek_balance(body: &serde_json::Value) -> UsageResult {
     let is_available = body
         .get("is_available")
         .and_then(|v| v.as_bool())

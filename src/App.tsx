@@ -132,7 +132,11 @@ import OpenClawHealthBanner from "@/components/openclaw/OpenClawHealthBanner";
 import HermesMemoryPanel, {
   HermesMemorySaveButton,
 } from "@/components/hermes/HermesMemoryPanel";
-import { APP_IDS, DEFAULT_VISIBLE_APPS, isModeAppId } from "@/config/appConfig";
+import {
+  APP_IDS,
+  DEFAULT_VISIBLE_APPS,
+  isModeAppId,
+} from "@/config/appConfig";
 
 interface SyncStatusUpdatedPayload {
   source?: string;
@@ -158,6 +162,16 @@ function App() {
   const [activeApp, setActiveApp] = useState<AppId>(getInitialApp);
   const sharedFeatureApp = sharedFeatureAppOf(activeApp);
   const [currentView, setCurrentView] = useState<View>(readStoredView);
+  useEffect(() => {
+    void invoke<boolean>("native_application_preview_mode")
+      .then((readonly) => {
+        if (readonly) {
+          setActiveApp("dsh");
+          setCurrentView("providers");
+        }
+      })
+      .catch(() => undefined);
+  }, []);
   const [settingsSection, setSettingsSection] =
     useState<SettingsSection>("general");
   const [appConfigScrollTarget, setAppConfigScrollTarget] = useState<AppId>();
@@ -694,7 +708,11 @@ function App() {
     }
     setCurrentView(page);
   };
-  useTrayAppPageSeen(currentView === "providers" ? activeApp : null);
+  useTrayAppPageSeen(
+    currentView === "providers"
+      ? activeApp
+      : null,
+  );
 
   useTrayNavigation((navigation) => {
     const navigate = () => {
@@ -1057,7 +1075,7 @@ function App() {
   };
 
   const handleHideActiveApp = async () => {
-    const visibleCount = Object.values(visibleApps).filter(Boolean).length;
+    const visibleCount = APP_IDS.filter((app) => visibleApps[app]).length;
     if (visibleCount <= 1) return;
     try {
       const current = await settingsApi.get();
@@ -1102,7 +1120,9 @@ function App() {
         </DropdownMenuTrigger>
       </HoverTip>
       <DropdownMenuContent align="end" className="min-w-[180px]">
-        <DropdownMenuItem onSelect={() => openPage("sessions")}>
+        <DropdownMenuItem
+          onSelect={() => openPage("sessions")}
+        >
           {t("appPage.viewSessions")}
         </DropdownMenuItem>
         {activeUsageApp && (
@@ -1115,7 +1135,9 @@ function App() {
             {t("appPage.viewUsage")}
           </DropdownMenuItem>
         )}
-        <DropdownMenuItem onSelect={() => openSettings("appConfig", activeApp)}>
+        <DropdownMenuItem
+          onSelect={() => openSettings("appConfig", activeApp)}
+        >
           {t("appPage.configDirectory")}
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={() => openPage("apps")}>
@@ -1123,7 +1145,7 @@ function App() {
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem
-          disabled={Object.values(visibleApps).filter(Boolean).length <= 1}
+          disabled={APP_IDS.filter((app) => visibleApps[app]).length <= 1}
           onSelect={() => void handleHideActiveApp()}
         >
           {t("appPage.hideFromSidebar")}
@@ -1259,8 +1281,9 @@ function App() {
       setFormModeView(currentModeView);
       setEditingProvider(provider);
     },
-    onDelete: (provider: Provider) =>
-      setConfirmAction({ provider, action: "delete" }),
+    onDelete: (provider: Provider) => {
+      setConfirmAction({ provider, action: "delete" });
+    },
     onDuplicate: handleDuplicateProvider,
     onConfigureUsage: setUsageProvider,
     onOpenWebsite: handleOpenWebsite,
@@ -1587,28 +1610,30 @@ function App() {
         </main>
       </div>
 
-      <AddProviderDialog
-        open={isAddOpen}
-        onOpenChange={setIsAddOpen}
-        appId={activeApp}
-        onSubmit={addProvider}
-        modeView={formModeView}
-      />
+      <>
+          <AddProviderDialog
+            open={isAddOpen}
+            onOpenChange={setIsAddOpen}
+            appId={activeApp}
+            onSubmit={addProvider}
+            modeView={formModeView}
+          />
 
-      <EditProviderDialog
-        open={Boolean(editingProvider)}
-        provider={effectiveEditingProvider}
-        onOpenChange={(open) => {
-          if (!open) {
-            setEditingProvider(null);
-          }
-        }}
-        onSubmit={handleEditProvider}
-        appId={activeApp}
-        isProxyTakeover={isCurrentAppTakeoverActive}
-        isCurrent={effectiveEditingProvider?.id === currentProviderId}
-        modeView={formModeView}
-      />
+          <EditProviderDialog
+            open={Boolean(editingProvider)}
+            provider={effectiveEditingProvider}
+            onOpenChange={(open) => {
+              if (!open) {
+                setEditingProvider(null);
+              }
+            }}
+            onSubmit={handleEditProvider}
+            appId={activeApp}
+            isProxyTakeover={isCurrentAppTakeoverActive}
+            isCurrent={effectiveEditingProvider?.id === currentProviderId}
+            modeView={formModeView}
+          />
+      </>
 
       {effectiveUsageProvider && (
         <UsageScriptModal

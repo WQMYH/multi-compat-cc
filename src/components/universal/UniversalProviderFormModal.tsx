@@ -25,6 +25,7 @@ interface UniversalProviderFormModalProps {
   onSaveAndSync?: (provider: UniversalProvider) => void;
   editingProvider?: UniversalProvider | null;
   initialPreset?: UniversalProviderPreset | null;
+  targetApp?: "dsh";
 }
 
 export function UniversalProviderFormModal({
@@ -34,6 +35,7 @@ export function UniversalProviderFormModal({
   onSaveAndSync,
   editingProvider,
   initialPreset,
+  targetApp,
 }: UniversalProviderFormModalProps) {
   const isDarkMode = useDarkMode();
   const { t } = useTranslation();
@@ -53,6 +55,7 @@ export function UniversalProviderFormModal({
   const [claudeEnabled, setClaudeEnabled] = useState(true);
   const [codexEnabled, setCodexEnabled] = useState(true);
   const [geminiEnabled, setGeminiEnabled] = useState(true);
+  const [dshEnabled, setDshEnabled] = useState(false);
 
   // 模型配置
   const [models, setModels] = useState<UniversalProviderModels>({});
@@ -74,6 +77,7 @@ export function UniversalProviderFormModal({
       setClaudeEnabled(editingProvider.apps.claude);
       setCodexEnabled(editingProvider.apps.codex);
       setGeminiEnabled(editingProvider.apps.gemini);
+      setDshEnabled(editingProvider.apps.dsh ?? false);
       setModels(editingProvider.models || {});
 
       // 尝试匹配预设
@@ -90,12 +94,13 @@ export function UniversalProviderFormModal({
       setApiKey("");
       setWebsiteUrl(defaultPreset.websiteUrl || "");
       setNotes("");
-      setClaudeEnabled(defaultPreset.defaultApps.claude);
-      setCodexEnabled(defaultPreset.defaultApps.codex);
-      setGeminiEnabled(defaultPreset.defaultApps.gemini);
+      setClaudeEnabled(!targetApp && defaultPreset.defaultApps.claude);
+      setCodexEnabled(!targetApp && defaultPreset.defaultApps.codex);
+      setGeminiEnabled(!targetApp && defaultPreset.defaultApps.gemini);
+      setDshEnabled(targetApp === "dsh");
       setModels(deepClone(defaultPreset.defaultModels));
     }
-  }, [editingProvider, initialPreset, isOpen]);
+  }, [editingProvider, initialPreset, isOpen, targetApp]);
 
   // 选择预设
   const handlePresetSelect = useCallback(
@@ -103,18 +108,19 @@ export function UniversalProviderFormModal({
       setSelectedPreset(preset);
       if (!isEditMode) {
         setName(preset.name);
-        setClaudeEnabled(preset.defaultApps.claude);
-        setCodexEnabled(preset.defaultApps.codex);
-        setGeminiEnabled(preset.defaultApps.gemini);
+        setClaudeEnabled(!targetApp && preset.defaultApps.claude);
+        setCodexEnabled(!targetApp && preset.defaultApps.codex);
+        setGeminiEnabled(!targetApp && preset.defaultApps.gemini);
+        setDshEnabled(targetApp === "dsh");
         setModels(deepClone(preset.defaultModels));
       }
     },
-    [isEditMode],
+    [isEditMode, targetApp],
   );
 
   // 更新模型配置
   const updateModel = useCallback(
-    (app: "claude" | "codex" | "gemini", field: string, value: string) => {
+    (app: "claude" | "codex" | "gemini" | "dsh", field: string, value: string) => {
       setModels((prev) => ({
         ...prev,
         [app]: {
@@ -200,9 +206,11 @@ requires_openai_auth = true`;
           websiteUrl: websiteUrl.trim() || undefined,
           notes: notes.trim() || undefined,
           apps: {
+            ...editingProvider.apps,
             claude: claudeEnabled,
             codex: codexEnabled,
             gemini: geminiEnabled,
+            dsh: dshEnabled,
           },
           models,
         }
@@ -220,6 +228,7 @@ requires_openai_auth = true`;
         claude: claudeEnabled,
         codex: codexEnabled,
         gemini: geminiEnabled,
+        dsh: dshEnabled,
       };
       provider.models = models;
       provider.websiteUrl = websiteUrl.trim() || undefined;
@@ -238,6 +247,7 @@ requires_openai_auth = true`;
     claudeEnabled,
     codexEnabled,
     geminiEnabled,
+    dshEnabled,
     models,
     selectedPreset,
     onSave,
@@ -259,9 +269,11 @@ requires_openai_auth = true`;
           websiteUrl: websiteUrl.trim() || undefined,
           notes: notes.trim() || undefined,
           apps: {
+            ...editingProvider.apps,
             claude: claudeEnabled,
             codex: codexEnabled,
             gemini: geminiEnabled,
+            dsh: dshEnabled,
           },
           models,
         }
@@ -279,6 +291,7 @@ requires_openai_auth = true`;
         claude: claudeEnabled,
         codex: codexEnabled,
         gemini: geminiEnabled,
+        dsh: dshEnabled,
       };
       provider.models = models;
       provider.websiteUrl = websiteUrl.trim() || undefined;
@@ -296,6 +309,7 @@ requires_openai_auth = true`;
     claudeEnabled,
     codexEnabled,
     geminiEnabled,
+    dshEnabled,
     models,
     selectedPreset,
   ]);
@@ -521,6 +535,18 @@ requires_openai_auth = true`;
           <Label>
             {t("universalProvider.modelConfig", { defaultValue: "模型配置" })}
           </Label>
+
+          <div className="space-y-3 rounded-lg border p-4">
+            <div className="flex items-center justify-between">
+              <Label>DSH</Label>
+              <Switch checked={dshEnabled} onCheckedChange={setDshEnabled} />
+            </div>
+            {dshEnabled && <div className="space-y-1">
+              <Label>{t("universalProvider.model", { defaultValue: "模型" })}</Label>
+              <Input value={models.dsh?.model ?? ""}
+                onChange={(event) => updateModel("dsh", "model", event.target.value)} />
+            </div>}
+          </div>
 
           {/* Claude 模型 */}
           {claudeEnabled && (

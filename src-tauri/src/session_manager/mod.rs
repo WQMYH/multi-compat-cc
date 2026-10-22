@@ -13,7 +13,7 @@ use std::time::Instant;
 
 // 其余模型类型从 `session_manager::model` 引用
 pub use model::SessionMessage;
-use providers::{agy, claude, codex, gemini, grokbuild, hermes, mcode, openclaw, opencode, pi};
+use providers::{agy, claude, codex, dsh, gemini, grokbuild, hermes, mcode, openclaw, opencode, pi};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,6 +88,7 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
     sessions.extend(r8);
     sessions.extend(mcode::scan_sessions());
     sessions.extend(agy::scan_sessions());
+    sessions.extend(dsh::scan_sessions());
 
     sessions.sort_by(|a, b| {
         let a_ts = a.last_active_at.or(a.created_at).unwrap_or(0);
@@ -121,6 +122,7 @@ pub fn load_messages(provider_id: &str, source_path: &str) -> Result<Vec<Session
         "grokbuild" => grokbuild::load_messages(path),
         "hermes" => hermes::load_messages(path),
         "pi" => pi::load_messages(path),
+        "dsh" => dsh::load_messages(path),
         _ => Err(format!("Unsupported provider: {provider_id}")),
     }
 }
@@ -220,6 +222,7 @@ fn delete_session_with_roots(
         "grokbuild" => grokbuild::delete_session(&validated_root, &validated_source, session_id),
         "hermes" => hermes::delete_session(&validated_root, &validated_source, session_id),
         "pi" => pi::delete_session(&validated_root, &validated_source, session_id),
+        "dsh" => dsh::delete_session(&validated_root, &validated_source, session_id),
         _ => Err(format!("Unsupported provider: {provider_id}")),
     }
 }
@@ -234,6 +237,7 @@ fn provider_roots(provider_id: &str) -> Result<Vec<PathBuf>, String> {
         "grokbuild" => grokbuild::session_roots(),
         "hermes" => vec![crate::hermes_config::get_hermes_dir().join("sessions")],
         "pi" => pi::session_roots(),
+        "dsh" => dsh::session_roots(),
         "agy" => agy::session_roots(),
         _ => return Err(format!("Unsupported provider: {provider_id}")),
     };

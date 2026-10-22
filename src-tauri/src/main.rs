@@ -1,5 +1,5 @@
-// Prevents additional console window on Windows in release, DO NOT REMOVE!!
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Desktop debug builds also use the GUI subsystem; diagnostics remain in the app log.
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 fn main() {
     // 在 Linux 上设置 WebKit 环境变量以解决 DMA-BUF 渲染问题

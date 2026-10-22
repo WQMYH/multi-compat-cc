@@ -49,7 +49,7 @@ import {
   useUpdateSkill,
 } from "@/hooks/useSkills";
 import type { AppId } from "@/lib/api/types";
-import { SKILLS_APP_IDS } from "@/config/appConfig";
+import { SKILLS_APP_IDS, type SkillsAppId } from "@/config/appConfig";
 import { settingsApi, skillsApi } from "@/lib/api";
 import { copyText } from "@/lib/clipboard";
 import { extractErrorMessage } from "@/utils/errorUtils";
@@ -313,7 +313,7 @@ const UnifiedSkillsPanel: React.FC<UnifiedSkillsPanelProps> = ({
       if (statusFilter === "updates" && !updatesMap[skill.id]) return false;
       if (statusFilter === "none" && enabledCount(skill) > 0) return false;
       if (statusFilter.startsWith("app:")) {
-        const app = statusFilter.slice(4) as AppId;
+        const app = statusFilter.slice(4) as SkillsAppId;
         if (!skill.apps[app]) return false;
       }
       if (sourceFilter !== "all" && sourceKey(skill) !== sourceFilter) {
@@ -492,7 +492,7 @@ const UnifiedSkillsPanel: React.FC<UnifiedSkillsPanelProps> = ({
     }
   };
 
-  const handleColumnBulk = (app: AppId, enabled: boolean) => {
+  const handleColumnBulk = (app: SkillsAppId, enabled: boolean) => {
     const ids = scope.rows
       .filter((skill) => Boolean(skill.apps[app]) !== enabled)
       .map((skill) => skill.id);
@@ -503,7 +503,7 @@ const UnifiedSkillsPanel: React.FC<UnifiedSkillsPanelProps> = ({
     });
   };
 
-  const handleSelectionToggle = (app: AppId, enabled: boolean) => {
+  const handleSelectionToggle = (app: SkillsAppId, enabled: boolean) => {
     const chosen = installedSkills.filter((skill) => selected.has(skill.id));
     const ids = chosen
       .filter((skill) => Boolean(skill.apps[app]) !== enabled)
@@ -1762,7 +1762,7 @@ UnifiedSkillsPanel.displayName = "UnifiedSkillsPanel";
 interface InstalledRowProps {
   skill: InstalledSkill;
   first: boolean;
-  appIds: AppId[];
+  appIds: SkillsAppId[];
   checked: boolean;
   hasUpdate: boolean;
   isUpdating: boolean;
@@ -1771,7 +1771,7 @@ interface InstalledRowProps {
   disabled: boolean;
   sourceText: string;
   onPick: (checked: boolean) => void;
-  onCell: (app: AppId) => void;
+  onCell: (app: SkillsAppId) => void;
   onOpenSource: () => void;
   onFixSync: () => void;
   onUpdate: () => void;
@@ -2043,9 +2043,9 @@ function AppMenuButton({
 }: {
   label: string;
   ariaLabel: string;
-  apps: AppId[];
+  apps: SkillsAppId[];
   disabled: boolean;
-  onPick: (app: AppId) => void;
+  onPick: (app: SkillsAppId) => void;
 }) {
   return (
     <DropdownMenu>

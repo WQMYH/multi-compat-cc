@@ -315,6 +315,8 @@ export interface VisibleApps {
   hermes: boolean;
   pi: boolean;
   mcode: boolean;
+  qoder: boolean;
+  dsh: boolean;
   agy: boolean;
 }
 
@@ -817,6 +819,8 @@ export interface UniversalProviderApps {
   claude: boolean;
   codex: boolean;
   gemini: boolean;
+  qoder?: boolean;
+  dsh?: boolean;
 }
 
 // Claude 模型配置
@@ -843,6 +847,8 @@ export interface UniversalProviderModels {
   claude?: ClaudeModelConfig;
   codex?: CodexModelConfig;
   gemini?: GeminiModelConfig;
+  qoder?: CodexModelConfig;
+  dsh?: CodexModelConfig;
 }
 
 // 统一供应商（跨应用共享配置）

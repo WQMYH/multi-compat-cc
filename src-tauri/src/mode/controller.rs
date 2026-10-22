@@ -35,7 +35,7 @@ use crate::provider::Provider;
 use crate::services::provider::codex_client_catalog;
 use crate::services::provider::codex_direct::{self, Owner};
 use crate::services::provider::codex_official_models;
-use crate::services::provider::{claude_direct, gemini_direct, grok_direct};
+use crate::services::provider::{claude_direct, dsh_direct, gemini_direct, grok_direct};
 use crate::store::AppState;
 
 use super::contract;
@@ -46,12 +46,13 @@ use super::state::{op, Contract, Mode, ModeState, PendingTarget, StackState};
 
 /// 有路由模式的应用（[`AppType::has_route_mode`]）。Claude Desktop 也在内：它经同一个路由
 /// 服务转发，只是没有故障转移。
-pub const PROXY_APPS: [AppType; 5] = [
+pub const PROXY_APPS: [AppType; 6] = [
     AppType::Claude,
     AppType::Codex,
     AppType::Gemini,
     AppType::GrokBuild,
     AppType::ClaudeDesktop,
+    AppType::Dsh,
 ];
 
 fn err(error: impl std::fmt::Display) -> String {
@@ -488,6 +489,17 @@ async fn write_proxy(
             .map_err(err)?;
             unchanged
         }
+        AppType::Dsh => {
+            let members = published_members(state, app, &stack, route)?;
+            let base = format!("{}/dsh/v1", proxy_url.trim_end_matches('/'));
+            let projection = dsh_direct::route_projection(&state.db, &state.codex_oauth_manager, route, &base, PROXY_TOKEN_PLACEHOLDER, &members).await.map_err(err)?;
+            let contract = contract::dsh(&projection);
+            let unchanged = !force && live_now.has_contract(&contract.key);
+            target.contract = Some(contract);
+            dsh_direct::run(&state.db, op_name,
+                (!unchanged).then_some(dsh_direct::Target::Provider(&projection)), pending(target)).map_err(err)?;
+            unchanged
+        }
         AppType::ClaudeDesktop => {
             let members = published_members(state, app, &stack, route)?;
             let profile = claude_desktop_config::route_profile(
@@ -597,6 +609,13 @@ fn write_direct(
                 pending_target,
             )
             .map_err(err)?;
+        }
+        AppType::Dsh => {
+            let projection = usable_direct(app, direct.as_ref()).filter(|p| !dsh_direct::needs_routing(p) && !dsh_direct::is_native_ref(p))
+                .map(|p| dsh_direct::projection(p, None, &[])).transpose().map_err(err)?;
+            let write = attached.then(|| projection.as_ref().map(dsh_direct::Target::Provider)
+                .unwrap_or(dsh_direct::Target::NativeDefault));
+            dsh_direct::run(&state.db, op_name, write, pending_target).map_err(err)?;
         }
         AppType::ClaudeDesktop => {
             // 直连那家写不进去（模型映射卡、配置不全）也不能让 Desktop 一直指着路由：退回官方。

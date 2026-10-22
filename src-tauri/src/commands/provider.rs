@@ -27,13 +27,244 @@ pub fn get_providers(
     app: String,
 ) -> Result<IndexMap<String, Provider>, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
+    if crate::readonly_provider_preview() {
+        return state.db.get_all_providers(&app).map_err(|e| e.to_string());
+    }
     ProviderService::list(state.inner(), app_type).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn get_current_provider(state: State<'_, AppState>, app: String) -> Result<String, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
+    if crate::readonly_provider_preview() {
+        return state
+            .db
+            .get_current_provider(&app)
+            .map(|id| id.unwrap_or_default())
+            .map_err(|e| e.to_string());
+    }
     ProviderService::current(state.inner(), app_type).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_dsh_native_defaults(
+    state: State<'_, AppState>,
+    inventory: Option<bool>,
+) -> Result<Vec<Provider>, String> {
+    let db = state.db.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let baseline = crate::services::provider::dsh_direct::native_default_baseline()
+            .map_err(|e| e.to_string())?;
+        let rows = if inventory.unwrap_or(false) {
+            read_dsh_native_providers(&db, baseline)?
+        } else {
+            read_dsh_native_defaults(baseline)?
+        };
+        let (native, observed): (Vec<_>, Vec<_>) = rows
+            .into_iter()
+            .partition(|row| row.settings_config.get("nativeObservedProfile").is_none());
+        let mut result = crate::services::provider::dsh_direct::register_native_refs(&db, native)
+            .map_err(|e| e.to_string())?;
+        result.extend(observed);
+        Ok(result)
+    })
+    .await
+    .map_err(|_| "DSH_NATIVE_DEFAULTS_TASK_FAILED".to_string())?
+}
+
+pub(crate) fn read_dsh_native_defaults(
+    baseline: Option<serde_json::Value>,
+) -> Result<Vec<Provider>, String> {
+    serde_json::from_value(read_dsh_native_response(baseline, None, None)?)
+        .map_err(|_| "DSH_NATIVE_DEFAULTS_INVALID_RESPONSE".into())
+}
+
+pub(crate) fn read_dsh_native_providers(
+    db: &crate::Database,
+    baseline: Option<serde_json::Value>,
+) -> Result<Vec<Provider>, String> {
+    let providers = db.get_all_providers("dsh").map_err(|e| e.to_string())?;
+    let excluded = providers
+        .values()
+        .filter(|provider| !crate::services::provider::dsh_direct::is_native_ref(provider))
+        .map(|provider| {
+            (
+                crate::services::provider::dsh_direct::id_for(&provider.id),
+                serde_json::json!(provider.id),
+            )
+        })
+        .collect();
+    let mut rows: Vec<Provider> =
+        serde_json::from_value(read_dsh_native_response(baseline, None, Some(excluded))?)
+            .map_err(|_| "DSH_NATIVE_PROVIDERS_INVALID_RESPONSE")?;
+    for row in &mut rows {
+        if row.settings_config["nativeObservation"] != true {
+            continue;
+        }
+        let profile = row.settings_config["profile"]
+            .as_str()
+            .filter(|p| ["desktop", "web"].contains(p))
+            .ok_or("DSH_NATIVE_PROVIDERS_INVALID_RESPONSE")?
+            .to_owned();
+        let current = row.settings_config["nativeIsCurrent"] == true;
+        let default = row.settings_config["nativeIsDefault"] == true;
+        *row = providers
+            .get(&row.id)
+            .filter(|p| !crate::services::provider::dsh_direct::is_native_ref(p))
+            .ok_or("DSH_NATIVE_PROVIDERS_INVALID_RESPONSE")?
+            .clone();
+        row.settings_config["nativeObservedProfile"] = serde_json::json!(profile);
+        row.settings_config["nativeIsCurrent"] = serde_json::json!(current);
+        row.settings_config["nativeIsDefault"] = serde_json::json!(default);
+    }
+    Ok(rows)
+}
+
+#[tauri::command]
+pub async fn set_dsh_native_model(
+    app_handle: tauri::AppHandle,
+    provider_id: String,
+    model_id: String,
+) -> Result<(), String> {
+    if crate::readonly_provider_preview() {
+        return Err("READONLY_PREVIEW_NO_SIDE_EFFECTS".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle
+            .try_state::<AppState>()
+            .ok_or("Application state unavailable")?;
+        crate::services::provider::dsh_direct::select_native_model(
+            state.inner(),
+            &provider_id,
+            &model_id,
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|_| "DSH_NATIVE_SELECTION_TASK_FAILED".to_string())?
+}
+
+fn read_dsh_native_response(
+    baseline: Option<serde_json::Value>,
+    provider_id: Option<&str>,
+    inventory: Option<serde_json::Map<String, serde_json::Value>>,
+) -> Result<serde_json::Value, String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let deadline = super::misc::CommandDeadline::from_timeout(Some(
+        std::time::Duration::from_secs(if provider_id.is_some() { 25 } else { 10 }),
+    ));
+    let cli = super::misc::locate_default_tool("dsh", deadline)?;
+    let node = super::misc::resolve_path_default("node", deadline)?.ok_or("DSH_NODE_NOT_FOUND")?;
+    let home = crate::services::provider::dsh_direct::root().map_err(|e| e.to_string())?;
+    let mut command = Command::new(node);
+    command.args(["--permission", "--allow-fs-read=*"]);
+    let mode = if provider_id.is_some() {
+        "--cc-dsh-native-balance"
+    } else if inventory.is_some() {
+        "--cc-dsh-native-providers"
+    } else {
+        "--cc-dsh-native-defaults"
+    };
+    command
+        .args([
+            "--input-type=module",
+            "--eval",
+            include_str!("../../../src-runtime/dsh-native-defaults.mjs"),
+            "--",
+            mode,
+        ])
+        .env_remove("NODE_OPTIONS")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    #[cfg(not(windows))]
+    super::misc::isolate_child_process_group(&mut command);
+    let input = serde_json::json!({"cliPath":cli,"home":home,"baseline":baseline,
+            "providerId":provider_id,"balanceUrl":crate::services::balance::DEEPSEEK_BALANCE_URL,
+            "excludeProviders":inventory.as_ref().map(|ids| ids.keys().cloned().collect::<Vec<_>>()).unwrap_or_default(),
+            "ccProviders":inventory.unwrap_or_default()});
+    let mut child = command
+        .spawn()
+        .map_err(|_| "DSH_NATIVE_DEFAULTS_START_FAILED")?;
+    let written = child
+        .stdin
+        .take()
+        .ok_or("DSH_NATIVE_DEFAULTS_INPUT_FAILED")?
+        .write_all(input.to_string().as_bytes());
+    if written.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("DSH_NATIVE_DEFAULTS_INPUT_FAILED".into());
+    }
+    let output = super::misc::wait_child_output(child, deadline)
+        .map_err(|_| "DSH_NATIVE_DEFAULTS_TIMEOUT")?;
+    if !output.status.success() {
+        let code = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .ok()
+            .and_then(|value| value["error"].as_str().map(str::to_owned))
+            .filter(|code| {
+                code.starts_with("DSH_") && code.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+            })
+            .unwrap_or_else(|| "DSH_NATIVE_DEFAULTS_READ_FAILED".into());
+        return Err(code);
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|_| "DSH_NATIVE_DEFAULTS_INVALID_RESPONSE".into())
+}
+
+fn dsh_native_balance_result(
+    result: Result<serde_json::Value, String>,
+) -> Result<crate::provider::UsageResult, String> {
+    match result {
+        Ok(body) => Ok(crate::services::balance::parse_deepseek_balance(&body)),
+        Err(code)
+            if code.starts_with("DSH_")
+                && !matches!(
+                    code.as_str(),
+                    "DSH_NATIVE_DEFAULTS_TIMEOUT"
+                        | "DSH_NATIVE_DEFAULTS_START_FAILED"
+                        | "DSH_NATIVE_BALANCE_READ_FAILED"
+                        | "DSH_NATIVE_BALANCE_REQUEST_FAILED"
+                        | "DSH_NATIVE_ACCOUNT_BALANCE_FAILED"
+                ) =>
+        {
+            Ok(crate::provider::UsageResult {
+                success: false,
+                data: None,
+                error: Some(code),
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn source16_native_dsh_balance_distinguishes_identity_failure_from_transport() {
+    for code in [
+        "DSH_NATIVE_BALANCE_IDENTITY_CHANGED",
+        "DSH_NATIVE_API_KEY_NOT_CONFIGURED",
+        "DSH_NATIVE_BALANCE_UNAUTHORIZED",
+        "DSH_NATIVE_ACCOUNT_AUTH_EXPIRED",
+        "DSH_PROFILE_INVALID",
+    ] {
+        let result = dsh_native_balance_result(Err(code.into())).unwrap();
+        assert!(!result.success);
+        assert!(result.data.is_none());
+        assert_eq!(result.error.as_deref(), Some(code));
+    }
+    assert!(dsh_native_balance_result(Err("DSH_NATIVE_DEFAULTS_TIMEOUT".into())).is_err());
+    let result = dsh_native_balance_result(Ok(serde_json::json!({
+        "is_available": true, "balance_infos": [{"currency":"CNY","total_balance":"31.25"}]
+    })))
+    .unwrap();
+    assert_eq!(result.data.unwrap()[0].remaining, Some(31.25));
 }
 
 #[tauri::command]
@@ -590,6 +821,10 @@ fn resolve_coding_plan_credentials(
     }
 }
 
+fn preview_supports_usage(app_type: &AppType, template_type: &str) -> bool {
+    *app_type == AppType::Dsh && template_type == TEMPLATE_TYPE_BALANCE
+}
+
 async fn query_provider_usage_inner(
     state: &AppState,
     copilot_state: &CopilotAuthState,
@@ -597,6 +832,16 @@ async fn query_provider_usage_inner(
     app_type: AppType,
     provider_id: &str,
 ) -> Result<crate::provider::UsageResult, String> {
+    if app_type == AppType::Dsh && provider_id.starts_with("native-current:") {
+        let provider_id = provider_id.to_owned();
+        return tauri::async_runtime::spawn_blocking(move || {
+            let baseline = crate::services::provider::dsh_direct::native_default_baseline()
+                .map_err(|e| e.to_string())?;
+            dsh_native_balance_result(read_dsh_native_response(baseline, Some(&provider_id), None))
+        })
+        .await
+        .map_err(|_| "DSH_NATIVE_BALANCE_TASK_FAILED".to_string())?;
+    }
     // 从数据库读取供应商信息，检查特殊模板类型
     let providers = state
         .db
@@ -609,6 +854,10 @@ async fn query_provider_usage_inner(
     let template_type = usage_script
         .and_then(|s| s.template_type.as_deref())
         .unwrap_or("");
+
+    if crate::readonly_provider_preview() && !preview_supports_usage(&app_type, template_type) {
+        return Err("READONLY_PREVIEW_NATIVE_BALANCE_ONLY".into());
+    }
 
     // ── GitHub Copilot 专用路径 ──
     if template_type == TEMPLATE_TYPE_GITHUB_COPILOT {
@@ -1243,6 +1492,21 @@ mod native_query_credentials_tests {
     use crate::app_config::AppType;
     use crate::provider::{Provider, UsageScript};
     use serde_json::json;
+
+    #[test]
+    fn source12_preview_reuses_dsh_balance_without_enabling_account_refresh_or_scripts() {
+        assert!(super::preview_supports_usage(&AppType::Dsh, "balance"));
+        for template in [
+            "",
+            "javascript",
+            "official_subscription",
+            "github_copilot",
+            "token_plan",
+        ] {
+            assert!(!super::preview_supports_usage(&AppType::Dsh, template));
+        }
+        assert!(!super::preview_supports_usage(&AppType::Codex, "balance"));
+    }
 
     fn usage_script(
         coding_plan_provider: Option<&str>,

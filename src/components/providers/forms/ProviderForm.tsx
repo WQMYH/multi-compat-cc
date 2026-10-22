@@ -282,6 +282,7 @@ type LocalProxyRequestOverridesBuildResult = ReturnType<
 
 export interface ProviderFormProps {
   appId: AppId;
+  nativeTarget?: "dsh";
   providerId?: string;
   submitLabel: string;
   onSubmit: (values: ProviderFormValues) => Promise<void> | void;
@@ -325,6 +326,9 @@ export interface ProviderFormProps {
 }
 
 export function ProviderForm(props: ProviderFormProps) {
+  if (props.appId === "dsh") {
+    return <ProviderFormFull {...props} nativeTarget="dsh" appId="codex" />;
+  }
   if (props.appId === "mcode") return <McodeProviderForm {...props} />;
   if (props.appId === "pi") {
     return <PiProviderForm {...props} />;
@@ -341,6 +345,7 @@ export function ProviderForm(props: ProviderFormProps) {
 
 function ProviderFormFull({
   appId,
+  nativeTarget,
   providerId,
   submitLabel,
   onSubmit,
@@ -702,7 +707,7 @@ function ProviderFormFull({
   // 聚合模式下 Claude Code / Codex 的第三方供应商用简化面板（连接 + 模型列表 + 高级）；
   // 两种布局共用同一份表单状态，完整表单从直连 / 路由那格打开。
   const { data: appModeView } = useAppMode(
-    appId,
+    nativeTarget === "dsh" ? "dsh" : appId,
     appId === "claude" || appId === "codex",
   );
   // 应用实际在直连时，非原生上游格式发不出请求：正在直连用的这张卡一保存就坏，别的卡切不过去。
@@ -829,7 +834,20 @@ function ProviderFormFull({
 
   // 新增：预设或模板投影到当前配置文件上显示。每次重置显示内容都要重新投影，否则保存时
   // 三方比较的底和显示内容对不上。
-  const { projectDraft } = useDraftEditorProjection(appId, onEditorBaseChange);
+  const { projectDraft: projectEditorDraft } = useDraftEditorProjection(
+    appId,
+    onEditorBaseChange,
+  );
+  const projectDraft = useCallback<typeof projectEditorDraft>(
+    (settings, category, apply, meta) => {
+      if (nativeTarget) {
+        apply(settings);
+        return;
+      }
+      projectEditorDraft(settings, category, apply, meta);
+    },
+    [nativeTarget, projectEditorDraft],
+  );
   const projectCodexDraft = useCallback(
     (
       auth: Record<string, unknown>,
@@ -1270,6 +1288,30 @@ function ProviderFormFull({
     (appId === "claude" || appId === "codex") && category !== "official";
 
   const handleSubmit = async (values: ProviderFormData) => {
+    if (
+      nativeTarget === "dsh" &&
+      isCodexOfficialProvider &&
+      !codexModel.trim()
+    ) {
+      toast.error(
+        t("providerForm.dshDefaultModelRequired", {
+          defaultValue: "请先选择 DSH 默认模型",
+        }),
+      );
+      return;
+    }
+    if (
+      nativeTarget === "dsh" &&
+      isCodexOfficialProvider &&
+      !selectedCodexAccountId
+    ) {
+      toast.error(
+        t("providerForm.dshManagedAccountRequired", {
+          defaultValue: "请先选择 CC 已托管的 Codex 账号",
+        }),
+      );
+      return;
+    }
     const overridesResult = shouldApplyLocalProxyRequestOverrides
       ? buildLocalProxyRequestOverrides(
           localProxyHeadersOverride,
@@ -2692,6 +2734,7 @@ function ProviderFormFull({
 
           {appId === "codex" && (
             <CodexFormFields
+              appId={nativeTarget === "dsh" ? "dsh" : undefined}
               providerId={providerId}
               isCopilotPreset={isCopilotProvider}
               isCopilotAuthenticated={isCopilotAuthenticated}
@@ -2726,8 +2769,10 @@ function ProviderFormFull({
               codexOauthNoneOptionDescription={t(
                 "codex.followCodexLoginDescription",
               )}
-              codexOauthAllowUnboundSelection
-              codexOauthAllowUnboundSelectionWithoutStatus
+              codexOauthAllowUnboundSelection={nativeTarget !== "dsh"}
+              codexOauthAllowUnboundSelectionWithoutStatus={
+                nativeTarget !== "dsh"
+              }
               codexOauthRequireExplicitSelection={
                 requiresExplicitCodexOfficialSelection
               }

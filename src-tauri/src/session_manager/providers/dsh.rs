@@ -1,0 +1,516 @@
+// Adapted from yang227/cc-switch PR7356 (MIT), with native-root validation.
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+
+use serde_json::Value;
+
+use crate::session_manager::model::SessionBlock;
+use crate::session_manager::{SessionMessage, SessionMeta};
+
+use super::utils::{
+    extract_text, path_basename, truncate_summary, FileParseCache, TITLE_MAX_CHARS,
+};
+
+const PROVIDER_ID: &str = "dsh";
+const SESSION_FILE_NAME: &str = "session.jsonl.zstd";
+/// Compressed size guard; decompressed content is bounded by the event limit.
+const MAX_SESSION_BYTES: u64 = 64 * 1024 * 1024;
+/// Reject oversized decompressed content instead of returning a partial transcript.
+const MAX_DECOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_EVENTS: usize = 500_000;
+
+/// 会话页每次打开都会全量扫描；没变过的文件直接复用上次的解析结果。
+/// zstd 解压比 claude/codex 的明文解析更贵，缓存收益更大。
+static PARSE_CACHE: LazyLock<FileParseCache> = LazyLock::new(FileParseCache::new);
+
+pub fn session_roots() -> Vec<PathBuf> {
+    crate::services::provider::dsh_direct::root()
+        .map(|home| vec![home.join("sessions")])
+        .unwrap_or_default()
+}
+
+pub fn scan_sessions() -> Vec<SessionMeta> {
+    let Some(root) = session_roots().into_iter().next() else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    for project in entries.flatten() {
+        let project_path = project.path();
+        if !project_path.is_dir() {
+            continue;
+        }
+        let Ok(session_dirs) = fs::read_dir(&project_path) else {
+            continue;
+        };
+        for session_dir in session_dirs.flatten() {
+            let file = session_dir.path().join(SESSION_FILE_NAME);
+            if file.is_file() {
+                if let Ok((_, source)) = crate::session_manager::content::resolve_under_roots(
+                    PROVIDER_ID,
+                    &file,
+                    std::slice::from_ref(&root),
+                ) {
+                    files.push(source);
+                }
+            }
+        }
+    }
+    PARSE_CACHE.scan(files, scan_session_file)
+}
+
+/// 适配 [`FileParseCache`] 的解析入口：解析失败按 io 错误上抛，
+/// 让缓存跳过且不记住「没有会话」，下轮扫描重试。
+fn scan_session_file(path: &Path) -> io::Result<Option<SessionMeta>> {
+    match parse_session(path) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+    }
+}
+
+pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
+    let events = read_events(path)?;
+    let mut messages = Vec::new();
+    for value in &events {
+        match value.get("type").and_then(Value::as_str) {
+            Some("user/message") => {
+                let content = value
+                    .pointer("/data/content")
+                    .map(extract_text)
+                    .unwrap_or_default();
+                if !content.trim().is_empty() {
+                    messages.push(SessionMessage::from_blocks(
+                        "user",
+                        event_time(value),
+                        vec![SessionBlock::text(content)],
+                    ));
+                }
+            }
+            Some("assistant/message") => {
+                let content = assistant_text(value);
+                if !content.trim().is_empty() {
+                    messages.push(SessionMessage::from_blocks(
+                        "assistant",
+                        event_time(value),
+                        vec![SessionBlock::text(content)],
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(messages)
+}
+
+pub fn delete_session(root: &Path, path: &Path, session_id: &str) -> Result<bool, String> {
+    if session_id.contains(['/', '\\']) || session_id == "." || session_id == ".." {
+        return Err("Invalid DSH session ID".to_string());
+    }
+    if path.file_name().and_then(|n| n.to_str()) != Some(SESSION_FILE_NAME) {
+        return Err(format!(
+            "DSH session source must be a {SESSION_FILE_NAME} file: {}",
+            path.display()
+        ));
+    }
+    let meta = parse_session(path)?;
+    if meta.session_id != session_id {
+        return Err(format!(
+            "DSH session ID mismatch: expected {session_id}, found {}",
+            meta.session_id
+        ));
+    }
+    let root = root.canonicalize().map_err(|error| {
+        format!(
+            "Failed to resolve DSH sessions root {}: {error}",
+            root.display()
+        )
+    })?;
+    let source = path
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve DSH session {}: {error}", path.display()))?;
+    let dir = source
+        .parent()
+        .ok_or_else(|| "DSH session has no parent directory".to_string())?;
+    if !dir.starts_with(&root)
+        || source
+            .strip_prefix(&root)
+            .map_err(|_| "Invalid DSH session path")?
+            .components()
+            .count()
+            != 3
+        || dir.file_name().and_then(|name| name.to_str()) != Some(session_id)
+    {
+        return Err("DSH session is outside the sessions root".to_string());
+    }
+    fs::remove_dir_all(dir)
+        .map_err(|error| format!("Failed to delete DSH session {}: {error}", dir.display()))?;
+    Ok(true)
+}
+
+fn event_time(value: &Value) -> Option<i64> {
+    value
+        .get("time")
+        .or_else(|| value.get("time0"))
+        .and_then(Value::as_i64)
+}
+
+fn assistant_text(value: &Value) -> String {
+    value
+        .pointer("/data/message/content")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|item| item.get("text").and_then(Value::as_str).map(str::to_string))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+fn read_events(path: &Path) -> Result<Vec<Value>, String> {
+    let (_, source) =
+        crate::session_manager::content::resolve_under_roots(PROVIDER_ID, path, &session_roots())?;
+    read_events_with_limit(&source, MAX_DECOMPRESSED_BYTES)
+}
+
+fn read_events_with_limit(path: &Path, limit: u64) -> Result<Vec<Value>, String> {
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("Failed to stat DSH session {}: {error}", path.display()))?;
+    if metadata.len() > MAX_SESSION_BYTES {
+        return Err(format!(
+            "DSH session exceeds the {MAX_SESSION_BYTES}-byte safety limit"
+        ));
+    }
+    let file = File::open(path).map_err(|error| format!("Failed to open DSH session: {error}"))?;
+    let decoder = zstd::stream::read::Decoder::new(file)
+        .map_err(|error| format!("Failed to decompress DSH session: {error}"))?;
+    let mut reader = BufReader::new(decoder.take(limit.saturating_add(1)));
+    let mut events = Vec::new();
+    let mut bytes = 0;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let count = reader
+            .read_line(&mut line)
+            .map_err(|error| format!("Failed to read DSH session: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        bytes += count as u64;
+        if bytes > limit {
+            return Err("DSH session exceeds the decompressed safety limit".into());
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        if events.len() >= MAX_EVENTS {
+            return Err(format!(
+                "DSH session exceeds the {MAX_EVENTS}-event safety limit"
+            ));
+        }
+        events.push(
+            serde_json::from_str::<Value>(&line)
+                .map_err(|_| "DSH session contains an invalid JSON record")?,
+        );
+    }
+    Ok(events)
+}
+
+fn parse_session(path: &Path) -> Result<SessionMeta, String> {
+    let source = path
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve DSH session {}: {error}", path.display()))?;
+    let events = read_events(&source)?;
+    let header = events
+        .iter()
+        .find(|value| value.get("type").and_then(Value::as_str) == Some("session"))
+        .ok_or_else(|| "DSH session has no header".to_string())?;
+    let id = header
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "DSH session header has no id".to_string())?
+        .to_string();
+    let cwd = header
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let created_at = header.get("createdAt").and_then(Value::as_i64);
+
+    let mut title = events
+        .iter()
+        .rev()
+        .find(|value| value.get("type").and_then(Value::as_str) == Some("session/title"))
+        .and_then(|value| value.pointer("/data/title"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let mut first_user: Option<String> = None;
+    let mut last_text: Option<String> = None;
+    let mut last_active_at = created_at;
+    for value in &events {
+        if let Some(time) = event_time(value) {
+            last_active_at = Some(last_active_at.map_or(time, |current| current.max(time)));
+        }
+        match value.get("type").and_then(Value::as_str) {
+            Some("user/message") => {
+                let content = value
+                    .pointer("/data/content")
+                    .map(extract_text)
+                    .unwrap_or_default();
+                if first_user.is_none() && !content.trim().is_empty() {
+                    first_user = Some(content.clone());
+                }
+                if !content.trim().is_empty() {
+                    last_text = Some(content);
+                }
+            }
+            Some("assistant/message") => {
+                let text = assistant_text(value);
+                if !text.trim().is_empty() {
+                    last_text = Some(text);
+                }
+            }
+            _ => {}
+        }
+    }
+    if title.is_none() {
+        title = first_user
+            .as_deref()
+            .map(|message| truncate_summary(message, TITLE_MAX_CHARS))
+            .filter(|message| !message.is_empty())
+            .or_else(|| cwd.as_deref().and_then(path_basename));
+    }
+    let summary = last_text
+        .as_deref()
+        .map(|message| truncate_summary(message, 160))
+        .filter(|message| !message.is_empty());
+    Ok(SessionMeta {
+        provider_id: PROVIDER_ID.to_string(),
+        session_id: id,
+        title,
+        summary,
+        project_dir: cwd.filter(|value| !value.trim().is_empty()),
+        created_at,
+        last_active_at,
+        source_path: source.to_str().map(str::to_string),
+        resume_command: None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    fn write_session(home: &Path, project: &str, id: &str, events: &[Value]) -> PathBuf {
+        let dir = home.join("sessions").join(project).join(id);
+        fs::create_dir_all(&dir).unwrap();
+        let payload = events
+            .iter()
+            .map(|event| serde_json::to_string(event).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let compressed = zstd::stream::encode_all(payload.as_bytes(), 3).unwrap();
+        let file = dir.join(SESSION_FILE_NAME);
+        fs::write(&file, compressed).unwrap();
+        file
+    }
+
+    fn fixture_events() -> Vec<Value> {
+        vec![
+            serde_json::json!({"type":"session","version":0,"id":"session-abc","createdAt":1787104521333_i64,"cwd":"/Users/test/project"}),
+            serde_json::json!({"type":"user/message","seq":8,"time":1787220655606_i64,"data":{"role":"user","content":[{"type":"text","text":"hello dsh"}]}}),
+            serde_json::json!({"type":"session/title","seq":11,"time":1787220655607_i64,"data":{"title":"Greeting"}}),
+            serde_json::json!({"type":"text-chunks","seq0":69,"time0":1787220662295_i64,"data":{"turn":1,"step":1,"index":1,"texts":["stream"," delta"]}}),
+            serde_json::json!({"type":"assistant/message","seq":352,"time":1787220668317_i64,"data":{"turn":1,"step":1,"message":{"role":"assistant","content":[{"type":"reasoning","text":"thinking"},{"type":"text","text":"hi there"}]}}}),
+        ]
+    }
+
+    fn with_temp_home(test: impl FnOnce(&Path)) {
+        let directory = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("DSH_HOME");
+        std::env::set_var("DSH_HOME", directory.path());
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| test(directory.path())));
+        match previous {
+            Some(value) => std::env::set_var("DSH_HOME", value),
+            None => std::env::remove_var("DSH_HOME"),
+        }
+        result.unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn scan_reads_zstd_sessions_with_titles() {
+        with_temp_home(|home| {
+            let file = write_session(
+                home,
+                "--Users-test-project--",
+                "session-abc",
+                &fixture_events(),
+            );
+            let sessions = scan_sessions();
+            assert_eq!(sessions.len(), 1);
+            let meta = &sessions[0];
+            assert_eq!(meta.provider_id, "dsh");
+            assert_eq!(meta.session_id, "session-abc");
+            assert_eq!(meta.title.as_deref(), Some("Greeting"));
+            assert_eq!(meta.project_dir.as_deref(), Some("/Users/test/project"));
+            assert_eq!(meta.created_at, Some(1787104521333));
+            assert_eq!(meta.last_active_at, Some(1787220668317));
+            assert_eq!(
+                meta.source_path.as_deref(),
+                file.canonicalize().unwrap().to_str()
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn load_messages_skips_stream_deltas_and_reasoning() {
+        with_temp_home(|home| {
+            let file = write_session(home, "proj", "session-abc", &fixture_events());
+            let messages = load_messages(&file).unwrap();
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[0].role, "user");
+            assert_eq!(messages[0].content, "hello dsh");
+            assert_eq!(messages[0].ts, Some(1787220655606));
+            assert_eq!(messages[1].role, "assistant");
+            assert_eq!(messages[1].content, "hi there");
+            let serialized = serde_json::to_value(&messages[1]).unwrap();
+            assert_eq!(serialized["blocks"][0]["type"], "text");
+            assert_eq!(serialized["blocks"][0]["text"], "hi there");
+            assert!(serialized.get("content").is_none());
+            let transcript =
+                crate::session_manager::load_transcript(PROVIDER_ID, file.to_str().unwrap())
+                    .unwrap();
+            assert!(!transcript.cached);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn corrupt_sessions_are_skipped_not_fatal() {
+        with_temp_home(|home| {
+            let dir = home.join("sessions").join("proj").join("session-bad");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(SESSION_FILE_NAME), b"not zstd at all").unwrap();
+            write_session(home, "proj", "session-abc", &fixture_events());
+            let sessions = scan_sessions();
+            assert_eq!(sessions.len(), 1);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn rescan_reuses_the_cache_and_drops_deleted_sessions() {
+        with_temp_home(|home| {
+            let file = write_session(home, "proj", "session-abc", &fixture_events());
+            let first = scan_sessions();
+            assert_eq!(first.len(), 1);
+            // 第二次扫描命中解析缓存，结果保持一致
+            let second = scan_sessions();
+            assert_eq!(second.len(), 1);
+            assert_eq!(second[0].session_id, first[0].session_id);
+            // 删除后按本轮文件列表重建缓存，不再返回已删会话
+            delete_session(&home.join("sessions"), &file, "session-abc").unwrap();
+            assert!(scan_sessions().is_empty());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn delete_removes_the_session_directory() {
+        with_temp_home(|home| {
+            let file = write_session(home, "proj", "session-abc", &fixture_events());
+            let root = home.join("sessions");
+            let error = delete_session(&root, &file, "wrong-id").expect_err("id mismatch");
+            assert!(error.contains("mismatch"), "unexpected error: {error}");
+            assert!(file.exists());
+            let deleted = delete_session(&root, &file, "session-abc").unwrap();
+            assert!(deleted);
+            assert!(!file.exists());
+            assert!(!file.parent().unwrap().exists());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn delete_accepts_an_unnormalized_root() {
+        with_temp_home(|home| {
+            let file = write_session(home, "proj", "session-abc", &fixture_events());
+            let root = home.join("sessions").join("proj").join("..");
+            let deleted = delete_session(&root, &file, "session-abc").unwrap();
+            assert!(deleted);
+            assert!(!file.parent().unwrap().exists());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn outside_native_session_sources_are_refused() {
+        with_temp_home(|home| {
+            fs::create_dir_all(home.join("sessions")).unwrap();
+            let file = home.join("outside.jsonl.zstd");
+            fs::write(
+                &file,
+                zstd::stream::encode_all(b"{}".as_slice(), 1).unwrap(),
+            )
+            .unwrap();
+            assert!(load_messages(&file)
+                .unwrap_err()
+                .contains("outside provider roots"));
+            assert!(file.exists());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn a_decompressed_limit_never_returns_a_partial_success() {
+        with_temp_home(|home| {
+            let file = write_session(home, "proj", "session-abc", &fixture_events());
+            assert!(read_events_with_limit(&file, 32)
+                .unwrap_err()
+                .contains("decompressed safety limit"));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn a_corrupt_json_record_never_returns_a_partial_transcript() {
+        with_temp_home(|home| {
+            let file = write_session(home, "proj", "session-abc", &fixture_events());
+            let mut bytes = zstd::stream::decode_all(fs::read(&file).unwrap().as_slice()).unwrap();
+            bytes.extend_from_slice(b"\n{broken-json\n");
+            fs::write(
+                &file,
+                zstd::stream::encode_all(bytes.as_slice(), 1).unwrap(),
+            )
+            .unwrap();
+            assert!(load_messages(&file)
+                .unwrap_err()
+                .contains("invalid JSON record"));
+            assert!(scan_sessions().is_empty());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn deletion_requires_the_native_session_directory_shape() {
+        with_temp_home(|home| {
+            let file = write_session(home, "proj", "session-abc", &fixture_events());
+            let misplaced = home.join("sessions").join(SESSION_FILE_NAME);
+            fs::copy(&file, &misplaced).unwrap();
+            assert!(delete_session(&home.join("sessions"), &misplaced, "session-abc").is_err());
+            assert!(misplaced.exists());
+            assert!(file.exists());
+        });
+    }
+}

@@ -27,6 +27,7 @@ const provider = (id: string, overrides: Partial<Provider> = {}): Provider => ({
 const official = provider("official", { category: "official" });
 const relay = provider("relay");
 const backup = provider("backup");
+
 /** Claude 下走 OpenAI 格式：需要路由 */
 const converted = provider("converted", { meta: { apiFormat: "openai_chat" } });
 
@@ -79,6 +80,42 @@ const button = (sections: ProviderSection[], id: string, key: string) => {
   return found;
 };
 
+it("uses common in-use and switch actions for each DSH profile rather than a configured status", () => {
+  const desktop = provider("native-current:desktop", {
+    settingsConfig: { nativeRef: true, profile: "desktop" },
+  });
+  const web = provider("native-current:web", {
+    settingsConfig: { nativeRef: true, profile: "web" },
+  });
+  const { input } = build({
+    app: "dsh",
+    active: "direct",
+    view: "direct",
+    providers: [desktop, web, relay],
+    directId: null,
+  });
+  const nativeInput = { ...input, directIds: new Set([desktop.id, web.id]) };
+  const native = buildSwitchSections(nativeInput);
+  expect(item(native, desktop.id).status?.label).toBe(
+    "providerCard.status.inUse",
+  );
+  expect(item(native, web.id).status?.label).toBe("providerCard.status.inUse");
+  button(native, relay.id, "switch").onClick();
+  expect(input.actions.switchDirect).toHaveBeenCalledWith(relay);
+  const managed = buildSwitchSections({
+    ...nativeInput,
+    directId: relay.id,
+    directIds: new Set([relay.id]),
+  });
+  expect(item(managed, relay.id).status?.label).toBe(
+    "providerCard.status.inUse",
+  );
+  expect(item(managed, desktop.id).status).toBeUndefined();
+  expect(item(managed, web.id).status).toBeUndefined();
+  button(managed, desktop.id, "switch").onClick();
+  expect(input.actions.switchDirect).toHaveBeenCalledWith(desktop);
+});
+
 /** 「更多」菜单里的「设为默认」 */
 const setDefaultItem = (sections: ProviderSection[], id: string) => {
   const found = item(sections, id).menuItems?.find(
@@ -87,6 +124,107 @@ const setDefaultItem = (sections: ProviderSection[], id: string) => {
   if (!found) throw new Error(`no setDefault menu item on ${id}`);
   return found;
 };
+
+describe("DSH native inventory model actions", () => {
+  const native = provider(`native-provider:desktop:${"a".repeat(64)}`, {
+    settingsConfig: {
+      nativeRef: true,
+      nativeProvider: true,
+      profile: "desktop",
+      provider: "lab",
+      nativeIsCurrent: true,
+      model: "first",
+      modelCatalog: {
+        models: [
+          { model: "first" },
+          { model: "second", displayName: "Second" },
+        ],
+      },
+    },
+  });
+
+  it("reuses the shared model menu even on the currently selected native card", () => {
+    const selectNativeModel = vi.fn();
+    const { sections } = build({
+      app: "dsh",
+      active: "direct",
+      view: "direct",
+      providers: [native],
+      directIds: new Set([native.id]),
+      actions: { ...actions(), selectNativeModel },
+    });
+    expect(item(sections, native.id).status?.label).toBe(
+      "providerCard.status.inUse",
+    );
+    button(sections, native.id, "setDefault").menu!.options[1].onSelect();
+    expect(selectNativeModel).toHaveBeenCalledTimes(1);
+    expect(selectNativeModel).toHaveBeenCalledWith(native, "second");
+    expect(item(sections, native.id).editDisabledReason).toBe(
+      "provider.nativeManagedReadOnly",
+    );
+  });
+
+  it("does not route a native-owned credential reference or offer a model write while routing", () => {
+    const { sections } = build({
+      app: "dsh",
+      active: "route",
+      view: "route",
+      providers: [native],
+    });
+    expect(item(sections, native.id).buttons).toHaveLength(1);
+    expect(item(sections, native.id).buttons[0].disabledReason).toBe(
+      "provider.nativeManagedReadOnly",
+    );
+    expect(item(sections, native.id).buttons[0].menu).toBeUndefined();
+  });
+});
+
+describe("DSH identity chips", () => {
+  it.each(["direct", "route", "stack"] as const)(
+    "keeps actual identity and routing requirements visible in %s without duplicate chips",
+    (mode) => {
+      const nativeApi = provider("native-api", { category: "official" });
+      const managed = provider("managed", {
+        category: "official",
+        meta: {
+          providerType: "codex_oauth",
+          authBinding: {
+            source: "managed_account",
+            authProvider: "codex_oauth",
+            accountId: "fixture-account",
+          },
+        },
+      });
+      const { sections } = build({
+        app: "dsh",
+        active: mode,
+        view: mode,
+        providers: [nativeApi, managed],
+        directId: nativeApi.id,
+        routeId: managed.id,
+        stackMembers: new Map([
+          [nativeApi.id, 2],
+          [managed.id, 1],
+        ]),
+      });
+      const managedKeys = item(sections, managed.id).chips.map(
+        (chip) => chip.key,
+      );
+      expect(managedKeys.filter((key) => key === "official")).toHaveLength(1);
+      expect(managedKeys.filter((key) => key === "needsRoute")).toHaveLength(1);
+      expect(
+        item(sections, nativeApi.id).chips.filter(
+          (chip) => chip.key === "official",
+        ),
+      ).toHaveLength(1);
+      expect(
+        item(sections, nativeApi.id).chips.some(
+          (chip) => chip.key === "needsRoute",
+        ),
+      ).toBe(false);
+    },
+  );
+});
 
 describe("buildSwitchSections — direct", () => {
   it("marks the direct provider in use and asks before switching to one that needs routing", () => {

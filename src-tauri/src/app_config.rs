@@ -40,7 +40,7 @@ impl McpApps {
             AppType::Hermes => self.hermes,
             AppType::Mcode => self.mcode,
             AppType::Pi => self.pi,
-            AppType::ClaudeDesktop => false,
+            AppType::ClaudeDesktop | AppType::Dsh => false,
             AppType::Agy => self.agy,
         }
     }
@@ -57,7 +57,7 @@ impl McpApps {
             AppType::Hermes => self.hermes = enabled,
             AppType::Mcode => self.mcode = enabled,
             AppType::Pi => self.pi = enabled,
-            AppType::ClaudeDesktop => {}
+            AppType::ClaudeDesktop | AppType::Dsh => {} // Claude Desktop 3P provider config doesn't support MCP here
             AppType::Agy => self.agy = enabled,
         }
     }
@@ -144,9 +144,9 @@ impl SkillApps {
             AppType::Hermes => self.hermes,
             AppType::Pi => self.pi,
             AppType::Mcode => self.mcode,
-            AppType::OpenClaw => false,
+            AppType::OpenClaw => false, // OpenClaw doesn't support Skills
+            AppType::ClaudeDesktop | AppType::Dsh => false,
             AppType::Agy => self.agy,
-            AppType::ClaudeDesktop => false,
         }
     }
 
@@ -161,9 +161,9 @@ impl SkillApps {
             AppType::Hermes => self.hermes = enabled,
             AppType::Pi => self.pi = enabled,
             AppType::Mcode => self.mcode = enabled,
-            AppType::OpenClaw => {}
+            AppType::OpenClaw => {} // OpenClaw doesn't support Skills, ignore
+            AppType::ClaudeDesktop | AppType::Dsh => {} // Claude Desktop 3P profiles don't use CC Switch skill sync
             AppType::Agy => self.agy = enabled,
-            AppType::ClaudeDesktop => {} // Claude Desktop 3P profiles don't use CC Switch skill sync
         }
     }
 
@@ -431,6 +431,7 @@ pub enum AppType {
     Hermes,
     Pi,
     Mcode,
+    Dsh,
     Agy,
 }
 
@@ -447,6 +448,7 @@ impl AppType {
             AppType::Hermes => "hermes",
             AppType::Pi => "pi",
             AppType::Mcode => "mcode",
+            AppType::Dsh => "dsh",
             AppType::Agy => "agy",
         }
     }
@@ -474,7 +476,7 @@ impl AppType {
     /// 加上 Claude Desktop。Desktop 经同一个路由服务转发，但没有 `proxy_config` 行、不做故障
     /// 转移，所以不算 [`Self::supports_local_proxy`]。
     pub fn has_route_mode(&self) -> bool {
-        self.supports_local_proxy() || matches!(self, AppType::ClaudeDesktop)
+        self.supports_local_proxy() || matches!(self, AppType::ClaudeDesktop | AppType::Dsh)
     }
 
     /// Return an iterator over all app types
@@ -490,6 +492,7 @@ impl AppType {
             AppType::Hermes,
             AppType::Pi,
             AppType::Mcode,
+            AppType::Dsh,
             AppType::Agy,
         ]
         .into_iter()
@@ -512,11 +515,12 @@ impl FromStr for AppType {
             "hermes" => Ok(AppType::Hermes),
             "pi" => Ok(AppType::Pi),
             "mcode" => Ok(AppType::Mcode),
+            "dsh" => Ok(AppType::Dsh),
             "agy" | "antigravity" | "antigravity-cli" => Ok(AppType::Agy),
             other => Err(AppError::localized(
                 "unsupported_app",
-                format!("不支持的应用标识: '{other}'。可选值: claude, claude-desktop, codex, gemini, grokbuild, opencode, openclaw, hermes, pi, mcode, agy。"),
-                format!("Unsupported app id: '{other}'. Allowed: claude, claude-desktop, codex, gemini, grokbuild, opencode, openclaw, hermes, pi, mcode, agy."),
+                format!("不支持的应用标识: '{other}'。可选值: claude, claude-desktop, codex, gemini, grokbuild, opencode, openclaw, hermes, pi, mcode, dsh, agy。"),
+                format!("Unsupported app id: '{other}'. Allowed: claude, claude-desktop, codex, gemini, grokbuild, opencode, openclaw, hermes, pi, mcode, dsh, agy."),
             )),
         }
     }
@@ -549,7 +553,7 @@ impl CommonConfigSnippets {
     pub fn get(&self, app: &AppType) -> Option<&String> {
         match app {
             AppType::Claude => self.claude.as_ref(),
-            AppType::ClaudeDesktop => None,
+            AppType::ClaudeDesktop | AppType::Dsh => None,
             AppType::Codex => self.codex.as_ref(),
             AppType::Gemini => self.gemini.as_ref(),
             AppType::GrokBuild => None,
@@ -564,7 +568,7 @@ impl CommonConfigSnippets {
     pub fn set(&mut self, app: &AppType, snippet: Option<String>) {
         match app {
             AppType::Claude => self.claude = snippet,
-            AppType::ClaudeDesktop => {}
+            AppType::ClaudeDesktop | AppType::Dsh => {}
             AppType::Codex => self.codex = snippet,
             AppType::Gemini => self.gemini = snippet,
             AppType::GrokBuild => {}
@@ -889,6 +893,7 @@ impl MultiAppConfig {
         // 插入到对应的应用配置中
         let prompts = match app {
             AppType::Claude => &mut config.prompts.claude.prompts,
+            AppType::Dsh => return Ok(false),
             AppType::ClaudeDesktop => &mut config.prompts.claude_desktop.prompts,
             AppType::Codex => &mut config.prompts.codex.prompts,
             AppType::Gemini => &mut config.prompts.gemini.prompts,
@@ -935,7 +940,7 @@ impl MultiAppConfig {
         ] {
             let old_servers = match app {
                 AppType::Claude => &self.mcp.claude.servers,
-                AppType::ClaudeDesktop => continue, // Claude Desktop 3P profiles don't use MCP here
+                AppType::ClaudeDesktop | AppType::Dsh => continue, // Claude Desktop 3P profiles don't use MCP here
                 AppType::Codex => &self.mcp.codex.servers,
                 AppType::Gemini => &self.mcp.gemini.servers,
                 AppType::GrokBuild => continue,
@@ -1057,6 +1062,15 @@ mod tests {
     use std::env;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn source11_dsh_uses_the_shared_application_and_mode_contract() {
+        let app = AppType::from_str("dsh").expect("DSH must be a normal CC application");
+        assert_eq!(app.as_str(), "dsh");
+        assert!(app.has_route_mode());
+        assert!(crate::mode::stack::supports_stack(&app));
+        assert!(AppType::from_str("qoder").is_err());
+    }
 
     #[test]
     fn app_type_parses_claude_desktop_aliases() {

@@ -246,7 +246,16 @@ pub async fn handle_messages(
     State(state): State<ProxyState>,
     request: axum::extract::Request,
 ) -> Result<axum::response::Response, ProxyError> {
-    handle_messages_for_app(state, request, AppType::Claude, "Claude", "claude", None).await
+    handle_messages_for_app(
+        state,
+        request,
+        AppType::Claude,
+        "Claude",
+        "claude",
+        None,
+        None,
+    )
+    .await
 }
 
 pub async fn handle_claude_desktop_messages(
@@ -261,6 +270,7 @@ pub async fn handle_claude_desktop_messages(
         "Claude Desktop",
         "claude-desktop",
         Some("/claude-desktop"),
+        None,
     )
     .await
 }
@@ -304,13 +314,14 @@ pub async fn handle_claude_desktop_models(
     Ok(Json(response))
 }
 
-async fn handle_messages_for_app(
+pub(super) async fn handle_messages_for_app(
     state: ProxyState,
     request: axum::extract::Request,
     app_type: AppType,
     tag: &'static str,
     app_type_str: &'static str,
-    strip_prefix: Option<&'static str>,
+    strip_prefix: Option<&str>,
+    fixed_target: Option<crate::mode::stack::StackTarget>,
 ) -> Result<axum::response::Response, ProxyError> {
     let (parts, body) = request.into_parts();
     let method = parts.method.clone();
@@ -324,9 +335,15 @@ async fn handle_messages_for_app(
         .to_bytes();
     let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
-    let stack = match resolve_stack_target(&state, &app_type, &mut body) {
-        Ok(stack) => stack,
-        Err(rejected) => return Ok(*rejected),
+    let stack = match fixed_target {
+        Some(target) => {
+            body["model"] = Value::String(target.upstream_model.clone());
+            Some(target)
+        }
+        None => match resolve_stack_target(&state, &app_type, &mut body) {
+            Ok(stack) => stack,
+            Err(rejected) => return Ok(*rejected),
+        },
     };
 
     let mut ctx = RequestContext::new(
@@ -1029,7 +1046,7 @@ pub async fn handle_grokbuild_responses(
     .await
 }
 
-async fn handle_responses_for_app(
+pub(super) async fn handle_responses_for_app(
     state: ProxyState,
     request: axum::extract::Request,
     app_type: AppType,

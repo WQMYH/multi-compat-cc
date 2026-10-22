@@ -1,4 +1,4 @@
-// 前端统一使用 AppId 作为应用标识（与后端命令参数 `app` 一致）
+// 应用导航标识；DSH 沿用 CC 公共供应商和模式流程。
 export type AppId =
   | "claude"
   | "claude-desktop"
@@ -10,4 +10,5 @@ export type AppId =
   | "hermes"
   | "pi"
   | "mcode"
+  | "dsh"
   | "agy";

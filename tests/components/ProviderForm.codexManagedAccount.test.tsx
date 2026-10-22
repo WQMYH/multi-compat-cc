@@ -164,6 +164,49 @@ describe("ProviderForm Codex Official managed account", () => {
     toastMocks.error.mockReset();
   });
 
+  it.each(["dsh"] as const)("reuses the existing managed account chooser for %s without another login", async (appId) => {
+    const onSubmit = vi.fn();
+    render(<QueryClientProvider client={createTestQueryClient()}>
+      <ProviderForm appId={appId} submitLabel="save-provider" onSubmit={onSubmit} onCancel={vi.fn()} />
+    </QueryClientProvider>);
+    fireEvent.click(screen.getByRole("button", { name: /OpenAI Official/ }));
+    if (appId === "dsh") {
+      expect(screen.queryByRole("button", { name: "select-native-login" })).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "save-provider" }));
+      await waitFor(() => expect(toastMocks.error).toHaveBeenCalledWith("请先选择 DSH 默认模型"));
+      expect(onSubmit).not.toHaveBeenCalled();
+      fireEvent.change(screen.getByRole("textbox", { name: "默认模型" }), { target: { value: "gpt-6.1-sol" } });
+      fireEvent.click(screen.getByRole("button", { name: "save-provider" }));
+      await waitFor(() => expect(toastMocks.error).toHaveBeenCalledWith("请先选择 CC 已托管的 Codex 账号"));
+      expect(onSubmit).not.toHaveBeenCalled();
+    }
+    fireEvent.click(await screen.findByRole("button", { name: "select-managed-account" }));
+    fireEvent.click(screen.getByRole("button", { name: "save-provider" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce());
+    const value = onSubmit.mock.calls[0][0] as ProviderFormValues;
+    expect(value.meta?.authBinding?.accountId).toBe("acct-managed");
+    expect(JSON.parse(value.settingsConfig).auth).toEqual({});
+    if (appId === "dsh") {
+      expect(JSON.parse(value.settingsConfig).config).toContain('model = "gpt-6.1-sol"');
+    }
+  });
+
+  it("repairs an existing DSH managed account row with no model through the shared editor", async () => {
+    const onSubmit = vi.fn();
+    render(<QueryClientProvider client={createTestQueryClient()}>
+      <ProviderForm appId="dsh" providerId="existing-dsh" submitLabel="save-provider" onSubmit={onSubmit} onCancel={vi.fn()}
+        initialData={{ name: "Existing DSH account", category: "official", settingsConfig: { auth: {}, config: "" },
+          meta: { providerType: "codex_oauth", authBinding: { source: "managed_account", authProvider: "codex_oauth", accountId: "acct-managed" } } }} />
+    </QueryClientProvider>);
+    fireEvent.change(await screen.findByRole("textbox", { name: "默认模型" }), { target: { value: "gpt-6.1-sol" } });
+    fireEvent.click(screen.getByRole("button", { name: "save-provider" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce());
+    const submitted = onSubmit.mock.calls[0][0] as ProviderFormValues;
+    expect(submitted.meta?.authBinding?.accountId).toBe("acct-managed");
+    expect(JSON.parse(submitted.settingsConfig).auth).toEqual({});
+    expect(JSON.parse(submitted.settingsConfig).config).toContain('model = "gpt-6.1-sol"');
+  });
+
   it("persists the selected managed account while stripping OAuth secrets", async () => {
     const onSubmit = vi.fn();
     renderCodexForm(onSubmit);

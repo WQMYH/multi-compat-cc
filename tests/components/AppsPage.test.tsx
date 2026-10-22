@@ -17,6 +17,7 @@ import {
   vi,
 } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { VisibleApps } from "@/types";
 import type {
   settingsApi,
   ToolInstallationReport,
@@ -27,6 +28,8 @@ import type {
 type ToolVersions = Awaited<ReturnType<typeof settingsApi.getToolVersions>>;
 
 const mocks = vi.hoisted(() => ({
+  visibleApps: undefined as VisibleApps | undefined,
+  updateSettings: vi.fn(),
   getToolVersions: vi.fn(),
   probeToolInstallations: vi.fn(),
   listToolInstallations: vi.fn(),
@@ -47,8 +50,8 @@ vi.mock("@/lib/api/providers", () => ({
 }));
 vi.mock("@/hooks/useSettings", () => ({
   useSettings: () => ({
-    settings: { visibleApps: undefined },
-    updateSettings: vi.fn(),
+    settings: { visibleApps: mocks.visibleApps },
+    updateSettings: mocks.updateSettings,
     autoSaveSettings: vi.fn(async () => null),
   }),
 }));
@@ -1289,8 +1292,11 @@ describe("AppsPage concurrent CLI upgrades", () => {
       return getVersions(tools);
     });
     const { AppsPage } = await import("@/components/apps/AppsPage");
+    const { TOOL_NAMES } = await import("@/components/apps/useToolManagement");
     const view = mountApps(AppsPage);
-    await waitFor(() => expect(mocks.getToolVersions).toHaveBeenCalledTimes(10));
+    await waitFor(() =>
+      expect(mocks.getToolVersions).toHaveBeenCalledTimes(TOOL_NAMES.length),
+    );
     view.unmount();
     const remounted = await renderApps();
     fireEvent.click(updateButton("Claude Code"));
@@ -1924,6 +1930,39 @@ describe("AppsPage concurrent CLI upgrades", () => {
 });
 
 describe("AppsPage visibility column", () => {
+  beforeEach(() => {
+    mocks.visibleApps = undefined;
+    mocks.updateSettings.mockReset();
+    mocks.getToolVersions.mockResolvedValue([]);
+    mocks.probeToolInstallations.mockResolvedValue([]);
+    mocks.listToolInstallations.mockResolvedValue([]);
+  });
+
+  it("does not count a retained Qoder setting as a visible application", async () => {
+    vi.resetModules();
+    const { APP_IDS, DEFAULT_VISIBLE_APPS } = await import(
+      "@/config/appConfig"
+    );
+    mocks.visibleApps = {
+      ...DEFAULT_VISIBLE_APPS,
+      ...Object.fromEntries(APP_IDS.map((app) => [app, false])),
+      dsh: true,
+      qoder: true,
+    };
+    mocks.updateSettings.mockClear();
+    try {
+      await renderApps();
+      const toggle = card("DSH").getByRole("switch");
+      expect(toggle).toBeChecked();
+      expect(toggle).toBeDisabled();
+      fireEvent.click(toggle);
+      expect(mocks.updateSettings).not.toHaveBeenCalled();
+      expect(mocks.visibleApps.qoder).toBe(true);
+    } finally {
+      mocks.visibleApps = undefined;
+    }
+  });
+
   it("renders the sidebar visibility switches small with the action color", async () => {
     vi.resetModules();
     await renderApps();

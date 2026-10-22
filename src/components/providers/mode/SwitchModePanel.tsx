@@ -4,7 +4,7 @@ import { HoverTip } from "@/components/ui/hover-tip";
 import { cn } from "@/lib/utils";
 import { useEffect, useMemo, useState, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "@/lib/toast";
 import type { Provider } from "@/types";
 import type { AppMode, StartupAttachFailure } from "@/types/proxy";
@@ -31,7 +31,10 @@ import {
 } from "@/lib/query/failover";
 import { useModeActions } from "@/hooks/useModeActions";
 import { getRoutingReason } from "@/utils/routingReason";
-import { CODEX_OFFICIAL_PROVIDER_ID } from "@/utils/providerCapabilities";
+import {
+  CODEX_OFFICIAL_PROVIDER_ID,
+  providerNeedsRouting,
+} from "@/utils/providerCapabilities";
 import { routeSwitchNotification } from "@/utils/routeSwitchNotification";
 import { extractErrorMessage } from "@/utils/errorUtils";
 import { Button } from "@/components/ui/button";
@@ -41,6 +44,8 @@ import { ProviderList } from "@/components/providers/ProviderList";
 import { CodexStaleClientsNotice } from "@/components/providers/CodexStaleClientsNotice";
 import {
   blockedFromRouting,
+  isDshNativeRef,
+  providerDisplayName,
   queueMoveSortUpdates,
 } from "@/components/providers/presentation";
 import { APP_DISPLAY_NAME } from "@/components/shell/AppGlyph";
@@ -92,7 +97,9 @@ interface SwitchModePanelProps extends ListCallbacks {
 
 /** Gemini CLI、Grok Build、Claude Desktop 没有聚合模式（Q6）：那一格隐藏，前两格位置不变。 */
 const modesFor = (app: ModeAppId): AppMode[] =>
-  isStackAppId(app) ? ["direct", "route", "stack"] : ["direct", "route"];
+  app !== "dsh" && isStackAppId(app)
+    ? ["direct", "route", "stack"]
+    : ["direct", "route"];
 
 /**
  * 切换式应用的供应商页（v7 S1–S3）：模式行 → 通知槽 → 按查看的模式分区的列表。
@@ -101,7 +108,7 @@ const modesFor = (app: ModeAppId): AppMode[] =>
 export function SwitchModePanel({
   statusSlot,
   app,
-  providers,
+  providers: savedProviders,
   currentProviderId,
   isLoading,
   scrollRef,
@@ -118,18 +125,59 @@ export function SwitchModePanel({
   const queryClient = useQueryClient();
   const appName = APP_DISPLAY_NAME[app];
   const modes = modesFor(app);
+  const {
+    data: nativeRows,
+    error: nativeError,
+    isFetching: nativeFetching,
+  } = useQuery({
+    queryKey: ["providers", app, "nativeDefaults"],
+    queryFn: providersApi.getDshNativeDefaults,
+    enabled: app === "dsh",
+  });
+  const nativeProviders = useMemo(
+    () =>
+      app === "dsh"
+        ? (
+            nativeRows ?? Object.values(savedProviders).filter(isDshNativeRef)
+          ).map((provider) => ({
+            ...provider,
+            name: providerDisplayName(app, provider, t),
+          }))
+        : [],
+    [app, nativeRows, savedProviders, t],
+  );
+  const providers = useMemo(
+    () =>
+      app === "dsh"
+        ? {
+            ...Object.fromEntries(
+              Object.entries(savedProviders).filter(
+                ([, provider]) => !isDshNativeRef(provider),
+              ),
+            ),
+            ...Object.fromEntries(
+              nativeProviders.map((provider) => [provider.id, provider]),
+            ),
+          }
+        : savedProviders,
+    [app, savedProviders, nativeProviders],
+  );
 
   const { data: modeView } = useAppMode(app);
   const active: AppMode =
-    modeView && modes.includes(modeView.mode) ? modeView.mode : "direct";
+    modeView && (modes.includes(modeView.mode) || app === "dsh")
+      ? modeView.mode
+      : "direct";
   const directId = modeView?.directProviderId ?? null;
   const routeId = modeView?.routeProviderId ?? null;
 
   // 离开页面再回来、或生效的模式变了，一律落在生效的那格（「查看中」不持久化）
-  const [view, setView] = useState<AppMode>(active);
+  const [view, setView] = useState<AppMode>(
+    app === "dsh" && active === "stack" ? "route" : active,
+  );
   const [searchSlot, setSearchSlot] = useState<HTMLDivElement | null>(null);
   useEffect(() => {
-    setView(active);
+    setView(app === "dsh" && active === "stack" ? "route" : active);
   }, [app, active]);
   useEffect(() => {
     onViewChange?.(app, view);
@@ -179,6 +227,78 @@ export function SwitchModePanel({
   const providerList = useMemo(() => Object.values(providers), [providers]);
   const nameOf = (id: string | null) =>
     (id && providers[id]?.name) || t("mode.noProvider");
+  const directProvider = directId ? providers[directId] : undefined;
+  const nativeFallback =
+    !directProvider ||
+    isDshNativeRef(directProvider) ||
+    providerNeedsRouting(app, directProvider);
+  const nativeObservationReady =
+    nativeRows !== undefined && !nativeError && !nativeFetching;
+  const exitDirectId =
+    app === "dsh" && nativeFallback
+      ? directProvider?.settingsConfig.nativeProvider === true
+        ? directId
+        : (nativeProviders.find(
+            (p) => p.settingsConfig.nativeIsDefault !== false,
+          )?.id ?? null)
+      : directId;
+  const directIds =
+    app === "dsh"
+      ? active === "direct" && !nativeObservationReady
+        ? new Set(
+            directId &&
+            directProvider &&
+            !providerNeedsRouting(app, directProvider)
+              ? [directId]
+              : [],
+          )
+        : new Set([
+            ...nativeProviders
+              .filter((provider) =>
+                active !== "direct"
+                  ? nativeFallback &&
+                    provider.settingsConfig.nativeIsDefault !== false
+                  : provider.settingsConfig.nativeIsCurrent === true,
+              )
+              .map((provider) => provider.id),
+            ...(directProvider &&
+            directId &&
+            !isDshNativeRef(directProvider) &&
+            !providerNeedsRouting(app, directProvider) &&
+            (active !== "direct" ||
+              (!nativeProviders.some(
+                (provider) =>
+                  provider.settingsConfig.nativeProvider === true ||
+                  provider.settingsConfig.nativeObservedProfile,
+              ) &&
+                nativeProviders.some(
+                  (provider) =>
+                    provider.settingsConfig.nativeIsCurrent !== true,
+                )) ||
+              nativeProviders.length === 0)
+              ? [directId]
+              : []),
+          ])
+      : undefined;
+  const directName = directIds?.size
+    ? [...new Set([...directIds].map(nameOf))].join(" / ")
+    : nameOf(directId);
+  const nativeTargetName = nativeProviders
+    .filter((provider) => provider.settingsConfig.nativeIsDefault !== false)
+    .map(
+      (provider) =>
+        `${t(provider.settingsConfig.profile === "desktop" ? "provider.nativeDesktop" : "provider.nativeWeb")} · ${provider.name}`,
+    )
+    .join(" / ");
+  const dialogProviders =
+    app === "dsh"
+      ? providerList.map((provider) =>
+          isDshNativeRef(provider) &&
+          provider.settingsConfig.nativeProvider !== true
+            ? { ...provider, name: nativeTargetName }
+            : provider,
+        )
+      : providerList;
 
   const stackMembers = useMemo(() => {
     const members = new Map<string, number>();
@@ -239,6 +359,7 @@ export function SwitchModePanel({
     active,
     view,
     directId,
+    directIds,
     routeId,
     failoverOn,
     queue: queueIds,
@@ -247,6 +368,14 @@ export function SwitchModePanel({
     routingReason: (provider: Provider) =>
       getRoutingReason(app, provider, t) ?? "",
     actions: {
+      selectNativeModel: async (provider: Provider, modelId: string) => {
+        try {
+          await providersApi.setDshNativeModel(provider.id, modelId);
+          await queryClient.invalidateQueries({ queryKey: ["providers", app] });
+        } catch (error) {
+          toast.error(extractErrorMessage(error) || t("common.unknown"));
+        }
+      },
       switchDirect: (provider: Provider) => void onSwitch(provider),
       needsRouteDialog: (provider: Provider) =>
         setDialog({
@@ -295,7 +424,7 @@ export function SwitchModePanel({
   );
   const status =
     active === "direct"
-      ? { lead: t("mode.status.directLead"), value: nameOf(directId) }
+      ? { lead: t("mode.status.directLead"), value: directName }
       : active === "route"
         ? {
             lead: t("mode.status.routeLead"),
@@ -374,6 +503,16 @@ export function SwitchModePanel({
   };
 
   const notices: React.ReactNode[] = [];
+  if (nativeError)
+    notices.push(
+      <Notice
+        key="nativeRead"
+        tone="warning"
+        title={t("provider.nativeDefaultsReadFailed")}
+      >
+        {extractErrorMessage(nativeError)}
+      </Notice>,
+    );
   if (active !== "direct" && proxyStatus !== undefined && !serviceRunning) {
     notices.push(
       <Notice
@@ -557,7 +696,9 @@ export function SwitchModePanel({
                   "me-1 h-1.5 w-1.5 shrink-0 rounded-full",
                   (
                     active === "direct"
-                      ? Boolean(directId && providers[directId])
+                      ? Boolean(
+                          directIds?.size ?? (directId && providers[directId]),
+                        )
                       : serviceRunning &&
                         modeView?.attached &&
                         Boolean(routeId && providers[routeId])
@@ -631,8 +772,8 @@ export function SwitchModePanel({
         app={app}
         state={dialog}
         active={active}
-        providers={providerList}
-        directId={directId}
+        providers={dialogProviders}
+        directId={exitDirectId}
         eligibleIds={eligibleIds}
         defaultPick={routeId ?? directId}
         stackMembers={(stack?.members ?? []).map((member) => ({
@@ -654,7 +795,11 @@ export function SwitchModePanel({
           modeActions.exitToDirect({
             directProviderId: directId,
             useProviderId,
-            providerName: nameOf(useProviderId ?? directId),
+            providerName: useProviderId
+              ? (dialogProviders.find(
+                  (provider) => provider.id === useProviderId,
+                )?.name ?? nameOf(useProviderId))
+              : directName,
           })
         }
         onSwitchDirect={(providerId) => {

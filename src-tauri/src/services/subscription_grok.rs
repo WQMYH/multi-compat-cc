@@ -353,7 +353,7 @@ fn grpc_web_trailer_fields(data: &[u8]) -> HashMap<String, String> {
 }
 
 /// gRPC message 使用 percent-encoding；解码失败的序列原样保留
-fn percent_decode(input: &str) -> String {
+pub(crate) fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

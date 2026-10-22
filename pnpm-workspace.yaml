@@ -5,4 +5,5 @@ onlyBuiltDependencies:
   - esbuild
 
 ignoredBuiltDependencies:
+  - '@qodercn-ai/qodercn-agent-sdk'
   - msw

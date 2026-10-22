@@ -18,6 +18,19 @@ pub async fn fetch_models_with_token(
     token: &str,
     account_id: &str,
 ) -> Result<Vec<FetchedModel>, String> {
+    Ok(parse_models(fetch_model_values(token, account_id).await?))
+}
+
+pub(crate) async fn fetch_model_catalog_with_token(
+    token: &str,
+    account_id: &str,
+) -> Result<Vec<Value>, String> {
+    Ok(parse_model_catalog(
+        fetch_model_values(token, account_id).await?,
+    ))
+}
+
+async fn fetch_model_values(token: &str, account_id: &str) -> Result<Value, String> {
     let client = crate::proxy::http_client::get();
     let response = build_models_request(&client, token, account_id)
         .send()
@@ -35,7 +48,7 @@ pub async fn fetch_models_with_token(
         .await
         .map_err(|e| format!("Failed to parse response: {e}"))?;
 
-    Ok(parse_models(value))
+    Ok(value)
 }
 
 fn build_models_request(
@@ -53,7 +66,7 @@ fn build_models_request(
         .timeout(Duration::from_secs(CODEX_OAUTH_FETCH_TIMEOUT_SECS))
 }
 
-fn parse_models(value: Value) -> Vec<FetchedModel> {
+fn model_entries(value: &Value) -> impl Iterator<Item = (&Value, Option<&str>)> {
     let entries = value
         .get("data")
         .and_then(Value::as_array)
@@ -61,23 +74,66 @@ fn parse_models(value: Value) -> Vec<FetchedModel> {
         .or_else(|| value.get("items").and_then(Value::as_array))
         .or_else(|| value.as_array());
 
+    entries
+        .into_iter()
+        .flatten()
+        .map(|entry| (entry, None))
+        .chain(
+            value
+                .get("models")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flat_map(|models| {
+                    models
+                        .iter()
+                        .map(|(key, entry)| (entry, Some(key.as_str())))
+                }),
+        )
+}
+
+fn parse_models(value: Value) -> Vec<FetchedModel> {
     let mut models = Vec::new();
-
-    if let Some(entries) = entries {
-        for entry in entries {
-            push_model_entry(&mut models, entry, None);
-        }
-    }
-
-    if let Some(model_map) = value.get("models").and_then(Value::as_object) {
-        for (key, entry) in model_map {
-            push_model_entry(&mut models, entry, Some(key));
-        }
+    for (entry, fallback_id) in model_entries(&value) {
+        push_model_entry(&mut models, entry, fallback_id);
     }
 
     models.sort_by(|a, b| a.id.cmp(&b.id));
     models.dedup_by(|a, b| a.id == b.id);
     models
+}
+
+pub(crate) fn parse_model_catalog(value: Value) -> Vec<Value> {
+    let mut catalog = Vec::new();
+    for (entry, fallback_id) in model_entries(&value) {
+        let mut models = Vec::new();
+        push_model_entry(&mut models, entry, fallback_id);
+        let Some(model) = models.pop() else { continue };
+        let mut row = serde_json::json!({"model": model.id});
+        if let Some(levels) = entry
+            .get("supported_reasoning_levels")
+            .and_then(Value::as_array)
+        {
+            row["reasoningLevels"] = Value::Array(
+                levels
+                    .iter()
+                    .filter_map(|level| {
+                        level
+                            .get("effort")
+                            .and_then(Value::as_str)
+                            .or_else(|| level.as_str())
+                            .map(|effort| Value::String(effort.to_string()))
+                    })
+                    .collect(),
+            );
+        }
+        if let Some(default) = entry.get("default_reasoning_level").and_then(Value::as_str) {
+            row["defaultReasoningLevel"] = Value::String(default.to_string());
+        }
+        catalog.push(row);
+    }
+    catalog.sort_by(|a, b| a["model"].as_str().cmp(&b["model"].as_str()));
+    catalog.dedup_by(|a, b| a["model"] == b["model"]);
+    catalog
 }
 
 fn push_model_entry(models: &mut Vec<FetchedModel>, entry: &Value, fallback_id: Option<&str>) {
@@ -141,6 +197,31 @@ fn truncate_body(body: String) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn model_catalog_preserves_supported_efforts_separately_from_default() {
+        let catalog = parse_model_catalog(json!({"models": {
+            "gpt-6.1-sol": {
+                "default_reasoning_level": "low",
+                "supported_reasoning_levels": [
+                    {"effort":"low"}, {"effort":"medium"}, {"effort":"high"},
+                    {"effort":"xhigh"}, {"effort":"max"}, {"effort":"ultra"}
+                ]
+            },
+            "gpt-reserve": {}
+        }}));
+        assert_eq!(catalog[0]["model"], "gpt-6.1-sol");
+        assert_eq!(catalog[0]["defaultReasoningLevel"], "low");
+        assert_eq!(
+            catalog[0]["reasoningLevels"],
+            json!(["low", "medium", "high", "xhigh", "max", "ultra"])
+        );
+        assert!(catalog[1].get("reasoningLevels").is_none());
+        assert_eq!(
+            parse_model_catalog(json!({"data":["only-an-id"]})),
+            json!([{"model":"only-an-id"}]).as_array().unwrap().clone()
+        );
+    }
 
     #[test]
     fn codex_oauth_model_discovery_uses_gpt6_compatible_identity() {

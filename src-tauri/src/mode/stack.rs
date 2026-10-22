@@ -54,7 +54,7 @@ pub const CLAUDE_DEFAULT_WINDOW: u64 = 200_000;
 pub fn supports_stack(app: &AppType) -> bool {
     matches!(
         app,
-        AppType::Claude | AppType::Codex | AppType::ClaudeDesktop
+        AppType::Claude | AppType::Codex | AppType::ClaudeDesktop | AppType::Dsh
     )
 }
 
@@ -117,7 +117,7 @@ fn slug(text: &str) -> String {
 /// Desktop 的 1M 写在模型条目里（`supports1m` + `prefer1m`），id 不带标记。
 pub fn encode(app: &AppType, key: &str, model: &str, one_m: bool) -> String {
     match app {
-        AppType::Codex => format!("{CODEX_PREFIX}{key}{CODEX_SEPARATOR}{model}"),
+        AppType::Codex | AppType::Dsh => format!("{CODEX_PREFIX}{key}{CODEX_SEPARATOR}{model}"),
         AppType::ClaudeDesktop => format!("{DESKTOP_PREFIX}{}", desktop_code(key, model)),
         _ => {
             let marker = if one_m { ONE_M_MARKER_FOR_CLIENT } else { "" };
@@ -169,7 +169,7 @@ pub fn decode<'a>(app: &AppType, id: &'a str) -> Decoded<'a> {
             let stripped = strip_one_m_suffix_for_upstream(rest);
             (stripped, CLAUDE_SEPARATOR, stripped.len() != rest.len())
         }
-        AppType::Codex => {
+        AppType::Codex | AppType::Dsh => {
             let Some(rest) = id.strip_prefix(CODEX_PREFIX) else {
                 return Decoded::Plain;
             };
@@ -475,7 +475,7 @@ fn model_ids_of(app: &AppType, key: &str, provider: &Provider, route: bool) -> V
             .into_iter()
             .map(|model| model.id)
             .collect(),
-        AppType::Codex if !route => codex_model_ids(key, provider),
+        AppType::Codex | AppType::Dsh if !route => codex_model_ids(key, provider),
         AppType::ClaudeDesktop if !route => desktop_models(key, provider)
             .into_iter()
             .map(|model| model.id)
