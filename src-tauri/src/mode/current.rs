@@ -59,10 +59,25 @@ pub fn provider_for(
         }
     }
     let direct = crate::settings::get_effective_current_provider(db, app)?;
+    if *app == AppType::ZCode {
+        if let Some(id) = &direct {
+            if db
+                .get_provider_by_id(id, app.as_str())?
+                .is_some_and(|provider| {
+                    crate::services::provider::zcode_direct::needs_routing(&provider)
+                })
+            {
+                return Ok(None);
+            }
+        }
+    }
     if *app == AppType::Dsh {
         if let Some(id) = &direct {
-            if db.get_provider_by_id(id, app.as_str())?
-                .is_some_and(|provider| crate::services::provider::dsh_direct::needs_routing(&provider))
+            if db
+                .get_provider_by_id(id, app.as_str())?
+                .is_some_and(|provider| {
+                    crate::services::provider::dsh_direct::needs_routing(&provider)
+                })
             {
                 return Ok(None);
             }

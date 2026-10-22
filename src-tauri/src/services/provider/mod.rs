@@ -10,8 +10,8 @@ pub(crate) mod codex_direct;
 mod codex_editor;
 mod codex_login;
 pub(crate) mod codex_official_models;
-mod editor_toml;
 pub(crate) mod dsh_direct;
+mod editor_toml;
 mod endpoints;
 mod gemini_auth;
 pub(crate) mod gemini_direct;
@@ -24,6 +24,7 @@ mod live;
 mod opencode_tests;
 mod pi;
 mod usage;
+pub(crate) mod zcode_direct;
 
 use indexmap::IndexMap;
 use regex::Regex;
@@ -40,7 +41,7 @@ use crate::store::AppState;
 // Re-export sub-module functions for external access
 pub use live::{
     import_default_config, import_hermes_providers_from_live, import_openclaw_providers_from_live,
-    import_opencode_providers_from_live, read_live_settings,
+    import_opencode_providers_from_live, import_zcode_providers_from_live, read_live_settings,
     should_import_default_config_on_startup, sync_current_to_live,
 };
 
@@ -59,7 +60,7 @@ pub(crate) use live::{
 // Internal re-exports
 use live::{
     remove_hermes_provider_from_live, remove_openclaw_provider_from_live,
-    remove_opencode_provider_from_live,
+    remove_opencode_provider_from_live, remove_zcode_provider_from_live,
 };
 use usage::validate_usage_script;
 
@@ -79,6 +80,7 @@ pub fn official_provider_supports_proxy_takeover(app_type: &AppType, provider: &
     (matches!(app_type, AppType::Codex)
         && crate::proxy::providers::is_codex_official_provider(provider))
         || (matches!(app_type, AppType::Dsh) && dsh_direct::needs_routing(provider))
+        || (matches!(app_type, AppType::ZCode) && zcode_direct::needs_routing(provider))
 }
 
 /// 统一会话开关变更后，立即按新开关状态重写当前官方 Codex 供应商的选路（关键字段），
@@ -313,6 +315,44 @@ mod tests {
         }
 
         result
+    }
+
+    #[test]
+    #[serial]
+    fn switching_zcode_provider_updates_default_model_selection() {
+        with_test_home(|state, _home| {
+            let provider = Provider::with_id(
+                "zcode-custom".to_string(),
+                "ZCode Custom".to_string(),
+                json!({
+                    "name": "ZCode Custom",
+                    "kind": "anthropic",
+                    "options": {
+                        "baseURL": "https://api.example.com/anthropic",
+                        "apiKey": "sk-test"
+                    },
+                    "models": {
+                        "model-b": {},
+                        "model-a": {}
+                    }
+                }),
+                None,
+            );
+            state
+                .db
+                .save_provider(AppType::ZCode.as_str(), &provider)
+                .expect("store ZCode provider");
+
+            ProviderService::switch(state, AppType::ZCode, &provider.id)
+                .expect("switch ZCode provider");
+
+            let live = crate::zcode_config::read_zcode_provider_config()
+                .expect("read ZCode provider config");
+            assert_eq!(
+                live["config"]["defaultModelSelection"],
+                json!({"providerId": "zcode-custom", "modelId": "model-b"})
+            );
+        });
     }
 
     fn codex_settings(base_url: &str, api_key: &str) -> Value {
@@ -5484,7 +5524,13 @@ impl ProviderService {
             }
             return Ok(saved);
         }
-        state.db.get_all_providers(app_type.as_str())
+        let mut providers = state.db.get_all_providers(app_type.as_str())?;
+        if app_type == AppType::ZCode {
+            for provider in crate::zcode_config::get_native_official_providers()? {
+                providers.entry(provider.id.clone()).or_insert(provider);
+            }
+        }
+        Ok(providers)
     }
 
     /// Get current provider ID
@@ -5579,6 +5625,8 @@ impl ProviderService {
 
         let mut provider = provider;
         Self::prepare_new_provider(&app_type, &mut provider)?;
+        let add_to_live =
+            add_to_live && !(app_type == AppType::ZCode && zcode_direct::needs_routing(&provider));
         if app_type.is_additive_mode() {
             Self::set_provider_live_config_managed(&mut provider, add_to_live);
         }
@@ -5609,7 +5657,6 @@ impl ProviderService {
 
         // 还没有当前供应商时这一家会被写进 live：和进入代理、切换互斥（同 `update`）。
         let _switch_guard = crate::mode::controller::lock_settled_blocking(state, &app_type)?;
-
 
         // Save to database
         state.db.save_provider(app_type.as_str(), &provider)?;
@@ -5655,7 +5702,9 @@ impl ProviderService {
                     return Ok(true);
                 }
                 AppType::Dsh => {
-                    if !crate::mode::current::is_proxy(&app_type) && !dsh_direct::needs_routing(&provider) {
+                    if !crate::mode::current::is_proxy(&app_type)
+                        && !dsh_direct::needs_routing(&provider)
+                    {
                         dsh_direct::switch_to(state.db.as_ref(), &provider)?;
                     }
                     return Ok(true);
@@ -6236,6 +6285,57 @@ impl ProviderService {
             return Ok(true);
         }
 
+        if app_type == AppType::ZCode {
+            let mode = crate::mode::current::mode_state(&app_type);
+            let direct = crate::mode::current::provider_for(
+                &state.db,
+                &app_type,
+                crate::mode::current::Purpose::Direct,
+            )?;
+            let is_direct = direct.as_deref() == Some(&provider.id);
+            if is_direct && !mode.is_proxy() && zcode_direct::needs_routing(&provider) {
+                return Err(AppError::InvalidInput(
+                    "ZCode managed accounts require CC routing".into(),
+                ));
+            }
+            let in_live = Self::check_live_config_exists(
+                &app_type,
+                &provider.id,
+                existing_provider
+                    .as_ref()
+                    .and_then(Self::provider_live_config_managed),
+            )?;
+            Self::set_provider_live_config_managed(&mut provider, in_live);
+            state.db.save_provider("zcode", &provider)?;
+            let written = if mode.is_proxy() && mode.proxy_route.as_deref() == Some(&provider.id) {
+                Self::resync_proxy_for_saved_row(state, &app_type, &provider)
+            } else if is_direct && !mode.is_proxy() {
+                zcode_direct::run(
+                    &state.db,
+                    crate::mode::state::op::APPLY,
+                    Some(zcode_direct::Target::Direct(Some(&provider))),
+                    Default::default(),
+                )
+                .map(|_| ())
+            } else if in_live && !zcode_direct::needs_routing(&provider) {
+                zcode_direct::run(
+                    &state.db,
+                    crate::mode::state::op::APPLY,
+                    Some(zcode_direct::Target::Append(&provider)),
+                    Default::default(),
+                )
+                .map(|_| ())
+            } else {
+                Ok(())
+            };
+            return Self::keep_row_if_written(
+                state,
+                &app_type,
+                &provider.id,
+                existing_provider.as_ref(),
+                written,
+            );
+        }
         // Additive mode apps (OpenCode, OpenClaw): only sync to live when the provider
         // already exists in live config. Editing a DB-only provider must not auto-add it.
         if app_type.is_additive_mode() {
@@ -6318,8 +6418,14 @@ impl ProviderService {
                 is_direct_current,
             );
         }
-        if matches!(app_type, AppType::Dsh) && is_direct_current && !mode.is_proxy() && dsh_direct::needs_routing(&provider) {
-            return Err(AppError::Message("DSH_MANAGED_ACCOUNT_REQUIRES_ROUTING".into()));
+        if matches!(app_type, AppType::Dsh)
+            && is_direct_current
+            && !mode.is_proxy()
+            && dsh_direct::needs_routing(&provider)
+        {
+            return Err(AppError::Message(
+                "DSH_MANAGED_ACCOUNT_REQUIRES_ROUTING".into(),
+            ));
         }
         // Desktop 直连模式下正在用的这张卡改成了要经路由的（模型映射、托管账号）：直连写不
         // 进去，存了行也同步不到 Desktop。先进入路由模式再改。
@@ -6468,6 +6574,7 @@ impl ProviderService {
                     AppType::OpenClaw => remove_openclaw_provider_from_live(id)?,
                     AppType::Hermes => remove_hermes_provider_from_live(id)?,
                     AppType::Mcode => crate::mcode_config::remove_provider(id)?,
+                    AppType::ZCode => remove_zcode_provider_from_live(id)?,
                     _ => {}
                 }
             }
@@ -6548,6 +6655,9 @@ impl ProviderService {
                 remove_hermes_provider_from_live(id)?;
             }
             AppType::Mcode => crate::mcode_config::remove_provider(id)?,
+            AppType::ZCode => {
+                remove_zcode_provider_from_live(id)?;
+            }
             _ => {
                 return Err(AppError::Message(format!(
                     "App {} does not support remove from live config",
@@ -6721,6 +6831,20 @@ impl ProviderService {
             dsh_direct::switch_to(state.db.as_ref(), provider)?;
             return Ok(SwitchResult::default());
         }
+        if matches!(app_type, AppType::ZCode) {
+            let mut updated = provider.clone();
+            Self::set_provider_live_config_managed(&mut updated, true);
+            state.db.save_provider("zcode", &updated)?;
+            let written = zcode_direct::run(
+                &state.db,
+                crate::mode::state::op::SWITCH,
+                Some(zcode_direct::Target::Direct(Some(&updated))),
+                crate::mode::state::PendingTarget::pointer(Some(id.into())),
+            )
+            .map(|_| ());
+            Self::keep_row_if_written(state, &app_type, id, Some(provider), written)?;
+            return Ok(SwitchResult::default());
+        }
 
         // OMO ↔ OMO Slim are mutually exclusive; activating one removes the other's config file.
         if matches!(app_type, AppType::OpenCode) {
@@ -6787,6 +6911,7 @@ impl ProviderService {
                     AppType::OpenClaw => remove_openclaw_provider_from_live(&provider.id),
                     AppType::Hermes => remove_hermes_provider_from_live(&provider.id),
                     AppType::Mcode => crate::mcode_config::remove_provider(&provider.id),
+                    AppType::ZCode => remove_zcode_provider_from_live(&provider.id),
                     _ => Ok(()),
                 };
 
@@ -7050,7 +7175,7 @@ impl ProviderService {
             AppType::OpenCode => Self::extract_opencode_common_config(&provider.settings_config),
             AppType::OpenClaw => Self::extract_openclaw_common_config(&provider.settings_config),
             AppType::Hermes => Ok(String::new()), // Hermes doesn't use common config snippets
-            AppType::Pi | AppType::Mcode | AppType::Agy => Ok(String::new()),
+            AppType::Pi | AppType::Mcode | AppType::Agy | AppType::ZCode => Ok(String::new()),
         }
     }
 
@@ -7068,7 +7193,7 @@ impl ProviderService {
             AppType::OpenCode => Self::extract_opencode_common_config(settings_config),
             AppType::OpenClaw => Self::extract_openclaw_common_config(settings_config),
             AppType::Hermes => Ok(String::new()), // Hermes doesn't use common config snippets
-            AppType::Pi | AppType::Mcode | AppType::Agy => Ok(String::new()),
+            AppType::Pi | AppType::Mcode | AppType::Agy | AppType::ZCode => Ok(String::new()),
         }
     }
 
@@ -7701,7 +7826,10 @@ impl ProviderService {
         .await
     }
 
-    pub(crate) fn validate_provider_settings(app_type: &AppType, provider: &Provider) -> Result<(), AppError> {
+    pub(crate) fn validate_provider_settings(
+        app_type: &AppType,
+        provider: &Provider,
+    ) -> Result<(), AppError> {
         icon::validate_icon(provider.icon.as_deref())?;
         match app_type {
             AppType::Dsh => return dsh_direct::validate(provider),
@@ -7841,6 +7969,23 @@ impl ProviderService {
             AppType::Pi => {
                 crate::pi_config::validate_provider_node(&provider.id, &provider.settings_config)?;
             }
+            AppType::ZCode => {
+                if provider
+                    .settings_config
+                    .get("config")
+                    .is_some_and(Value::is_string)
+                {
+                    crate::native_provider_config::native_config(provider)?;
+                }
+                // ZCode: accept any JSON object (provider fragment with kind/options/models)
+                if !provider.settings_config.is_object() {
+                    return Err(AppError::localized(
+                        "provider.zcode.settings.not_object",
+                        "ZCode 配置必须是 JSON 对象",
+                        "ZCode configuration must be a JSON object",
+                    ));
+                }
+            }
         }
 
         // Validate and clean UsageScript configuration (common for all app types)
@@ -7921,7 +8066,9 @@ impl ProviderService {
                     })?;
                 Ok((api_key, base_url))
             }
-            AppType::Dsh => Err(AppError::Message("DSH_USAGE_CREDENTIAL_QUERY_UNSUPPORTED".into())),
+            AppType::Dsh => Err(AppError::Message(
+                "DSH_USAGE_CREDENTIAL_QUERY_UNSUPPORTED".into(),
+            )),
             AppType::ClaudeDesktop => {
                 let credentials =
                     crate::claude_desktop_config::direct_gateway_credentials(provider)?;
@@ -8006,8 +8153,8 @@ impl ProviderService {
 
                 Ok((api_key, base_url))
             }
-            AppType::OpenCode => {
-                // OpenCode uses options.apiKey and options.baseURL
+            AppType::OpenCode | AppType::ZCode => {
+                // OpenCode and ZCode use options.apiKey and options.baseURL
                 let options = provider
                     .settings_config
                     .get("options")
@@ -8226,7 +8373,9 @@ impl ProviderService {
         let mut live_failures = Vec::new();
 
         if provider.apps.dsh {
-            let mut child = provider.to_native_provider("dsh").ok_or_else(|| AppError::Message("dsh 需要明确选择模型".into()))?;
+            let mut child = provider
+                .to_native_provider("dsh")
+                .ok_or_else(|| AppError::Message("dsh 需要明确选择模型".into()))?;
             Self::validate_provider_settings(&AppType::Codex, &child)?;
             if let Some(existing) = state.db.get_provider_by_id(&child.id, "dsh")? {
                 child.created_at = existing.created_at;

@@ -17,6 +17,7 @@ export const APP_DISPLAY_NAME: Record<AppId, string> = {
   mcode: "MiniMax Code",
   dsh: "DSH",
   agy: "Antigravity",
+  zcode: "ZCode",
 };
 
 const APP_ICON_NAME: Record<AppId, string> = {
@@ -32,6 +33,7 @@ const APP_ICON_NAME: Record<AppId, string> = {
   mcode: "minimax",
   dsh: "deepseek",
   agy: "antigravity",
+  zcode: "zcode",
 };
 
 // Claude Code 和 Claude Desktop 用同一个图标，靠右下角的小角标区分终端与桌面

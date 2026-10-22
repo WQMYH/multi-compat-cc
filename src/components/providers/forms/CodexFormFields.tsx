@@ -1870,15 +1870,19 @@ export function CodexFormFields({
   // 默认模型 —— config.toml 顶层 model，Codex 启动时默认请求的模型。实时写回 TOML；留空则删行。
   // 有模型列表时第一行就是它，不显示这个框（Grok Build 没有列表，一直显示）；列表为空时
   // 两种布局都显示，聚合模式下发布的就是它。
-  const defaultModelField = (category !== "official" || appId === "dsh") &&
+  const defaultModelField = (category !== "official" ||
+    appId === "dsh" ||
+    appId === "zcode") &&
     onModelChange &&
     (!firstRowIsDefault || catalogRows.length === 0) && (
       <div className="space-y-1.5">
         {labelWithHelp(
           t("codexConfig.defaultModelLabel", { defaultValue: "默认模型" }),
-          appId === "dsh"
-            ? t("providerForm.dshDefaultModelHint", {
-                defaultValue: "DSH 新会话使用的默认模型，请选择当前供应商或托管账号支持的模型。",
+          appId === "dsh" || appId === "zcode"
+            ? t("providerForm.nativeDefaultModelHint", {
+                client: appId === "dsh" ? "DSH" : "ZCode",
+                defaultValue:
+                  "{{client}} 新会话使用的默认模型，请选择当前供应商或托管账号支持的模型。",
               })
             : isGrokBuild
               ? t("grokBuild.defaultModelHint", {

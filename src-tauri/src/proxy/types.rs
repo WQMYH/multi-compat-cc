@@ -110,6 +110,8 @@ pub struct ProxyServerInfo {
 /// 各应用的接管状态（是否改写该应用的 Live 配置指向本地代理）
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProxyTakeoverStatus {
+    #[serde(default)]
+    pub zcode: bool,
     pub claude: bool,
     pub codex: bool,
     pub gemini: bool,

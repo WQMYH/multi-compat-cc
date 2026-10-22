@@ -114,7 +114,7 @@ export function supportsOfficialProxyTakeover(
   appId: AppId,
   provider: Pick<Provider, "id" | "category" | "meta" | "settingsConfig">,
 ): boolean {
-  if (appId === "dsh") {
+  if (appId === "dsh" || appId === "zcode") {
     return Boolean(
       resolveManagedAccountId(provider.meta, "codex_oauth")?.trim(),
     );
@@ -147,7 +147,7 @@ export function providerNeedsRouting(
   appId: AppId,
   provider: Provider,
 ): boolean {
-  if (appId === "dsh") {
+  if (appId === "dsh" || appId === "zcode") {
     return (
       Boolean(resolveManagedAccountId(provider.meta, "codex_oauth")?.trim()) ||
       isOAuthProviderType(provider.meta?.providerType) ||

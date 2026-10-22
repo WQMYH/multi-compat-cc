@@ -133,6 +133,7 @@ export function RoutingSection({ onOpenApp }: RoutingSectionProps) {
     grokbuild: useProvidersQuery("grokbuild").data,
     "claude-desktop": useProvidersQuery("claude-desktop").data,
     dsh: useProvidersQuery("dsh").data,
+    zcode: useProvidersQuery("zcode").data,
   };
 
   const usingApps = MODE_APP_IDS.flatMap((app, index) => {

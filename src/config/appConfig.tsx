@@ -29,6 +29,7 @@ export const APP_IDS: AppId[] = [
   "mcode",
   "dsh",
   "agy",
+  "zcode",
 ];
 
 export const DEFAULT_VISIBLE_APPS: VisibleApps = {
@@ -45,6 +46,7 @@ export const DEFAULT_VISIBLE_APPS: VisibleApps = {
   qoder: true,
   dsh: true,
   agy: true,
+  zcode: true,
 };
 
 /** App IDs shown in Skills panels. */
@@ -59,6 +61,7 @@ export const SKILLS_APP_IDS: SkillsAppId[] = [
   "pi",
   "mcode",
   "agy",
+  "zcode",
 ];
 
 export type ProxyAppId = Extract<
@@ -82,12 +85,13 @@ export function isProxyAppId(appId: string): appId is ProxyAppId {
  * 有直连 / 路由模式的应用（后端 `AppType::has_route_mode`）：上面四个，加上 Claude Desktop。
  * Desktop 经同一个路由服务转发，但没有故障转移和路由设置（不在 `PROXY_APP_IDS` 里）。
  */
-export type ModeAppId = ProxyAppId | "claude-desktop" | "dsh";
+export type ModeAppId = ProxyAppId | "claude-desktop" | "dsh" | "zcode";
 
 export const MODE_APP_IDS: ModeAppId[] = [
   ...PROXY_APP_IDS,
   "claude-desktop",
   "dsh",
+  "zcode",
 ];
 
 export function isModeAppId(appId: string): appId is ModeAppId {
@@ -113,7 +117,7 @@ export function isStackAppId(appId: string): appId is StackAppId {
 
 export type AdditiveAppId = Extract<
   AppId,
-  "opencode" | "openclaw" | "hermes" | "pi" | "mcode"
+  "opencode" | "openclaw" | "hermes" | "pi" | "mcode" | "zcode"
 >;
 
 export const ADDITIVE_APP_IDS: AdditiveAppId[] = [
@@ -122,6 +126,7 @@ export const ADDITIVE_APP_IDS: AdditiveAppId[] = [
   "openclaw",
   "hermes",
   "pi",
+  "zcode",
 ];
 
 export function isAdditiveAppId(appId: string): appId is AdditiveAppId {
@@ -155,6 +160,7 @@ export const MCP_APP_IDS: McpAppId[] = [
   "pi",
   "mcode",
   "agy",
+  "zcode",
 ];
 
 export function isMcpAppId(appId: string): appId is McpAppId {
@@ -287,6 +293,16 @@ export const APP_ICON_MAP: Record<AppId, AppConfig> = {
       "bg-sky-500/10 ring-1 ring-sky-500/20 hover:bg-sky-500/20 text-sky-700 dark:text-sky-300",
     badgeClass:
       "bg-sky-500/10 text-sky-700 dark:text-sky-300 hover:bg-sky-500/20 border-0 gap-1.5",
+  },
+  zcode: {
+    label: "ZCode",
+    icon: (
+      <ProviderIcon icon="zcode" name="ZCode" size={14} showFallback={false} />
+    ),
+    activeClass:
+      "bg-blue-500/10 ring-1 ring-blue-500/20 hover:bg-blue-500/20 text-blue-600 dark:text-blue-400",
+    badgeClass:
+      "bg-blue-500/10 text-blue-700 dark:text-blue-300 hover:bg-blue-500/20 border-0 gap-1.5",
   },
 };
 

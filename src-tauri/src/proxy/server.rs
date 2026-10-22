@@ -299,6 +299,7 @@ impl ProxyServer {
     pub(super) fn build_router(&self) -> Router {
         Router::new()
             .merge(super::dsh::routes())
+            .merge(super::zcode::routes())
             // 健康检查
             .route("/health", get(handlers::health_check))
             .route("/status", get(handlers::get_status))

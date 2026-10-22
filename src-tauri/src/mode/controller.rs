@@ -35,7 +35,9 @@ use crate::provider::Provider;
 use crate::services::provider::codex_client_catalog;
 use crate::services::provider::codex_direct::{self, Owner};
 use crate::services::provider::codex_official_models;
-use crate::services::provider::{claude_direct, dsh_direct, gemini_direct, grok_direct};
+use crate::services::provider::{
+    claude_direct, dsh_direct, gemini_direct, grok_direct, zcode_direct,
+};
 use crate::store::AppState;
 
 use super::contract;
@@ -46,13 +48,14 @@ use super::state::{op, Contract, Mode, ModeState, PendingTarget, StackState};
 
 /// 有路由模式的应用（[`AppType::has_route_mode`]）。Claude Desktop 也在内：它经同一个路由
 /// 服务转发，只是没有故障转移。
-pub const PROXY_APPS: [AppType; 6] = [
+pub const PROXY_APPS: [AppType; 7] = [
     AppType::Claude,
     AppType::Codex,
     AppType::Gemini,
     AppType::GrokBuild,
     AppType::ClaudeDesktop,
     AppType::Dsh,
+    AppType::ZCode,
 ];
 
 fn err(error: impl std::fmt::Display) -> String {
@@ -492,12 +495,42 @@ async fn write_proxy(
         AppType::Dsh => {
             let members = published_members(state, app, &stack, route)?;
             let base = format!("{}/dsh/v1", proxy_url.trim_end_matches('/'));
-            let projection = dsh_direct::route_projection(&state.db, &state.codex_oauth_manager, route, &base, PROXY_TOKEN_PLACEHOLDER, &members).await.map_err(err)?;
+            let projection = dsh_direct::route_projection(
+                &state.db,
+                &state.codex_oauth_manager,
+                route,
+                &base,
+                PROXY_TOKEN_PLACEHOLDER,
+                &members,
+            )
+            .await
+            .map_err(err)?;
             let contract = contract::dsh(&projection);
             let unchanged = !force && live_now.has_contract(&contract.key);
             target.contract = Some(contract);
-            dsh_direct::run(&state.db, op_name,
-                (!unchanged).then_some(dsh_direct::Target::Provider(&projection)), pending(target)).map_err(err)?;
+            dsh_direct::run(
+                &state.db,
+                op_name,
+                (!unchanged).then_some(dsh_direct::Target::Provider(&projection)),
+                pending(target),
+            )
+            .map_err(err)?;
+            unchanged
+        }
+        AppType::ZCode => {
+            let base = format!("{}/zcode/v1", proxy_url.trim_end_matches('/'));
+            let projection =
+                zcode_direct::route_config(route, &base, PROXY_TOKEN_PLACEHOLDER).map_err(err)?;
+            let contract = contract::zcode(&projection);
+            let unchanged = !force && live_now.has_contract(&contract.key);
+            target.contract = Some(contract);
+            zcode_direct::run(
+                &state.db,
+                op_name,
+                (!unchanged).then_some(zcode_direct::Target::Route(route, &projection)),
+                pending(target),
+            )
+            .map_err(err)?;
             unchanged
         }
         AppType::ClaudeDesktop => {
@@ -611,11 +644,29 @@ fn write_direct(
             .map_err(err)?;
         }
         AppType::Dsh => {
-            let projection = usable_direct(app, direct.as_ref()).filter(|p| !dsh_direct::needs_routing(p) && !dsh_direct::is_native_ref(p))
-                .map(|p| dsh_direct::projection(p, None, &[])).transpose().map_err(err)?;
-            let write = attached.then(|| projection.as_ref().map(dsh_direct::Target::Provider)
-                .unwrap_or(dsh_direct::Target::NativeDefault));
+            let projection = usable_direct(app, direct.as_ref())
+                .filter(|p| !dsh_direct::needs_routing(p) && !dsh_direct::is_native_ref(p))
+                .map(|p| dsh_direct::projection(p, None, &[]))
+                .transpose()
+                .map_err(err)?;
+            let write = attached.then(|| {
+                projection
+                    .as_ref()
+                    .map(dsh_direct::Target::Provider)
+                    .unwrap_or(dsh_direct::Target::NativeDefault)
+            });
             dsh_direct::run(&state.db, op_name, write, pending_target).map_err(err)?;
+        }
+        AppType::ZCode => {
+            let direct =
+                usable_direct(app, direct.as_ref()).filter(|p| !zcode_direct::needs_routing(p));
+            zcode_direct::run(
+                &state.db,
+                op_name,
+                attached.then_some(zcode_direct::Target::Direct(direct)),
+                pending_target,
+            )
+            .map_err(err)?;
         }
         AppType::ClaudeDesktop => {
             // 直连那家写不进去（模型映射卡、配置不全）也不能让 Desktop 一直指着路由：退回官方。
@@ -2666,6 +2717,274 @@ mod mode_tests {
         };
         assert_eq!(keys(&live), keys(&original));
         assert_eq!(keys(&live["env"]), keys(&original["env"]));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn zcode_account_routing_uses_shared_modes_and_restores_direct_provider() {
+        let _home = Home::new();
+        let api = Provider::with_id(
+            "native-api".into(),
+            "API fixture".into(),
+            json!({
+                "auth":{"OPENAI_API_KEY":"fixture-api-key"},
+                "config":"model = \"model-api\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nname = \"custom\"\nbase_url = \"https://fixture.invalid/v1\"\nwire_api = \"responses\""
+            }),
+            None,
+        );
+        let mut account = Provider::with_id(
+            "managed".into(),
+            "Managed fixture".into(),
+            json!({
+                "auth":{}, "config":"model = \"model-a\"\n",
+                "modelCatalog":{"models":[{"model":"model-a"},{"model":"model-b"}]}
+            }),
+            None,
+        );
+        account.category = Some("official".into());
+        account.meta = Some(serde_json::from_value(json!({"providerType":"codex_oauth",
+            "authBinding":{"source":"managed_account","authProvider":"codex_oauth","accountId":"fixture-account-binding"}})).unwrap());
+        let state = state_with(AppType::ZCode, &[api.clone(), account], "native-api").await;
+        let path = crate::zcode_config::get_zcode_provider_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let untouched = json!({"providerId":"account:untouched","config":{"opaque":true}});
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({"config":{
+            "providerConfigRules":{"providerRules":[untouched.clone()]},
+            "modelConfigRules":{"keep":[1,2]}}}))
+            .unwrap(),
+        )
+        .unwrap();
+        ProviderService::switch(&state, AppType::ZCode, "native-api").unwrap();
+        enter_with_route(&state, &AppType::ZCode, false, Some("managed"))
+            .await
+            .unwrap();
+        let rules = crate::zcode_config::get_typed_providers().unwrap();
+        let route = &rules[zcode_direct::ROUTE_ID];
+        assert_eq!(route.kind, "openai");
+        assert_eq!(
+            route.models.keys().cloned().collect::<Vec<_>>(),
+            ["model-a", "model-b"]
+        );
+        assert_eq!(
+            route.options.api_key.as_deref(),
+            Some(PROXY_TOKEN_PLACEHOLDER)
+        );
+        assert!(route
+            .options
+            .base_url
+            .as_ref()
+            .unwrap()
+            .ends_with("/zcode/v1"));
+        assert!(
+            state
+                .proxy_service
+                .get_takeover_status()
+                .await
+                .unwrap()
+                .zcode
+        );
+        assert_eq!(in_use(&state, &AppType::ZCode).as_deref(), Some("managed"));
+        assert_eq!(
+            direct(&state, &AppType::ZCode).as_deref(),
+            Some("native-api")
+        );
+        let live = crate::zcode_config::read_zcode_provider_config().unwrap();
+        assert!(!serde_json::to_string(&live)
+            .unwrap()
+            .contains("fixture-account-binding"));
+        assert_eq!(
+            live["config"]["defaultModelSelection"]["providerId"],
+            zcode_direct::ROUTE_ID
+        );
+        assert_eq!(
+            crate::services::provider::import_zcode_providers_from_live(&state).unwrap(),
+            0
+        );
+        assert!(state
+            .db
+            .get_provider_by_id(zcode_direct::ROUTE_ID, "zcode")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            state
+                .db
+                .get_provider_by_id("native-api", "zcode")
+                .unwrap()
+                .unwrap()
+                .settings_config,
+            api.settings_config
+        );
+        exit(&state, &AppType::ZCode).await.unwrap();
+        let live = crate::zcode_config::read_zcode_provider_config().unwrap();
+        assert_eq!(
+            live["config"]["defaultModelSelection"],
+            json!({"providerId":"native-api","modelId":"model-api"})
+        );
+        assert_eq!(
+            live["config"]["providerConfigRules"]["providerRules"][0],
+            untouched
+        );
+        assert_eq!(live["config"]["modelConfigRules"]["keep"], json!([1, 2]));
+        assert!(!crate::zcode_config::get_typed_providers()
+            .unwrap()
+            .contains_key(zcode_direct::ROUTE_ID));
+        assert!(!state.proxy_service.is_running().await);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn zcode_shared_responses_route_preserves_the_selected_catalog_model() {
+        use axum::{http::HeaderMap, routing::post, Json, Router};
+        let _home = Home::new();
+        let seen = Arc::new(tokio::sync::Mutex::new(
+            None::<(HeaderMap, serde_json::Value)>,
+        ));
+        let capture = seen.clone();
+        let upstream = Router::new().route("/v1/responses", post(move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+            let capture = capture.clone();
+            async move {
+                *capture.lock().await = Some((headers, body));
+                Json(json!({"id":"synthetic-response", "object":"response", "status":"completed", "output":[],
+                    "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = listener.local_addr().unwrap();
+        let upstream_task =
+            tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let api = Provider::with_id(
+            "api".into(),
+            "Synthetic API".into(),
+            json!({
+                "kind":"openai", "options":{"baseURL":format!("http://{upstream_address}/v1"), "apiKey":"fixture-only"},
+                "models":{"model-a":{},"model-b":{}}
+            }),
+            None,
+        );
+        let state = state_with(AppType::ZCode, &[api], "api").await;
+        enter_with_route(&state, &AppType::ZCode, false, Some("api"))
+            .await
+            .unwrap();
+        let status = state.proxy_service.get_status().await.unwrap();
+        let response = reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(5)).build().unwrap()
+            .post(format!("http://127.0.0.1:{}/zcode/v1/responses", status.port))
+            .json(&json!({"model":"model-b", "input":[{"role":"user","content":"synthetic-only"}], "stream":false}))
+            .send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap()["id"],
+            "synthetic-response"
+        );
+        let (headers, body) = seen
+            .lock()
+            .await
+            .take()
+            .expect("the shared route reached the synthetic upstream");
+        assert_eq!(headers["authorization"], "Bearer fixture-only");
+        assert_eq!(body["model"], "model-b");
+        assert!(body.get("input").is_some());
+        assert!(body.get("messages").is_none());
+        exit(&state, &AppType::ZCode).await.unwrap();
+        assert!(!state.proxy_service.is_running().await);
+        upstream_task.abort();
+        let _ = upstream_task.await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn zcode_failed_switch_preserves_native_bytes_and_current_pointer() {
+        let _home = Home::new();
+        let empty = Provider::with_id(
+            "empty".into(),
+            "No model".into(),
+            json!({
+                "kind":"openai","options":{"baseURL":"https://fixture.invalid/v1","apiKey":"fixture"},"models":{}
+            }),
+            None,
+        );
+        let previous = Provider::with_id(
+            "previous".into(),
+            "Previous".into(),
+            json!({
+                "kind":"openai", "options":{"baseURL":"https://fixture.invalid/v1","apiKey":"fixture"},
+                "models":{"keep":{}}
+            }),
+            None,
+        );
+        let state = state_with(AppType::ZCode, &[empty, previous], "previous").await;
+        let path = crate::zcode_config::get_zcode_provider_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let before = b"{\"config\":{\"defaultModelSelection\":{\"providerId\":\"account:keep\",\"modelId\":\"keep\"}}}";
+        fs::write(&path, before).unwrap();
+        let stored = serde_json::to_value(
+            state
+                .db
+                .get_provider_by_id("empty", "zcode")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(ProviderService::switch(&state, AppType::ZCode, "empty").is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(
+            crate::mode::current::local_direct_pointer(&AppType::ZCode).as_deref(),
+            Some("previous")
+        );
+        assert!(!crate::mode::operation::has_pending("zcode"));
+        assert_eq!(
+            serde_json::to_value(
+                state
+                    .db
+                    .get_provider_by_id("empty", "zcode")
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            stored
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn zcode_routing_without_direct_row_restores_existing_native_selection() {
+        let _home = Home::new();
+        let account = Provider::with_id(
+            "managed".into(),
+            "API route fixture".into(),
+            json!({
+                "auth":{"OPENAI_API_KEY":"fixture"},
+                "config":"model = \"route-model\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://fixture.invalid/v1\"\nwire_api = \"responses\""
+            }),
+            None,
+        );
+        let db = Arc::new(Database::memory().unwrap());
+        db.save_provider("zcode", &account).unwrap();
+        db.update_proxy_config(ProxyConfig {
+            listen_port: 0,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let state = AppState::new(db);
+        let path = crate::zcode_config::get_zcode_provider_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = json!({"providerId":"account:native","modelId":"native-model"});
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({"config":{"defaultModelSelection":original}})).unwrap(),
+        )
+        .unwrap();
+        enter_with_route(&state, &AppType::ZCode, false, Some("managed"))
+            .await
+            .unwrap();
+        exit(&state, &AppType::ZCode).await.unwrap();
+        let live = crate::zcode_config::read_zcode_provider_config().unwrap();
+        assert_eq!(live["config"]["defaultModelSelection"], original);
+        assert!(!crate::zcode_config::get_typed_providers()
+            .unwrap()
+            .contains_key(zcode_direct::ROUTE_ID));
     }
 
     #[tokio::test]

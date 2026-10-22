@@ -97,6 +97,10 @@ export const isDshNativeRef = (provider: Provider): boolean =>
           ))),
   );
 
+export const isZcodeNativeRef = (provider: Provider): boolean =>
+  provider.settingsConfig.nativeManaged === true &&
+  provider.id.startsWith("account:");
+
 export function providerDisplayName(
   app: AppId,
   provider: Provider,
@@ -233,6 +237,22 @@ export function buildSwitchSections(input: SwitchModeInput): ProviderSection[] {
   return buildSwitchSectionsByView(input).map((section) => ({
     ...section,
     items: section.items.map((item) => {
+      if (input.app === "zcode" && isZcodeNativeRef(item.provider)) {
+        return {
+          provider: item.provider,
+          presentation: {
+            chips: providerIdentityChips(input.app, item.provider, t),
+            status: { label: t("provider.inConfig"), dot: "muted" as const },
+            buttons: [],
+            editDisabledReason: t("provider.nativeAccountManaged", {
+              app: "ZCode",
+            }),
+            deleteDisabledReason: t("provider.nativeAccountManaged", {
+              app: "ZCode",
+            }),
+          },
+        };
+      }
       const reason = deleteBlockedReason(item.provider.id);
       const nativeRef = input.app === "dsh" && isDshNativeRef(item.provider);
       // DSH keeps identity requirements visible in every mode, not only Direct.

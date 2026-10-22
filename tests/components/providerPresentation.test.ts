@@ -80,6 +80,30 @@ const button = (sections: ProviderSection[], id: string, key: string) => {
   return found;
 };
 
+it("shows ZCode's native account configuration without claiming an active CC route", () => {
+  const native = provider("account:bigmodel-individual-coding-plan", {
+    category: "official",
+    settingsConfig: { nativeManaged: true },
+  });
+  for (const view of ["direct", "route"] as const) {
+    const { sections } = build({
+      app: "zcode",
+      active: "route",
+      view,
+      providers: [native, relay],
+      directId: null,
+      routeId: relay.id,
+    });
+    const card = item(sections, native.id);
+    expect(card.status?.label).toBe("provider.inConfig");
+    expect(card.status?.dot).toBe("muted");
+    expect(card.buttons).toEqual([]);
+    expect(card.chips.some((chip) => chip.key === "official")).toBe(true);
+    expect(card.editDisabledReason).toBe("provider.nativeAccountManaged");
+    expect(card.deleteDisabledReason).toBe("provider.nativeAccountManaged");
+  }
+});
+
 it("uses common in-use and switch actions for each DSH profile rather than a configured status", () => {
   const desktop = provider("native-current:desktop", {
     settingsConfig: { nativeRef: true, profile: "desktop" },

@@ -80,7 +80,11 @@ pub fn claude_desktop(profile: &Value) -> Contract {
 }
 
 pub(crate) fn dsh(projection: &crate::services::provider::dsh_direct::Projection) -> Contract {
-    Contract { version: CONTRACT_VERSION, key: key_of(&json!({"app":"dsh", "version":CONTRACT_VERSION, "projection":projection})), exclusive: Map::new() }
+    Contract {
+        version: CONTRACT_VERSION,
+        key: key_of(&json!({"app":"dsh", "version":CONTRACT_VERSION, "projection":projection})),
+        exclusive: Map::new(),
+    }
 }
 
 fn sorted(map: &Map<String, Value>) -> Value {
@@ -92,6 +96,15 @@ fn sorted(map: &Map<String, Value>) -> Value {
             .map(|(key, value)| json!([key, value]))
             .collect(),
     )
+}
+
+pub(crate) fn zcode(projection: &crate::provider::ZCodeProviderConfig) -> Contract {
+    Contract {
+        version: CONTRACT_VERSION,
+        key: key_of(&json!({"app":"zcode",
+        "version":CONTRACT_VERSION,"projection":projection})),
+        exclusive: Map::new(),
+    }
 }
 
 #[cfg(test)]

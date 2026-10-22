@@ -437,7 +437,10 @@ impl RequestForwarder {
         error: &ProxyError,
     ) -> Option<OpaqueStateRejection> {
         if already_retried
-            || !matches!(app_type, AppType::Codex | AppType::GrokBuild | AppType::Dsh)
+            || !matches!(
+                app_type,
+                AppType::Codex | AppType::GrokBuild | AppType::Dsh | AppType::ZCode
+            )
             || codex_upstream_format != Some(CodexUpstreamFormat::NativeResponses)
         {
             return None;
@@ -1385,18 +1388,33 @@ impl RequestForwarder {
     ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
         *codex_upstream_format_out = None;
         // 使用适配器提取 base_url
-        let dsh_account = if matches!(app_type, AppType::Dsh) {
-            crate::services::provider::dsh_direct::validate(provider).map_err(|e| ProxyError::ConfigError(e.to_string()))?;
-            provider.meta.as_ref().and_then(|meta| meta.managed_account_id_for("codex_oauth"))
-        } else { None };
-        let mut base_url = if dsh_account.is_some() { super::providers::CHATGPT_CODEX_BASE_URL.into() } else { adapter.extract_base_url(provider)? };
+        let managed_native_account = if matches!(app_type, AppType::Dsh | AppType::ZCode) {
+            if *app_type == AppType::Dsh {
+                crate::services::provider::dsh_direct::validate(provider)
+                    .map_err(|e| ProxyError::ConfigError(e.to_string()))?;
+            } else {
+                crate::native_provider_config::native_config(provider)
+                    .map_err(|e| ProxyError::ConfigError(e.to_string()))?;
+            }
+            provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.managed_account_id_for("codex_oauth"))
+        } else {
+            None
+        };
+        let mut base_url = if managed_native_account.is_some() {
+            super::providers::CHATGPT_CODEX_BASE_URL.into()
+        } else {
+            adapter.extract_base_url(provider)?
+        };
 
         let is_full_url = provider
             .meta
             .as_ref()
             .and_then(|meta| meta.is_full_url)
             .unwrap_or(false)
-            && dsh_account.is_none()
+            && managed_native_account.is_none()
             && !provider.is_codex_oauth()
             && !provider.is_xai_oauth()
             && !provider.is_github_copilot();
@@ -1407,19 +1425,21 @@ impl RequestForwarder {
         // Codex upstream conversion mode — computed early because the [1m]-suffix strip
         // below must be skipped on the Anthropic path (the marker has to survive to
         // catalog matching and to the transform's own strip+beta detection).
-        let mut codex_responses_to_chat = matches!(app_type, AppType::Codex | AppType::GrokBuild | AppType::Dsh)
-            && dsh_account.is_none()
+        let mut codex_responses_to_chat = matches!(
+            app_type,
+            AppType::Codex | AppType::GrokBuild | AppType::Dsh | AppType::ZCode
+        ) && managed_native_account.is_none()
             && super::providers::should_convert_codex_responses_to_chat(provider, endpoint);
-        let mut codex_responses_to_anthropic =
-            matches!(app_type, AppType::Codex | AppType::GrokBuild | AppType::Dsh)
-                && dsh_account.is_none()
-                && super::providers::should_convert_codex_responses_to_anthropic(
-                    provider, endpoint,
-                );
+        let mut codex_responses_to_anthropic = matches!(
+            app_type,
+            AppType::Codex | AppType::GrokBuild | AppType::Dsh | AppType::ZCode
+        ) && managed_native_account.is_none()
+            && super::providers::should_convert_codex_responses_to_anthropic(provider, endpoint);
         let mut copilot_endpoint_override: Option<String> = None;
         let codex_official_auth_passthrough = matches!(app_type, AppType::Codex)
             && super::providers::is_codex_official_provider(provider);
-        let codex_stack_request = self.stack_request && matches!(app_type, AppType::Codex | AppType::Dsh);
+        let codex_stack_request = self.stack_request
+            && matches!(app_type, AppType::Codex | AppType::Dsh | AppType::ZCode);
 
         if codex_official_auth_passthrough {
             let (expected_chatgpt_account_id, managed_session_matches) = match provider
@@ -1517,7 +1537,9 @@ impl RequestForwarder {
         // Grok Build exposes a stable client-side model profile in config.toml.
         // Route requests to the provider's real upstream model before applying
         // the optional Responses -> Chat/Anthropic bridge.
-        if matches!(app_type, AppType::GrokBuild | AppType::Dsh) && !self.keeps_resolved_model() {
+        if matches!(app_type, AppType::GrokBuild | AppType::Dsh | AppType::ZCode)
+            && !self.keeps_resolved_model()
+        {
             super::providers::apply_codex_upstream_model(provider, &mut mapped_body);
         }
 
@@ -1666,8 +1688,10 @@ impl RequestForwarder {
             codex_responses_to_anthropic = false;
         }
 
-        let codex_upstream_format = if matches!(app_type, AppType::Codex | AppType::GrokBuild | AppType::Dsh)
-            && super::providers::is_codex_responses_endpoint(endpoint)
+        let codex_upstream_format = if matches!(
+            app_type,
+            AppType::Codex | AppType::GrokBuild | AppType::Dsh | AppType::ZCode
+        ) && super::providers::is_codex_responses_endpoint(endpoint)
         {
             Some(if codex_responses_to_anthropic {
                 CodexUpstreamFormat::Anthropic
@@ -1991,8 +2015,10 @@ impl RequestForwarder {
         // One gate so rebase conflicts stay here plus the isolate file, not
         // scattered across sanitizers. Flatten namespaces first; then apply
         // xAI request rewrites (schema, agent_message, unknown models).
-        if matches!(app_type, AppType::Codex | AppType::GrokBuild | AppType::Dsh)
-            && !codex_responses_to_chat
+        if matches!(
+            app_type,
+            AppType::Codex | AppType::GrokBuild | AppType::Dsh | AppType::ZCode
+        ) && !codex_responses_to_chat
             && !codex_responses_to_anthropic
             && super::providers::provider_needs_responses_namespace_flatten(provider)
         {
@@ -2059,7 +2085,10 @@ impl RequestForwarder {
             }
         }
 
-        if matches!(app_type, AppType::Codex | AppType::GrokBuild | AppType::Dsh) {
+        if matches!(
+            app_type,
+            AppType::Codex | AppType::GrokBuild | AppType::Dsh | AppType::ZCode
+        ) {
             self.apply_media_prevention(&mut request_body, provider);
         }
 
@@ -2107,9 +2136,11 @@ impl RequestForwarder {
         // 获取认证头（提前准备，用于内联替换），同时保留仅用于日志脱敏的
         // 精确认证材料。实际日志永远不输出这些值。
         let mut log_secrets: Vec<String> = Vec::new();
-        let selected_auth = if dsh_account.is_some() {
+        let selected_auth = if managed_native_account.is_some() {
             Some(AuthInfo::new(String::new(), AuthStrategy::CodexOAuth))
-        } else { adapter.extract_auth(provider) };
+        } else {
+            adapter.extract_auth(provider)
+        };
         let mut auth_headers = if let Some(mut auth) = selected_auth {
             // GitHub Copilot 特殊处理：从 CopilotAuthManager 获取真实 token
             if auth.strategy == AuthStrategy::GitHubCopilot {
@@ -2839,8 +2870,10 @@ impl RequestForwarder {
                     // A response.failed/error before output remains failover-safe.
                     response = self.validate_responses_stream_start(response).await?;
                 }
-            } else if matches!(app_type, AppType::Codex | AppType::GrokBuild | AppType::Dsh)
-                && !codex_responses_to_chat
+            } else if matches!(
+                app_type,
+                AppType::Codex | AppType::GrokBuild | AppType::Dsh | AppType::ZCode
+            ) && !codex_responses_to_chat
                 && !codex_responses_to_anthropic
                 && request_is_streaming
                 && !response.is_json()
@@ -4775,10 +4808,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source11_dsh_uses_the_common_responses_wire_and_selected_model_without_messages_bridge() {
+    async fn source11_dsh_uses_the_common_responses_wire_and_selected_model_without_messages_bridge(
+    ) {
         use axum::{routing::post, Json, Router};
-        let seen=Arc::new(tokio::sync::Mutex::new(None::<(HeaderMap,Value)>));
-        let capture=seen.clone();
+        let seen = Arc::new(tokio::sync::Mutex::new(None::<(HeaderMap, Value)>));
+        let capture = seen.clone();
         let app=Router::new().route("/v1/responses",post(move |headers:HeaderMap,Json(body):Json<Value>| {
             let capture=capture.clone();
             async move {
@@ -4786,28 +4820,44 @@ mod tests {
                 Json(json!({"id":"fixture-response","object":"response","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}))
             }
         }));
-        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address=listener.local_addr().unwrap();
-        let server=tokio::spawn(async move { axum::serve(listener,app).await.unwrap() });
-        let provider=Provider::with_id("dsh-only".into(),"DSH".into(),json!({
-            "auth":{"OPENAI_API_KEY":"fixture-only"},
-            "config":format!("model = \"model-dsh\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nname = \"custom\"\nbase_url = \"http://{address}/v1\"\nwire_api = \"responses\"")
-        }),None);
-        let forwarder=test_forwarder(Duration::from_secs(5),Duration::from_secs(5));
-        let adapter=get_adapter(&AppType::Dsh).unwrap();
-        let mut upstream=None;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = Provider::with_id(
+            "dsh-only".into(),
+            "DSH".into(),
+            json!({
+                "auth":{"OPENAI_API_KEY":"fixture-only"},
+                "config":format!("model = \"model-dsh\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nname = \"custom\"\nbase_url = \"http://{address}/v1\"\nwire_api = \"responses\"")
+            }),
+            None,
+        );
+        let forwarder = test_forwarder(Duration::from_secs(5), Duration::from_secs(5));
+        let adapter = get_adapter(&AppType::Dsh).unwrap();
+        let mut upstream = None;
         let result=forwarder.forward(&AppType::Dsh,&http::Method::POST,&provider,"/responses",
             &json!({"model":"client-old","instructions":"fixture","input":[{"role":"user","content":"synthetic"}],"stream":false}),
             &HeaderMap::new(),&Extensions::new(),adapter.as_ref(),&mut upstream).await;
-        assert!(result.is_ok(),"{}",result.err().map(|e|e.to_string()).unwrap_or_default());
-        let captured=seen.lock().await.take().expect("the mock received native Responses");
-        assert_eq!(captured.1["model"],"model-dsh");
+        assert!(
+            result.is_ok(),
+            "{}",
+            result.err().map(|e| e.to_string()).unwrap_or_default()
+        );
+        let captured = seen
+            .lock()
+            .await
+            .take()
+            .expect("the mock received native Responses");
+        assert_eq!(captured.1["model"], "model-dsh");
         assert!(captured.1.get("input").is_some());
         assert!(captured.1.get("messages").is_none());
-        assert_eq!(captured.0.get("authorization").unwrap(),"Bearer fixture-only");
-        assert_eq!(upstream,Some(CodexUpstreamFormat::NativeResponses));
+        assert_eq!(
+            captured.0.get("authorization").unwrap(),
+            "Bearer fixture-only"
+        );
+        assert_eq!(upstream, Some(CodexUpstreamFormat::NativeResponses));
         server.abort();
-        let _=server.await;
+        let _ = server.await;
     }
 
     #[tokio::test]

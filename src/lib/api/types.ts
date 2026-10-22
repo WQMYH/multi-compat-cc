@@ -11,4 +11,5 @@ export type AppId =
   | "pi"
   | "mcode"
   | "dsh"
-  | "agy";
+  | "agy"
+  | "zcode";

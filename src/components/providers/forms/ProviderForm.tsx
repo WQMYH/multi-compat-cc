@@ -59,9 +59,14 @@ import {
   type HermesProviderPreset,
 } from "@/config/hermesProviderPresets";
 import { isHermesBuiltinProviderId } from "@/config/hermesBuiltinProviderIds";
+import {
+  zcodeProviderPresets,
+  type ZCodeProviderPreset,
+} from "@/config/zcodeProviderPresets";
 import { OpenCodeFormFields } from "./OpenCodeFormFields";
 import { OpenClawFormFields } from "./OpenClawFormFields";
 import { HermesFormFields } from "./HermesFormFields";
+import { ZCodeFormFields } from "./ZCodeFormFields";
 import type { UniversalProviderPreset } from "@/config/universalProviderPresets";
 import {
   applyTemplateValues,
@@ -122,6 +127,7 @@ import {
   useOmoDraftState,
   useOpenclawFormState,
   useHermesFormState,
+  useZcodeFormState,
   useCopilotAuth,
   useCodexOauth,
   useXaiOauth,
@@ -137,10 +143,13 @@ import {
   isNativeOpencodeConfig,
 } from "./helpers/opencodeFormUtils";
 import { HERMES_DEFAULT_CONFIG } from "./hooks/useHermesFormState";
+import { ZCODE_DEFAULT_CONFIG } from "./hooks/useZcodeFormState";
 import { resolveManagedAccountId } from "@/lib/authBinding";
 import { useOpenClawLiveProviderIds } from "@/hooks/useOpenClaw";
 import { useHermesLiveProviderIds } from "@/hooks/useHermes";
 import { resolveCodexOfficialIdentity } from "@/utils/providerCapabilities";
+import { useZcodeLiveProviderIds } from "@/hooks/useZcode";
+import { useProvidersQuery } from "@/lib/query/queries";
 
 type PresetEntry = {
   id: string;
@@ -150,7 +159,8 @@ type PresetEntry = {
     | GeminiProviderPreset
     | OpenCodeProviderPreset
     | OpenClawProviderPreset
-    | HermesProviderPreset;
+    | HermesProviderPreset
+    | ZCodeProviderPreset;
 };
 
 function getPresetProviderType(
@@ -282,7 +292,7 @@ type LocalProxyRequestOverridesBuildResult = ReturnType<
 
 export interface ProviderFormProps {
   appId: AppId;
-  nativeTarget?: "dsh";
+  nativeTarget?: "dsh" | "zcode";
   providerId?: string;
   submitLabel: string;
   onSubmit: (values: ProviderFormValues) => Promise<void> | void;
@@ -328,6 +338,9 @@ export interface ProviderFormProps {
 export function ProviderForm(props: ProviderFormProps) {
   if (props.appId === "dsh") {
     return <ProviderFormFull {...props} nativeTarget="dsh" appId="codex" />;
+  }
+  if (props.appId === "zcode" && (!props.initialData || typeof props.initialData.settingsConfig?.config === "string")) {
+    return <ProviderFormFull {...props} nativeTarget="zcode" appId="codex" />;
   }
   if (props.appId === "mcode") return <McodeProviderForm {...props} />;
   if (props.appId === "pi") {
@@ -488,7 +501,9 @@ function ProviderFormFull({
                   ? OPENCLAW_DEFAULT_CONFIG
                   : appId === "hermes"
                     ? HERMES_DEFAULT_CONFIG
-                    : CLAUDE_DEFAULT_CONFIG,
+                    : appId === "zcode"
+                      ? ZCODE_DEFAULT_CONFIG
+                      : CLAUDE_DEFAULT_CONFIG,
       icon: initialData?.icon ?? "",
       iconColor: initialData?.iconColor ?? "",
     }),
@@ -707,7 +722,7 @@ function ProviderFormFull({
   // 聚合模式下 Claude Code / Codex 的第三方供应商用简化面板（连接 + 模型列表 + 高级）；
   // 两种布局共用同一份表单状态，完整表单从直连 / 路由那格打开。
   const { data: appModeView } = useAppMode(
-    nativeTarget === "dsh" ? "dsh" : appId,
+    nativeTarget ?? appId,
     appId === "claude" || appId === "codex",
   );
   // 应用实际在直连时，非原生上游格式发不出请求：正在直连用的这张卡一保存就坏，别的卡切不过去。
@@ -932,6 +947,11 @@ function ProviderFormFull({
     } else if (appId === "hermes") {
       return hermesProviderPresets.map<PresetEntry>((preset, index) => ({
         id: `hermes-${index}`,
+        preset,
+      }));
+    } else if (appId === "zcode") {
+      return zcodeProviderPresets.map<PresetEntry>((preset, index) => ({
+        id: `zcode-${index}`,
         preset,
       }));
     }
@@ -1196,6 +1216,37 @@ function ProviderFormFull({
     isLoading: isHermesLiveProviderIdsLoading,
   } = useHermesLiveProviderIds(appId === "hermes");
 
+  // ZCode form state — rebuilds config directly from local state (no
+  // getSettingsConfig read-back), avoiding the PR#4975 stale-read footgun.
+  const zcodeForm = useZcodeFormState({
+    initialData,
+    appId,
+    providerId,
+    onSettingsConfigChange: (config) => form.setValue("settingsConfig", config),
+  });
+  // JSON 编辑器是 settingsConfig 的另一个写入方：外部改动（粘贴/手改）时把
+  // 结构化字段重新对齐，避免之后任一侧的保存覆盖掉另一侧的编辑。
+  const zcodeSettingsValue = form.watch("settingsConfig");
+  useEffect(() => {
+    if (appId === "zcode" && zcodeSettingsValue) {
+      zcodeForm.hydrateFromJson(zcodeSettingsValue);
+    }
+  }, [appId, zcodeSettingsValue, zcodeForm]);
+  const {
+    data: zcodeLiveProviderIds = [],
+    isLoading: isZcodeLiveProviderIdsLoading,
+  } = useZcodeLiveProviderIds(appId === "zcode");
+
+  // ZCode 的查重要同时覆盖数据库已存的 id：从 live 移除过的供应商仍留在
+  // 数据库里，只查 live 会漏掉它们，新增同 id 会静默覆盖整行。
+  const { data: zcodeProvidersData } = useProvidersQuery("zcode");
+  const existingZcodeKeys = useMemo(() => {
+    if (appId !== "zcode" || !zcodeProvidersData?.providers) return [];
+    return Object.keys(zcodeProvidersData.providers).filter(
+      (key) => key !== providerId,
+    );
+  }, [appId, zcodeProvidersData?.providers, providerId]);
+
   const additiveExistingProviderKeys = useMemo(() => {
     if (appId === "opencode" && !isAnyOmoCategory) {
       return Array.from(
@@ -1228,10 +1279,21 @@ function ProviderFormFull({
       );
     }
 
+    if (appId === "zcode") {
+      return Array.from(
+        new Set(
+          [...zcodeLiveProviderIds, ...existingZcodeKeys].filter(
+            (key) => key !== providerId,
+          ),
+        ),
+      );
+    }
+
     return [];
   }, [
     appId,
     existingOpencodeKeys,
+    existingZcodeKeys,
     hermesForm.existingHermesKeys,
     hermesLiveProviderIds,
     isAnyOmoCategory,
@@ -1239,6 +1301,7 @@ function ProviderFormFull({
     openclawLiveProviderIds,
     opencodeLiveProviderIds,
     providerId,
+    zcodeLiveProviderIds,
   ]);
 
   const isProviderKeyLockStateLoading = useMemo(() => {
@@ -1252,6 +1315,9 @@ function ProviderFormFull({
     if (appId === "hermes") {
       return isHermesLiveProviderIdsLoading;
     }
+    if (appId === "zcode") {
+      return isZcodeLiveProviderIdsLoading;
+    }
     return false;
   }, [
     appId,
@@ -1260,6 +1326,7 @@ function ProviderFormFull({
     isHermesLiveProviderIdsLoading,
     isOpenclawLiveProviderIdsLoading,
     isOpencodeLiveProviderIdsLoading,
+    isZcodeLiveProviderIdsLoading,
   ]);
 
   const isProviderKeyLocked = useMemo(() => {
@@ -1273,6 +1340,9 @@ function ProviderFormFull({
     if (appId === "hermes") {
       return hermesLiveProviderIds.includes(providerId);
     }
+    if (appId === "zcode") {
+      return zcodeLiveProviderIds.includes(providerId);
+    }
     return false;
   }, [
     appId,
@@ -1282,6 +1352,7 @@ function ProviderFormFull({
     openclawLiveProviderIds,
     opencodeLiveProviderIds,
     providerId,
+    zcodeLiveProviderIds,
   ]);
 
   const shouldApplyLocalProxyRequestOverrides =
@@ -1289,19 +1360,19 @@ function ProviderFormFull({
 
   const handleSubmit = async (values: ProviderFormData) => {
     if (
-      nativeTarget === "dsh" &&
+      nativeTarget &&
       isCodexOfficialProvider &&
       !codexModel.trim()
     ) {
       toast.error(
-        t("providerForm.dshDefaultModelRequired", {
-          defaultValue: "请先选择 DSH 默认模型",
+        t(`providerForm.${nativeTarget}DefaultModelRequired`, {
+          defaultValue: `请先选择 ${nativeTarget === "zcode" ? "ZCode" : "DSH"} 默认模型`,
         }),
       );
       return;
     }
     if (
-      nativeTarget === "dsh" &&
+      nativeTarget &&
       isCodexOfficialProvider &&
       !selectedCodexAccountId
     ) {
@@ -1455,6 +1526,38 @@ function ProviderFormFull({
       ) {
         toast.error(t("hermes.form.providerKeyDuplicate"));
         return;
+      }
+    }
+
+    if (appId === "zcode") {
+      // ZCode provider keys allow letters, numbers, hyphens, colons, underscores
+      const zcodeKeyPattern = /^[a-zA-Z0-9:_-]+$/;
+      if (!zcodeForm.zcodeProviderKey.trim()) {
+        toast.error(t("zcode.providerKeyRequired"));
+        return;
+      }
+      if (!zcodeKeyPattern.test(zcodeForm.zcodeProviderKey)) {
+        toast.error(t("zcode.providerKeyInvalid"));
+        return;
+      }
+      if (isProviderKeyLockStateLoading) {
+        toast.error(t("zcode.providerKeyStatusLoading"));
+        return;
+      }
+      if (
+        !isProviderKeyLocked &&
+        additiveExistingProviderKeys.includes(zcodeForm.zcodeProviderKey)
+      ) {
+        toast.error(t("zcode.providerKeyDuplicate"));
+        return;
+      }
+      // apiKeyRequired is derived from the initial config presence, NOT
+      // hard-coded — fixes the PR#4975 regression that forced a key.
+      if (zcodeForm.zcodeApiKeyRequired && !zcodeForm.zcodeApiKey.trim()) {
+        issues.push(t("zcode.apiKeyRequired"));
+      }
+      if (!zcodeForm.zcodeBaseUrl.trim()) {
+        issues.push(t("zcode.baseUrlRequired"));
       }
     }
 
@@ -1846,6 +1949,8 @@ function ProviderFormFull({
       payload.providerKey = openclawForm.openclawProviderKey;
     } else if (appId === "hermes") {
       payload.providerKey = hermesForm.hermesProviderKey;
+    } else if (appId === "zcode") {
+      payload.providerKey = zcodeForm.zcodeProviderKey;
     }
 
     if (isAnyOmoCategory && !payload.presetCategory) {
@@ -2190,6 +2295,20 @@ function ProviderFormFull({
     formBaseUrl: hermesForm.hermesBaseUrl,
   });
 
+  // 使用 API Key 链接 hook (ZCode)
+  const {
+    shouldShowApiKeyLink: shouldShowZcodeApiKeyLink,
+    websiteUrl: zcodeWebsiteUrl,
+    isPartner: isZcodePartner,
+    partnerPromotionKey: zcodePartnerPromotionKey,
+  } = useApiKeyLink({
+    appId: "zcode",
+    category,
+    selectedPresetId,
+    presetEntries,
+    formWebsiteUrl: form.watch("websiteUrl") || "",
+  });
+
   // 使用端点测速候选 hook
   const speedTestEndpoints = useSpeedTestEndpoints({
     appId,
@@ -2234,6 +2353,9 @@ function ProviderFormFull({
       }
       if (appId === "hermes") {
         hermesForm.resetHermesState();
+      }
+      if (appId === "zcode") {
+        zcodeForm.resetZcodeState();
       }
       return;
     }
@@ -2366,6 +2488,23 @@ function ProviderFormFull({
 
       form.reset({
         name: preset.nameKey ? t(preset.nameKey) : preset.name,
+        websiteUrl: preset.websiteUrl ?? "",
+        settingsConfig: JSON.stringify(config, null, 2),
+        icon: preset.icon ?? "",
+        iconColor: preset.iconColor ?? "",
+      });
+      return;
+    }
+
+    // ZCode preset handling
+    if (appId === "zcode") {
+      const preset = entry.preset as ZCodeProviderPreset;
+      const config = preset.settingsConfig;
+
+      zcodeForm.resetZcodeState(config);
+
+      form.reset({
+        name: preset.name,
         websiteUrl: preset.websiteUrl ?? "",
         settingsConfig: JSON.stringify(config, null, 2),
         icon: preset.icon ?? "",
@@ -2645,6 +2784,60 @@ function ProviderFormFull({
                       </p>
                     )}
                 </div>
+              ) : appId === "zcode" ? (
+                <div className="space-y-2">
+                  <Label htmlFor="zcode-key">
+                    {t("zcode.providerKey")}
+                    <span className="text-destructive ml-1">*</span>
+                  </Label>
+                  <ImeSafeInput
+                    id="zcode-key"
+                    value={zcodeForm.zcodeProviderKey}
+                    onValueChange={zcodeForm.setZcodeProviderKey}
+                    normalize={(v) => v.replace(/[^a-zA-Z0-9:_-]/g, "")}
+                    placeholder={t("zcode.providerKeyPlaceholder")}
+                    disabled={
+                      isProviderKeyLocked || isProviderKeyLockStateLoading
+                    }
+                    className={
+                      (additiveExistingProviderKeys.includes(
+                        zcodeForm.zcodeProviderKey,
+                      ) &&
+                        !isProviderKeyLocked) ||
+                      (zcodeForm.zcodeProviderKey.trim() !== "" &&
+                        !/^[a-zA-Z0-9:_-]+$/.test(zcodeForm.zcodeProviderKey))
+                        ? "border-destructive"
+                        : ""
+                    }
+                  />
+                  {additiveExistingProviderKeys.includes(
+                    zcodeForm.zcodeProviderKey,
+                  ) &&
+                    !isProviderKeyLocked && (
+                      <p className="text-xs text-destructive">
+                        {t("zcode.providerKeyDuplicate")}
+                      </p>
+                    )}
+                  {zcodeForm.zcodeProviderKey.trim() !== "" &&
+                    !/^[a-zA-Z0-9:_-]+$/.test(zcodeForm.zcodeProviderKey) && (
+                      <p className="text-xs text-destructive">
+                        {t("zcode.providerKeyInvalid")}
+                      </p>
+                    )}
+                  {!(
+                    additiveExistingProviderKeys.includes(
+                      zcodeForm.zcodeProviderKey,
+                    ) && !isProviderKeyLocked
+                  ) &&
+                    (zcodeForm.zcodeProviderKey.trim() === "" ||
+                      /^[a-zA-Z0-9:_-]+$/.test(zcodeForm.zcodeProviderKey)) && (
+                      <p className="text-xs text-muted-foreground">
+                        {isProviderKeyLocked
+                          ? t("zcode.providerKeyLockedHint")
+                          : t("zcode.providerKeyHint")}
+                      </p>
+                    )}
+                </div>
               ) : undefined
             }
           />
@@ -2734,7 +2927,7 @@ function ProviderFormFull({
 
           {appId === "codex" && (
             <CodexFormFields
-              appId={nativeTarget === "dsh" ? "dsh" : undefined}
+              appId={nativeTarget}
               providerId={providerId}
               isCopilotPreset={isCopilotProvider}
               isCopilotAuthenticated={isCopilotAuthenticated}
@@ -2769,9 +2962,9 @@ function ProviderFormFull({
               codexOauthNoneOptionDescription={t(
                 "codex.followCodexLoginDescription",
               )}
-              codexOauthAllowUnboundSelection={nativeTarget !== "dsh"}
+              codexOauthAllowUnboundSelection={!nativeTarget}
               codexOauthAllowUnboundSelectionWithoutStatus={
-                nativeTarget !== "dsh"
+                !nativeTarget
               }
               codexOauthRequireExplicitSelection={
                 requiresExplicitCodexOfficialSelection
@@ -2953,6 +3146,29 @@ function ProviderFormFull({
             />
           )}
 
+          {/* ZCode 专属字段 */}
+          {appId === "zcode" && (
+            <ZCodeFormFields
+              kind={zcodeForm.zcodeKind}
+              onKindChange={zcodeForm.handleZcodeKindChange}
+              name={zcodeForm.zcodeName}
+              onNameChange={zcodeForm.handleZcodeNameChange}
+              apiKey={zcodeForm.zcodeApiKey}
+              onApiKeyChange={zcodeForm.handleZcodeApiKeyChange}
+              category={category}
+              shouldShowApiKeyLink={shouldShowZcodeApiKeyLink}
+              websiteUrl={zcodeWebsiteUrl}
+              isPartner={isZcodePartner}
+              partnerPromotionKey={zcodePartnerPromotionKey}
+              baseUrl={zcodeForm.zcodeBaseUrl}
+              onBaseUrlChange={zcodeForm.handleZcodeBaseUrlChange}
+              models={zcodeForm.zcodeModels}
+              onModelsChange={zcodeForm.handleZcodeModelsChange}
+              extraOptions={zcodeForm.zcodeExtraOptions}
+              onExtraOptionsChange={zcodeForm.handleZcodeExtraOptionsChange}
+            />
+          )}
+
           {/* 配置编辑器：Codex、Claude、Gemini 分别使用不同的编辑器 */}
           {useStackLayout ? (
             settingsConfigErrorField
@@ -3035,7 +3251,9 @@ function ProviderFormFull({
               </div>
               {settingsConfigErrorField}
             </>
-          ) : appId === "openclaw" || appId === "hermes" ? (
+          ) : appId === "openclaw" ||
+            appId === "hermes" ||
+            appId === "zcode" ? (
             <>
               <div className="space-y-2">
                 <Label htmlFor="settingsConfig">
@@ -3056,7 +3274,19 @@ function ProviderFormFull({
   "base_url": "https://api.example.com/v1",
   "api_key": ""
 }`
-                      : `{
+                      : appId === "zcode"
+                        ? `{
+  "name": "my-provider",
+  "kind": "anthropic",
+  "enabled": true,
+  "source": "custom",
+  "options": {
+    "baseURL": "https://api.example.com/anthropic",
+    "apiKey": "your-api-key-here"
+  },
+  "models": {}
+}`
+                        : `{
   "baseUrl": "https://api.example.com/v1",
   "apiKey": "your-api-key-here",
   "api": "openai-completions",

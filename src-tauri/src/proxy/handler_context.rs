@@ -204,6 +204,20 @@ impl RequestContext {
             }
         };
 
+        let (provider, providers) = if app_type == AppType::ZCode {
+            let providers = providers
+                .iter()
+                .map(crate::services::provider::zcode_direct::common_provider)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| ProxyError::ConfigError(e.to_string()))?;
+            let provider = providers
+                .first()
+                .cloned()
+                .ok_or(ProxyError::NoAvailableProvider)?;
+            (provider, providers)
+        } else {
+            (provider, providers)
+        };
         Ok(Self {
             start_time,
             app_config,

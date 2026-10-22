@@ -291,6 +291,7 @@ describe("SessionManagerPage", () => {
         qoder: false,
         dsh: false,
         agy: false,
+        zcode: false,
       },
     });
     renderPage("codex");

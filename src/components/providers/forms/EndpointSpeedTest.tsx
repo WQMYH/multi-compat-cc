@@ -22,6 +22,7 @@ const ENDPOINT_TIMEOUT_SECS: Record<AppId, number> = {
   mcode: 8,
   dsh: 12,
   agy: 8,
+  zcode: 8,
 };
 
 interface TestResult {

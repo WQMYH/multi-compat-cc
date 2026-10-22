@@ -33,6 +33,7 @@ import {
   useHermesLiveProviderIds,
   useHermesModelConfig,
 } from "@/hooks/useHermes";
+import { useZcodeLiveProviderIds } from "@/hooks/useZcode";
 import { useStreamCheck } from "@/hooks/useStreamCheck";
 import { ProviderCard } from "@/components/providers/ProviderCard";
 import { ProviderEmptyState } from "@/components/providers/ProviderEmptyState";
@@ -57,6 +58,7 @@ import {
   type ProviderSection,
   type SwitchModeInput,
   isDshNativeRef,
+  isZcodeNativeRef,
 } from "@/components/providers/presentation";
 
 /** 切换式应用（Claude Code / Codex / Gemini CLI / Grok Build）的模式状态和动作，由供应商页传入。 */
@@ -142,6 +144,11 @@ export function ProviderList({
   const { data: hermesLiveIds, isPending: isHermesLiveIdsPending } =
     useHermesLiveProviderIds(appId === "hermes");
   const { data: hermesModelConfig } = useHermesModelConfig(appId === "hermes");
+
+  // ZCode: 查询 live 配置中的供应商 ID 列表，用于判断 isInConfig
+  const { data: zcodeLiveIds } = useZcodeLiveProviderIds(appId === "zcode");
+
+  // OpenClaw: query default model to determine which provider is default
   const { data: openclawDefaultModel } = useOpenClawDefaultModel(
     appId === "openclaw",
   );
@@ -176,6 +183,8 @@ export function ProviderList({
           return openclawLiveIds?.includes(provider.id) ?? false;
         case "hermes":
           return hermesLiveIds?.includes(provider.id) ?? false;
+        case "zcode":
+          return zcodeLiveIds?.includes(provider.id) ?? false;
         case "pi":
           return isPiStateReady
             ? (piCurrentState?.enabledProviderIds.includes(provider.id) ??
@@ -190,6 +199,7 @@ export function ProviderList({
       opencodeLiveIds,
       openclawLiveIds,
       hermesLiveIds,
+      zcodeLiveIds,
       isPiStateReady,
       piCurrentState,
     ],
@@ -213,6 +223,10 @@ export function ProviderList({
       }
       if (appId === "hermes") {
         return (await providersApi.importHermesFromLive()) > 0;
+      }
+      if (appId === "zcode") {
+        const count = await providersApi.importZcodeFromLive();
+        return count > 0;
       }
       if (appId === "claude-desktop") {
         return (await providersApi.importClaudeDesktopFromClaude()) > 0;
@@ -483,7 +497,8 @@ export function ProviderList({
       onEdit={onEdit}
       onDelete={onDelete}
       onDuplicate={
-        appId === "dsh" && provider.settingsConfig.nativeRef
+        (appId === "dsh" && provider.settingsConfig.nativeRef) ||
+        (appId === "zcode" && isZcodeNativeRef(provider))
           ? undefined
           : onDuplicate
       }
@@ -494,7 +509,8 @@ export function ProviderList({
       // Antigravity 的「打开终端」已经是主按钮，「更多」菜单里不再重复
       onOpenTerminal={appId === "agy" ? undefined : onOpenTerminal}
       onTest={
-        appId === "dsh" && provider.settingsConfig.nativeRef
+        (appId === "dsh" && provider.settingsConfig.nativeRef) ||
+        (appId === "zcode" && isZcodeNativeRef(provider))
           ? undefined
           : handleTest
       }
@@ -657,7 +673,9 @@ interface SortableProviderCardProps {
 }
 
 function SortableProviderCard(props: SortableProviderCardProps) {
-  const nativeRef = props.appId === "dsh" && isDshNativeRef(props.provider);
+  const nativeRef =
+    (props.appId === "dsh" && isDshNativeRef(props.provider)) ||
+    (props.appId === "zcode" && isZcodeNativeRef(props.provider));
   const {
     setNodeRef,
     attributes,

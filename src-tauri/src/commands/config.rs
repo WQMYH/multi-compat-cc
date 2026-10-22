@@ -72,7 +72,10 @@ pub async fn get_config_status(
     match AppType::from_str(&app).map_err(|e| e.to_string())? {
         AppType::Dsh => {
             let root = crate::services::provider::dsh_direct::root().map_err(|e| e.to_string())?;
-            Ok(ConfigStatus { exists: root.join("profiles").is_dir(), path: root.to_string_lossy().into_owned() })
+            Ok(ConfigStatus {
+                exists: root.join("profiles").is_dir(),
+                path: root.to_string_lossy().into_owned(),
+            })
         }
         AppType::Claude => Ok(config::get_claude_config_status()),
         AppType::ClaudeDesktop => {
@@ -167,6 +170,15 @@ pub async fn get_config_status(
                 path: dir.to_string_lossy().into_owned(),
             })
         }
+        AppType::ZCode => {
+            let config_path = crate::zcode_config::get_zcode_provider_config_path();
+            let exists = config_path.exists();
+            let path = crate::zcode_config::get_zcode_dir()
+                .to_string_lossy()
+                .to_string();
+
+            Ok(ConfigStatus { exists, path })
+        }
     }
 }
 
@@ -195,6 +207,7 @@ pub async fn get_config_dir(app: String) -> Result<String, String> {
             .unwrap()
             .to_path_buf(),
         AppType::Agy => crate::agy_config::agy_dir(),
+        AppType::ZCode => crate::zcode_config::get_zcode_dir(),
     };
 
     Ok(dir.to_string_lossy().to_string())
@@ -220,6 +233,7 @@ pub async fn open_config_folder(handle: AppHandle, app: String) -> Result<bool, 
             .unwrap()
             .to_path_buf(),
         AppType::Agy => crate::agy_config::agy_dir(),
+        AppType::ZCode => crate::zcode_config::get_zcode_dir(),
     };
 
     if !config_dir.exists() {
