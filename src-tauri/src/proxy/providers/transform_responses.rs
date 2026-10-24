@@ -2001,23 +2001,20 @@ pub fn anthropic_to_responses(
     // - stream: 必须永远 true（codex-rs 硬编码 true，且 cc-switch 的
     //   SSE 解析层只处理流式响应，强制覆盖避免客户端误传 false）
     if is_codex_oauth {
-        result["store"] = json!(false);
         if codex_fast_mode {
             result["service_tier"] = json!("priority");
         }
 
-        const REASONING_MARKER: &str = "reasoning.encrypted_content";
-        let mut includes: Vec<Value> = body
+        result["include"] = body
             .get("include")
             .and_then(|v| v.as_array())
             .cloned()
-            .unwrap_or_default();
-        if !includes
-            .iter()
-            .any(|v| v.as_str() == Some(REASONING_MARKER))
-        {
-            includes.push(json!(REASONING_MARKER));
-        }
+            .unwrap_or_default()
+            .into();
+        normalize_codex_oauth_responses_request(&mut result, true)?;
+        let includes = result["include"]
+            .as_array_mut()
+            .expect("normalized include");
         if !hosted_web_search_names.is_empty()
             && !includes
                 .iter()
@@ -2025,30 +2022,44 @@ pub fn anthropic_to_responses(
         {
             includes.push(json!(WEB_SEARCH_SOURCES_MARKER));
         }
-        result["include"] = json!(includes);
-
-        if let Some(obj) = result.as_object_mut() {
-            // —— 删除 ChatGPT 反代不接受的字段 ——
-            obj.remove("max_output_tokens");
-            obj.remove("temperature");
-            obj.remove("top_p");
-
-            // —— 兜底必填字段（or_insert：客户端送了什么就保留，否则注入默认值）——
-            obj.entry("instructions".to_string()).or_insert(json!(""));
-            obj.entry("tools".to_string()).or_insert(json!([]));
-            // Anthropic 默认允许并行工具调用。优先保留上方已转换的显式设置，
-            // 否则允许支持该能力的 Codex 模型在同一响应中批量调用独立工具。
-            obj.entry("parallel_tool_calls".to_string())
-                .or_insert(json!(true));
-
-            // —— 强制覆盖 stream = true ——
-            // 即便客户端误传 stream:false 也要覆盖，因为 codex-rs 永远 true，
-            // 且 cc-switch SSE 解析层只支持流式响应。
-            obj.insert("stream".to_string(), json!(true));
-        }
     }
 
     Ok(result)
+}
+
+/// The same ChatGPT-account contract for converted and native Responses requests.
+pub(crate) fn normalize_codex_oauth_responses_request(
+    body: &mut Value,
+    is_codex_oauth: bool,
+) -> Result<(), ProxyError> {
+    if !is_codex_oauth {
+        return Ok(());
+    }
+    let obj = body.as_object_mut().ok_or_else(|| {
+        ProxyError::InvalidRequest("Codex OAuth Responses body must be an object".into())
+    })?;
+    obj.insert("store".into(), json!(false));
+    let mut includes = obj
+        .get("include")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    const REASONING_MARKER: &str = "reasoning.encrypted_content";
+    if !includes
+        .iter()
+        .any(|value| value.as_str() == Some(REASONING_MARKER))
+    {
+        includes.push(json!(REASONING_MARKER));
+    }
+    obj.insert("include".into(), json!(includes));
+    for field in ["max_output_tokens", "temperature", "top_p"] {
+        obj.remove(field);
+    }
+    obj.entry("instructions").or_insert(json!(""));
+    obj.entry("tools").or_insert(json!([]));
+    obj.entry("parallel_tool_calls").or_insert(json!(true));
+    obj.insert("stream".into(), json!(true));
+    Ok(())
 }
 
 fn map_tool_choice_to_responses(
@@ -5204,6 +5215,56 @@ mod tests {
     }
 
     // ==================== Codex OAuth (ChatGPT 反代) 协议约束 ====================
+
+    #[test]
+    fn native_codex_oauth_responses_normalizes_contract_without_translating_input() {
+        for store in [None, Some(true), Some(false)] {
+            let mut request = json!({"model":"fixture-model", "stream":false,
+                "input":[{"role":"user","content":[{"type":"input_text","text":"synthetic only"}]}],
+                "tools":[{"type":"function","name":"fixture_tool","parameters":{"type":"object"}}],
+                "parallel_tool_calls":false, "reasoning":{"effort":"max"},
+                "include":["fixture.include","reasoning.encrypted_content"],
+                "max_output_tokens":100, "temperature":0.3, "top_p":0.9});
+            if let Some(store) = store {
+                request["store"] = json!(store);
+            }
+            let before = request.clone();
+            normalize_codex_oauth_responses_request(&mut request, true).unwrap();
+            assert_eq!(request["store"], false);
+            assert_eq!(request["stream"], true);
+            assert_eq!(request["instructions"], "");
+            for field in [
+                "input",
+                "tools",
+                "model",
+                "reasoning",
+                "parallel_tool_calls",
+                "include",
+            ] {
+                assert_eq!(
+                    request[field], before[field],
+                    "native field {field} must survive"
+                );
+            }
+            for field in ["max_output_tokens", "temperature", "top_p"] {
+                assert!(request.get(field).is_none());
+            }
+            let once = request.clone();
+            normalize_codex_oauth_responses_request(&mut request, true).unwrap();
+            assert_eq!(request, once);
+        }
+    }
+
+    #[test]
+    fn native_responses_non_oauth_body_is_unchanged_and_invalid_oauth_body_is_rejected() {
+        let mut api = json!({"store":true,"stream":false,"max_output_tokens":32});
+        let before = api.clone();
+        normalize_codex_oauth_responses_request(&mut api, false).unwrap();
+        assert_eq!(api, before);
+        let mut invalid = json!([]);
+        assert!(normalize_codex_oauth_responses_request(&mut invalid, true).is_err());
+        assert_eq!(invalid, json!([]));
+    }
 
     #[test]
     fn test_anthropic_to_responses_codex_oauth_sets_store_and_include() {

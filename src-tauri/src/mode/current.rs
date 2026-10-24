@@ -58,6 +58,19 @@ pub fn provider_for(
             return Ok(Some(route.id));
         }
     }
+    if *app == AppType::ZCode && crate::zcode_config::get_zcode_provider_config_path().is_file() {
+        let Some(id) = crate::services::provider::zcode_direct::direct_provider_id()? else {
+            return Ok(None);
+        };
+        let provider = db.get_provider_by_id(&id, app.as_str())?.or(
+            crate::zcode_config::get_native_official_providers()?
+                .into_iter()
+                .find(|provider| provider.id == id),
+        );
+        return Ok(provider
+            .filter(|provider| !crate::services::provider::zcode_direct::needs_routing(provider))
+            .map(|provider| provider.id));
+    }
     let direct = crate::settings::get_effective_current_provider(db, app)?;
     if *app == AppType::ZCode {
         if let Some(id) = &direct {
@@ -117,7 +130,15 @@ fn proxy_route_row(db: &Database, app: &AppType) -> Result<Option<Provider>, App
 /// 直连指针指向的那一行。
 pub fn direct_provider(db: &Database, app: &AppType) -> Result<Option<Provider>, AppError> {
     match provider_for(db, app, Purpose::Direct)? {
-        Some(id) => db.get_provider_by_id(&id, app.as_str()),
+        Some(id) => {
+            let row = db.get_provider_by_id(&id, app.as_str())?;
+            if row.is_none() && *app == AppType::ZCode {
+                return Ok(crate::zcode_config::get_native_official_providers()?
+                    .into_iter()
+                    .find(|provider| provider.id == id));
+            }
+            Ok(row)
+        }
         None => Ok(None),
     }
 }

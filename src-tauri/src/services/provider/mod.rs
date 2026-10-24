@@ -5526,6 +5526,7 @@ impl ProviderService {
         }
         let mut providers = state.db.get_all_providers(app_type.as_str())?;
         if app_type == AppType::ZCode {
+            providers.retain(|_, provider| !crate::zcode_config::is_native_official(provider));
             for provider in crate::zcode_config::get_native_official_providers()? {
                 providers.entry(provider.id.clone()).or_insert(provider);
             }
@@ -6725,7 +6726,11 @@ impl ProviderService {
         }
 
         // Check if provider exists
-        let providers = state.db.get_all_providers(app_type.as_str())?;
+        let providers = if app_type == AppType::ZCode {
+            Self::list(state, app_type.clone())?
+        } else {
+            state.db.get_all_providers(app_type.as_str())?
+        };
         let _provider = providers
             .get(id)
             .ok_or_else(|| AppError::Message(format!("供应商 {id} 不存在")))?;
@@ -6832,8 +6837,12 @@ impl ProviderService {
             return Ok(SwitchResult::default());
         }
         if matches!(app_type, AppType::ZCode) {
+            let existing = state.db.get_provider_by_id(id, "zcode")?;
             let mut updated = provider.clone();
-            Self::set_provider_live_config_managed(&mut updated, true);
+            Self::set_provider_live_config_managed(
+                &mut updated,
+                !crate::zcode_config::is_native_official(provider),
+            );
             state.db.save_provider("zcode", &updated)?;
             let written = zcode_direct::run(
                 &state.db,
@@ -6842,7 +6851,7 @@ impl ProviderService {
                 crate::mode::state::PendingTarget::pointer(Some(id.into())),
             )
             .map(|_| ());
-            Self::keep_row_if_written(state, &app_type, id, Some(provider), written)?;
+            Self::keep_row_if_written(state, &app_type, id, existing.as_ref(), written)?;
             return Ok(SwitchResult::default());
         }
 
@@ -7975,7 +7984,7 @@ impl ProviderService {
                     .get("config")
                     .is_some_and(Value::is_string)
                 {
-                    crate::native_provider_config::native_config(provider)?;
+                    zcode_direct::validate(provider)?;
                 }
                 // ZCode: accept any JSON object (provider fragment with kind/options/models)
                 if !provider.settings_config.is_object() {

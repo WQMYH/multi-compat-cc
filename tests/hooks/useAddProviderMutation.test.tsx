@@ -71,6 +71,48 @@ beforeEach(() => {
 });
 
 describe("useAddProviderMutation", () => {
+  it("adds a ZCode API provider from the shared editor with a generated id", async () => {
+    const { wrapper } = createWrapper();
+    const { result } = renderHook(() => useAddProviderMutation("zcode"), { wrapper });
+    const settingsConfig = {
+      auth: { OPENAI_API_KEY: "fixture-key" },
+      config: 'model = "fixture-model"',
+    };
+
+    const provider = await act(async () =>
+      result.current.mutateAsync({ name: "API fixture", settingsConfig }),
+    );
+
+    expect(apiMocks.add).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "generated-uuid", settingsConfig }),
+      "zcode",
+      undefined,
+      undefined,
+    );
+    expect(provider.id).toBe("generated-uuid");
+  });
+
+  it("preserves a native ZCode provider key and still rejects a missing native key", async () => {
+    const { wrapper } = createWrapper();
+    const { result } = renderHook(() => useAddProviderMutation("zcode"), { wrapper });
+    const nativeProvider = {
+      name: "Native fixture",
+      settingsConfig: { kind: "openai-responses", options: {}, models: {} },
+    };
+
+    const provider = await act(async () =>
+      result.current.mutateAsync({ ...nativeProvider, providerKey: "personal:fixture" }),
+    );
+    expect(provider.id).toBe("personal:fixture");
+    await act(async () => {
+      await expect(result.current.mutateAsync(nativeProvider)).rejects.toThrow(
+        "Provider key is required for zcode",
+      );
+    });
+    expect(apiMocks.add).toHaveBeenCalledOnce();
+    expect(uuidMocks.generateUUID).not.toHaveBeenCalled();
+  });
+
   it("adds an agy profile without silently activating it", async () => {
     const { wrapper } = createWrapper();
     const { result } = renderHook(() => useAddProviderMutation("agy"), {

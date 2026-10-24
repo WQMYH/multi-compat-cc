@@ -241,9 +241,7 @@ export function buildSwitchSections(input: SwitchModeInput): ProviderSection[] {
         return {
           provider: item.provider,
           presentation: {
-            chips: providerIdentityChips(input.app, item.provider, t),
-            status: { label: t("provider.inConfig"), dot: "muted" as const },
-            buttons: [],
+            ...item.presentation,
             editDisabledReason: t("provider.nativeAccountManaged", {
               app: "ZCode",
             }),

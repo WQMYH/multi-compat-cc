@@ -66,6 +66,13 @@ export const useAddProviderMutation = (appId: AppId) => {
       let id: string;
 
       if (
+        appId === "zcode" &&
+        !providerInput.providerKey &&
+        typeof providerInput.settingsConfig.config === "string"
+      ) {
+        // The shared CC editor has no native provider-key field.
+        id = generateUUID();
+      } else if (
         appId === "opencode" ||
         appId === "openclaw" ||
         appId === "hermes" ||

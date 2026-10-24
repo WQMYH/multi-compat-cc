@@ -23,6 +23,43 @@ fn sanitize_provider_name(name: &str) -> String {
 }
 
 #[test]
+fn provider_service_zcode_add_preserves_advertised_reasoning_values() {
+    let _guard = test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    reset_test_fs();
+    let home = ensure_test_home();
+    let state = create_test_state().expect("create test state");
+    let config = "model = \"fixture-model\"\nmodel_reasoning_effort = \"ultra\"\nmodel_provider = \"fixture\"\n[model_providers.fixture]\nbase_url = \"https://fixture.invalid/v1\"\nwire_api = \"responses\"\n";
+    let provider = Provider::with_id(
+        "zcode-capabilities".into(),
+        "ZCode capability fixture".into(),
+        json!({"auth":{"OPENAI_API_KEY":"fixture-only"},"config":config,
+            "modelCatalog":{"models":[{"model":"fixture-model","reasoningLevels":["none","max","ultra"]}]}}),
+        None,
+    );
+
+    ProviderService::add_without_switching(&state, AppType::ZCode, provider.clone())
+        .expect("the public add entry accepts ZCode's advertised values");
+    let saved = state
+        .db
+        .get_provider_by_id(&provider.id, "zcode")
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.settings_config, provider.settings_config);
+    assert!(!home.join(".zcode/v2/provider_config.json").exists());
+
+    let mut invalid = provider;
+    invalid.id = "zcode-invalid-effort".into();
+    invalid.settings_config["config"] = json!(config.replace("ultra", "not-advertised"));
+    assert!(ProviderService::add_without_switching(&state, AppType::ZCode, invalid).is_err());
+    assert!(state
+        .db
+        .get_provider_by_id("zcode-invalid-effort", "zcode")
+        .unwrap()
+        .is_none());
+    assert!(!home.join(".zcode/v2/provider_config.json").exists());
+}
+
+#[test]
 fn migrate_legacy_common_config_usage_marks_historical_provider_enabled() {
     let _guard = test_mutex().lock().unwrap_or_else(|e| e.into_inner());
     reset_test_fs();

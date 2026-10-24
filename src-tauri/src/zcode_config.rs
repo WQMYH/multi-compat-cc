@@ -154,6 +154,75 @@ pub fn get_native_official_providers() -> Result<Vec<Provider>, AppError> {
     native_official_providers_at(&get_zcode_dir())
 }
 
+pub(crate) fn is_native_official(provider: &Provider) -> bool {
+    provider.id.starts_with("account:") && provider.settings_config["nativeManaged"] == true
+}
+
+/// Reuse the desktop version probe for the materialized, versioned model catalog.
+pub(crate) fn latest_runtime_dir(root: &Path) -> Option<PathBuf> {
+    let mut best: Option<((u64, u64, u64), PathBuf)> = None;
+    for platform in std::fs::read_dir(root).ok()?.flatten() {
+        let Ok(versions) = std::fs::read_dir(platform.path()) else {
+            continue;
+        };
+        for entry in versions.flatten() {
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let mut parts = name.split(['-', '+', ' ']).next()?.split('.');
+            let parsed = (|| {
+                Some((
+                    parts.next()?.parse().ok()?,
+                    parts.next()?.parse().ok()?,
+                    parts.next()?.parse().ok()?,
+                ))
+            })();
+            let Some(parsed) = parsed else { continue };
+            if best.as_ref().is_none_or(|(version, _)| parsed > *version) {
+                best = Some((parsed, entry.path()));
+            }
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+pub(crate) fn native_official_selection(id: &str) -> Result<Value, AppError> {
+    let runtime = get_zcode_dir().join("v2/runtime/provider");
+    let mut catalogs = vec![runtime.join("bundled/zcode-builtin.json")];
+    if let Some(version) = latest_runtime_dir(&runtime) {
+        if let Ok(endpoints) = std::fs::read_dir(version) {
+            catalogs.extend(
+                endpoints
+                    .flatten()
+                    .map(|entry| entry.path().join("zcode-builtin.json")),
+            );
+        }
+    }
+    for path in catalogs.into_iter().filter(|path| path.is_file()) {
+        let catalog: Value = crate::config::read_json_file(&path)?;
+        if let Some(model) = catalog
+            .pointer("/config/providerConfigRules/providerRules")
+            .and_then(Value::as_array)
+            .and_then(|rules| {
+                rules
+                    .iter()
+                    .find(|rule| rule["providerId"] == id && rule["enabled"] != false)
+            })
+            .and_then(|rule| rule.pointer("/config/builtinModelIds"))
+            .and_then(Value::as_array)
+            .and_then(|models| models.iter().find_map(Value::as_str))
+            .filter(|model| !model.trim().is_empty())
+        {
+            return Ok(json!({"providerId": id, "modelId": model}));
+        }
+    }
+    Err(AppError::InvalidInput(format!(
+        "ZCode official model catalog for '{id}' is unavailable; open ZCode to load its native models before switching"
+    )))
+}
+
 fn native_official_providers_at(root: &Path) -> Result<Vec<Provider>, AppError> {
     let path = root.join("v2/setting.json");
     if !path.exists() {
@@ -454,7 +523,7 @@ fn write_zcode_provider_config_unlocked(path: &Path, config: &Value) -> Result<(
     }
     let json =
         serde_json::to_string_pretty(config).map_err(|e| AppError::JsonSerialize { source: e })?;
-    atomic_write_private(&path, json.as_bytes())?;
+    atomic_write_private(path, json.as_bytes())?;
 
     log::debug!("ZCode provider config written to {path:?}");
     Ok(())
@@ -521,6 +590,261 @@ pub(crate) fn upsert_provider_rule(doc: &mut Value, id: &str, rule: Value) {
     }
 }
 
+pub(crate) fn model_config(model: &crate::provider::ZCodeModel) -> Result<Value, AppError> {
+    let mut config = json!({"properties":{},"optionSpecs":{}});
+    for field in ["enabled", "properties", "optionSpecs"] {
+        if let Some(value) = model.extra.get(field) {
+            if field != "enabled" && !value.is_object() && !value.is_null() {
+                return Err(AppError::InvalidInput(
+                    "Invalid ZCode model configuration".into(),
+                ));
+            }
+            config[field] = value.clone();
+        }
+    }
+    for field in ["reasoningLevel", "maxOutputTokens"] {
+        if config["optionSpecs"]
+            .get(field)
+            .is_some_and(|value| !value.is_object() && !value.is_null())
+        {
+            return Err(AppError::InvalidInput(
+                "Invalid ZCode model option specification".into(),
+            ));
+        }
+    }
+    if let Some(limit) = &model.limit {
+        if let Some(context) = limit.context {
+            if context == 0 {
+                return Err(AppError::InvalidInput(
+                    "ZCode context window must be positive".into(),
+                ));
+            }
+            config["properties"]["contextWindow"] = json!(context);
+        }
+        if let Some(output) = limit.output {
+            if output == 0 {
+                return Err(AppError::InvalidInput(
+                    "ZCode output limit must be positive".into(),
+                ));
+            }
+            config["optionSpecs"]["maxOutputTokens"]["max"] = json!(output);
+        }
+    }
+    if let Some(reasoning) = &model.reasoning {
+        if !reasoning.is_object() {
+            return Err(AppError::InvalidInput(
+                "Invalid ZCode reasoning configuration".into(),
+            ));
+        }
+        if reasoning.get("defaultVariant").is_some_and(|default| {
+            default
+                .as_str()
+                .is_none_or(|level| level.trim().is_empty() || level.chars().any(char::is_control))
+        }) {
+            return Err(AppError::InvalidInput(
+                "Invalid ZCode default reasoning level".into(),
+            ));
+        }
+        if reasoning["enabled"] == false {
+            config["optionSpecs"]["reasoningLevel"] = Value::Null;
+        } else if let Some(levels) = reasoning.get("variants") {
+            let levels = levels
+                .as_array()
+                .filter(|levels| !levels.is_empty())
+                .ok_or_else(|| {
+                    AppError::InvalidInput("ZCode reasoning levels must be a nonempty array".into())
+                })?;
+            let mut seen = std::collections::HashSet::new();
+            for level in levels {
+                let level = level
+                    .as_str()
+                    .filter(|level| {
+                        !level.trim().is_empty() && !level.chars().any(char::is_control)
+                    })
+                    .ok_or_else(|| {
+                        AppError::InvalidInput("Invalid ZCode reasoning level".into())
+                    })?;
+                if !seen.insert(level) {
+                    return Err(AppError::InvalidInput(
+                        "Duplicate ZCode reasoning level".into(),
+                    ));
+                }
+            }
+            if reasoning
+                .get("defaultVariant")
+                .is_some_and(|default| !levels.contains(default))
+            {
+                return Err(AppError::InvalidInput(
+                    "ZCode default reasoning level is not declared".into(),
+                ));
+            }
+            // Values come from CC; ZCode retains its native API request mapping.
+            config["optionSpecs"]["reasoningLevel"]["values"] = json!(levels);
+        }
+    }
+    for field in ["properties", "optionSpecs"] {
+        if config[field] == json!({}) {
+            config.as_object_mut().unwrap().remove(field);
+        }
+    }
+    Ok(config)
+}
+
+pub(crate) fn upsert_provider_config(
+    doc: &mut Value,
+    id: &str,
+    config: &ZCodeProviderConfig,
+) -> Result<(), AppError> {
+    let updates = config
+        .models
+        .iter()
+        .map(|(model, value)| Ok((model, model_config(value)?)))
+        .collect::<Result<Vec<_>, AppError>>()?;
+    upsert_provider_rule(doc, id, provider_config_to_rule(id, config));
+    let root = doc["config"]["modelConfigRules"]
+        .as_object_mut()
+        .ok_or_else(|| AppError::Config("Invalid ZCode model rules".into()))?;
+    let manual: std::collections::HashSet<String> = root
+        .get("manualProviderModelRules")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|rule| rule["providerId"] == id)
+        .filter_map(|rule| rule["modelId"].as_str().map(str::to_string))
+        .collect();
+    let rules = root
+        .entry("providerModelRules")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or_else(|| AppError::Config("Invalid ZCode provider model rules".into()))?;
+    for (model, update) in updates {
+        if manual.contains(model) {
+            rules.retain(|rule| rule["providerId"] != id || rule["modelId"] != *model);
+            continue;
+        }
+        if update == json!({}) {
+            continue;
+        }
+        if let Some(rule) = rules
+            .iter_mut()
+            .find(|rule| rule["providerId"] == id && rule["modelId"] == *model)
+        {
+            if !rule["config"].is_object() {
+                return Err(AppError::Config(
+                    "Invalid ZCode provider model configuration".into(),
+                ));
+            }
+            for (field, value) in update.as_object().unwrap() {
+                if let (Some(existing), Some(new)) =
+                    (rule["config"][field].as_object_mut(), value.as_object())
+                {
+                    for (key, value) in new {
+                        if let (Some(current), Some(next)) = (
+                            existing.get_mut(key).and_then(Value::as_object_mut),
+                            value.as_object(),
+                        ) {
+                            current.extend(next.clone());
+                        } else {
+                            existing.insert(key.clone(), value.clone());
+                        }
+                    }
+                } else {
+                    rule["config"][field] = value.clone();
+                }
+            }
+        } else {
+            rules.push(json!({"providerId":id,"modelId":model,"config":update}));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn clear_projected_model_capabilities(doc: &mut Value, id: &str) {
+    if let Some(rules) = doc
+        .pointer_mut("/config/modelConfigRules/providerModelRules")
+        .and_then(Value::as_array_mut)
+    {
+        for rule in rules.iter_mut().filter(|rule| rule["providerId"] == id) {
+            let Some(config) = rule.get_mut("config").and_then(Value::as_object_mut) else {
+                continue;
+            };
+            if let Some(properties) = config.get_mut("properties").and_then(Value::as_object_mut) {
+                properties.remove("contextWindow");
+            }
+            if let Some(specs) = config.get_mut("optionSpecs").and_then(Value::as_object_mut) {
+                for (field, leaf) in [("reasoningLevel", "values"), ("maxOutputTokens", "max")] {
+                    if let Some(value) = specs.get_mut(field) {
+                        if let Some(value) = value.as_object_mut() {
+                            value.remove(leaf);
+                        }
+                        if value.is_null() || value == &json!({}) {
+                            specs.remove(field);
+                        }
+                    }
+                }
+            }
+            for field in ["properties", "optionSpecs"] {
+                if config.get(field) == Some(&json!({})) {
+                    config.remove(field);
+                }
+            }
+        }
+        rules.retain(|rule| rule["providerId"] != id || rule["config"] != json!({}));
+    }
+}
+
+fn read_model_configs(doc: &Value, id: &str, config: &mut ZCodeProviderConfig) {
+    for group in ["providerModelRules", "manualProviderModelRules"] {
+        for rule in doc["config"]["modelConfigRules"][group]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|rule| rule["providerId"] == id)
+        {
+            let Some(model) = rule["modelId"]
+                .as_str()
+                .and_then(|id| config.models.get_mut(id))
+            else {
+                continue;
+            };
+            for field in ["enabled", "properties", "optionSpecs"] {
+                if let Some(value) = rule["config"].get(field) {
+                    model.extra.insert(field.into(), value.clone());
+                }
+            }
+            let reasoning = rule["config"].pointer("/optionSpecs/reasoningLevel");
+            if reasoning == Some(&Value::Null) {
+                model.reasoning = Some(json!({"enabled":false}));
+            } else if let Some(values) = reasoning.and_then(|reasoning| reasoning.get("values")) {
+                model.reasoning = Some(json!({"enabled":true,"variants":values}));
+            }
+            if let Some(context) = rule["config"]
+                .pointer("/properties/contextWindow")
+                .and_then(Value::as_u64)
+            {
+                model.limit.get_or_insert_with(Default::default).context = Some(context);
+            }
+            if let Some(output) = rule["config"]
+                .pointer("/optionSpecs/maxOutputTokens/max")
+                .and_then(Value::as_u64)
+            {
+                model.limit.get_or_insert_with(Default::default).output = Some(output);
+            }
+        }
+    }
+    let selected = &doc["config"]["defaultModelSelection"];
+    if selected["providerId"] == id {
+        if let Some(model) = selected["modelId"]
+            .as_str()
+            .and_then(|id| config.models.get_mut(id))
+        {
+            if let Some(level) = selected.pointer("/options/reasoningLevel") {
+                model.reasoning.get_or_insert_with(|| json!({}))["defaultVariant"] = level.clone();
+            }
+        }
+    }
+}
+
 pub(crate) fn remove_provider_rule(doc: &mut Value, id: &str) {
     let Some(cfg) = doc.get_mut("config").and_then(Value::as_object_mut) else {
         return;
@@ -542,6 +866,15 @@ pub(crate) fn remove_provider_rule(doc: &mut Value, id: &str) {
         == Some(id)
     {
         cfg.remove("defaultModelSelection");
+    }
+    for group in ["providerModelRules", "manualProviderModelRules"] {
+        if let Some(rules) = cfg
+            .get_mut("modelConfigRules")
+            .and_then(|rules| rules.get_mut(group))
+            .and_then(Value::as_array_mut)
+        {
+            rules.retain(|rule| rule["providerId"] != id);
+        }
     }
 }
 
@@ -716,7 +1049,8 @@ pub fn get_providers() -> Result<Map<String, Value>, AppError> {
 
     for rule in read_provider_rules(&doc) {
         match provider_rule_to_config(&rule) {
-            Some((id, config)) => {
+            Some((id, mut config)) => {
+                read_model_configs(&doc, &id, &mut config);
                 let value = match serde_json::to_value(&config) {
                     Ok(v) => v,
                     Err(e) => {
@@ -740,6 +1074,7 @@ pub fn get_providers() -> Result<Map<String, Value>, AppError> {
 /// `config` 应为 ZCodeProviderConfig 形状；解析失败时退化为从原始 JSON 摘
 /// 最小字段（与 live.rs 的 raw fallback 对应）。
 pub fn set_provider(id: &str, config: Value) -> Result<(), AppError> {
+    let typed = serde_json::from_value::<ZCodeProviderConfig>(config.clone()).ok();
     let rule = match serde_json::from_value::<ZCodeProviderConfig>(config.clone()) {
         Ok(typed) => provider_config_to_rule(id, &typed),
         Err(e) => {
@@ -754,6 +1089,9 @@ pub fn set_provider(id: &str, config: Value) -> Result<(), AppError> {
     with_zcode_file_lock(&path, || {
         let mut doc = read_zcode_provider_config()?;
         upsert_provider_rule(&mut doc, id, rule);
+        if let Some(typed) = &typed {
+            upsert_provider_config(&mut doc, id, typed)?;
+        }
         write_zcode_provider_config_unlocked(&path, &doc)
     })
 }
@@ -789,16 +1127,19 @@ pub fn get_typed_providers() -> Result<IndexMap<String, ZCodeProviderConfig>, Ap
 
 /// 以类型化结构写入一个 provider
 pub fn set_typed_provider(id: &str, config: &ZCodeProviderConfig) -> Result<(), AppError> {
-    let rule = provider_config_to_rule(id, config);
     let path = get_zcode_provider_config_path();
     with_zcode_file_lock(&path, || {
         let mut doc = read_zcode_provider_config()?;
-        upsert_provider_rule(&mut doc, id, rule);
+        upsert_provider_config(&mut doc, id, config)?;
         write_zcode_provider_config_unlocked(&path, &doc)
     })
 }
 
-pub(crate) fn apply_default_model_selection(doc: &mut Value, id: &str) -> Result<(), AppError> {
+pub(crate) fn apply_default_model_selection(
+    doc: &mut Value,
+    id: &str,
+    provider: Option<&ZCodeProviderConfig>,
+) -> Result<(), AppError> {
     let model_id = read_provider_rules(doc)
         .into_iter()
         .find(|rule| rule.get("providerId").and_then(Value::as_str) == Some(id))
@@ -816,14 +1157,35 @@ pub(crate) fn apply_default_model_selection(doc: &mut Value, id: &str) -> Result
             ))
         })?;
 
+    let manual = doc["config"]["modelConfigRules"]["manualProviderModelRules"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|rule| rule["providerId"] == id && rule["modelId"] == model_id);
+    let requested = provider
+        .and_then(|provider| provider.models.get(&model_id))
+        .and_then(|model| model.reasoning.as_ref())
+        .filter(|reasoning| reasoning["enabled"] != false)
+        .and_then(|reasoning| reasoning.get("defaultVariant"));
+    let level = requested
+        .filter(|level| {
+            manual.is_none_or(|rule| {
+                rule["config"]
+                    .pointer("/optionSpecs/reasoningLevel/values")
+                    .and_then(Value::as_array)
+                    .is_some_and(|values| values.contains(level))
+            })
+        })
+        .cloned();
     let config = doc
         .get_mut("config")
         .and_then(Value::as_object_mut)
         .ok_or_else(|| AppError::Config("ZCode provider config root is invalid".into()))?;
-    config.insert(
-        "defaultModelSelection".to_string(),
-        json!({"providerId": id, "modelId": model_id}),
-    );
+    let mut selection = json!({"providerId":id,"modelId":model_id});
+    if let Some(level) = level {
+        selection["options"] = json!({"reasoningLevel":level});
+    }
+    config.insert("defaultModelSelection".into(), selection);
     Ok(())
 }
 
@@ -860,7 +1222,7 @@ fn write_zcode_cli_config_unlocked(path: &Path, config: &Value) -> Result<(), Ap
     }
     let json =
         serde_json::to_string_pretty(config).map_err(|e| AppError::JsonSerialize { source: e })?;
-    atomic_write_private(&path, json.as_bytes())?;
+    atomic_write_private(path, json.as_bytes())?;
 
     log::debug!("ZCode CLI config written to {path:?}");
     Ok(())
@@ -926,6 +1288,168 @@ pub fn remove_mcp_server(id: &str) -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn manual_rule(provider: &str, model: &str) -> Value {
+        json!({"providerId":provider,"modelId":model,"config":{
+            "properties":{"contextWindow":32000,"supportsJsonSchemaOutput":false,
+                "supportsNativeWebSearch":false,"supportsMidConversationSystem":true,
+                "inputFormat":{"supportsImage":false,"supportsVideo":false,"supportsPdf":false}},
+            "optionSpecs":{"reasoningLevel":{"values":["high"],"map":"{\"reasoning\":{\"effort\":reasoningLevel}}"},
+                "maxOutputTokens":{"max":8192}}
+        }})
+    }
+
+    #[test]
+    fn typed_model_metadata_roundtrips_without_overwriting_manual_options() {
+        let config: ZCodeProviderConfig = serde_json::from_value(json!({
+            "kind":"openai", "options":{"baseURL":"https://fixture.invalid/v1","apiKey":"fixture-only"},
+            "models":{
+                "model-a":{"limit":{"context":400000},"reasoning":{"enabled":true,"variants":["none","minimal","low","medium","high","xhigh","max","ultra"],"defaultVariant":"max"}},
+                "model-b":{"reasoning":{"enabled":true,"variants":["low"]}},
+                "model-c":{"reasoning":{"enabled":false}}
+            }
+        })).unwrap();
+        let manual = manual_rule("api", "model-b");
+        let foreign =
+            json!({"providerId":"foreign","modelId":"unchanged","config":{"enabled":false}});
+        let mut doc = json!({"schemaVersion":1,"config":{
+            "providerConfigRules":{"providerRules":[]},
+            "modelConfigRules":{"providerModelRules":[foreign.clone(),
+                {"providerId":"api","modelId":"model-a","config":{"properties":{"supportsToolCall":true},"optionSpecs":{"reasoningLevel":{"values":["high"],"map":"{\"custom_effort\":reasoningLevel}"}}}}
+            ],"manualProviderModelRules":[manual.clone()]}
+        }});
+        upsert_provider_config(&mut doc, "api", &config).unwrap();
+        apply_default_model_selection(&mut doc, "api", Some(&config)).unwrap();
+        let stable = doc.clone();
+        upsert_provider_config(&mut doc, "api", &config).unwrap();
+        assert_eq!(doc, stable);
+        assert_eq!(
+            doc["config"]["defaultModelSelection"],
+            json!({"providerId":"api","modelId":"model-a","options":{"reasoningLevel":"max"}})
+        );
+        let rules = doc["config"]["modelConfigRules"]["providerModelRules"]
+            .as_array()
+            .unwrap();
+        assert_eq!(rules[0], foreign);
+        let model = rules
+            .iter()
+            .find(|rule| rule["modelId"] == "model-a")
+            .unwrap();
+        assert_eq!(
+            model["config"]["optionSpecs"]["reasoningLevel"]["map"],
+            "{\"custom_effort\":reasoningLevel}"
+        );
+        assert_eq!(model["config"]["properties"]["supportsToolCall"], true);
+        assert_eq!(
+            doc["config"]["modelConfigRules"]["manualProviderModelRules"][0],
+            manual
+        );
+        assert!(!rules
+            .iter()
+            .any(|rule| rule["providerId"] == "api" && rule["modelId"] == "model-b"));
+        let mut restored = provider_rule_to_config(&provider_config_to_rule("api", &config))
+            .unwrap()
+            .1;
+        read_model_configs(&doc, "api", &mut restored);
+        assert_eq!(
+            restored.models["model-a"].reasoning,
+            config.models["model-a"].reasoning
+        );
+        assert_eq!(
+            restored.models["model-a"].limit.as_ref().unwrap().context,
+            Some(400000)
+        );
+        assert_eq!(
+            restored.models["model-b"].reasoning.as_ref().unwrap()["variants"],
+            json!(["high"])
+        );
+        assert_eq!(
+            restored.models["model-c"].reasoning.as_ref().unwrap()["enabled"],
+            false
+        );
+        let mut conflict = config.clone();
+        conflict.models.move_index(1, 0);
+        conflict.models["model-b"].reasoning =
+            Some(json!({"enabled":true,"variants":["max"],"defaultVariant":"max"}));
+        upsert_provider_config(&mut doc, "api", &conflict).unwrap();
+        apply_default_model_selection(&mut doc, "api", Some(&conflict)).unwrap();
+        assert_eq!(
+            doc["config"]["defaultModelSelection"],
+            json!({"providerId":"api","modelId":"model-b"})
+        );
+        assert_eq!(
+            doc["config"]["modelConfigRules"]["manualProviderModelRules"][0],
+            manual
+        );
+        remove_provider_rule(&mut doc, "api");
+        assert_eq!(
+            doc["config"]["modelConfigRules"]["providerModelRules"],
+            json!([foreign])
+        );
+        assert_eq!(
+            doc["config"]["modelConfigRules"]["manualProviderModelRules"],
+            json!([])
+        );
+    }
+
+    #[test]
+    fn invalid_model_efforts_do_not_mutate_the_native_document() {
+        let config: ZCodeProviderConfig = serde_json::from_value(json!({
+            "kind":"openai", "models":{"model-a":{"reasoning":{"enabled":true,"variants":["low","low"]}}}
+        })).unwrap();
+        let mut doc = json!({"schemaVersion":1,"config":{"providerConfigRules":{"providerRules":[]},"modelConfigRules":{"providerModelRules":[],"manualProviderModelRules":[]}}});
+        let before = doc.clone();
+        assert!(upsert_provider_config(&mut doc, "api", &config).is_err());
+        assert_eq!(doc, before);
+    }
+
+    #[test]
+    fn route_source_change_clears_only_projected_capabilities() {
+        let manual = manual_rule("route", "manual-model");
+        let foreign = json!({"providerId":"foreign","modelId":"unchanged","config":{"properties":{"contextWindow":1}}});
+        let mut doc = json!({"schemaVersion":1,"config":{
+            "modelConfigRules":{"providerModelRules":[foreign.clone(),
+                {"providerId":"route","modelId":"shared-model","config":{
+                    "properties":{"contextWindow":400000,"supportsToolCall":true},
+                    "optionSpecs":{"reasoningLevel":{"values":["max"],"map":"{\"custom\":reasoningLevel}"},
+                        "maxOutputTokens":{"max":20000,"map":"{\"limit\":maxOutputTokens}"}}}}
+            ],"manualProviderModelRules":[manual.clone()]}
+        }});
+        clear_projected_model_capabilities(&mut doc, "route");
+        let rules = doc["config"]["modelConfigRules"]["providerModelRules"]
+            .as_array()
+            .unwrap();
+        assert_eq!(rules[0], foreign);
+        let config = &rules[1]["config"];
+        assert!(config["properties"].get("contextWindow").is_none());
+        assert_eq!(config["properties"]["supportsToolCall"], true);
+        assert!(config["optionSpecs"]["reasoningLevel"]
+            .get("values")
+            .is_none());
+        assert_eq!(
+            config["optionSpecs"]["reasoningLevel"]["map"],
+            "{\"custom\":reasoningLevel}"
+        );
+        assert!(config["optionSpecs"]["maxOutputTokens"]
+            .get("max")
+            .is_none());
+        assert_eq!(
+            doc["config"]["modelConfigRules"]["manualProviderModelRules"][0],
+            manual
+        );
+        let mut empty = json!({});
+        clear_projected_model_capabilities(&mut empty, "route");
+        assert_eq!(empty, json!({}));
+        for config in [json!("invalid"), json!([]), Value::Null] {
+            let mut doc = json!({"config":{"modelConfigRules":{"providerModelRules":[
+                {"providerId":"route","modelId":"model","config":config},
+                {"providerId":"route","modelId":"missing-config"}
+            ]}}});
+            let before = doc.clone();
+            clear_projected_model_capabilities(&mut doc, "route");
+            assert_eq!(doc, before);
+        }
+    }
 
     #[test]
     fn official_connections_are_detected_without_reading_or_copying_credentials() {
@@ -1171,7 +1695,7 @@ mod tests {
             }
         });
 
-        apply_default_model_selection(&mut doc, "custom").unwrap();
+        apply_default_model_selection(&mut doc, "custom", None).unwrap();
 
         assert_eq!(
             doc["config"]["defaultModelSelection"],
@@ -1190,7 +1714,7 @@ mod tests {
             }
         });
 
-        let error = apply_default_model_selection(&mut doc, "empty").unwrap_err();
+        let error = apply_default_model_selection(&mut doc, "empty", None).unwrap_err();
         assert!(error.to_string().contains("no selectable model"));
     }
 

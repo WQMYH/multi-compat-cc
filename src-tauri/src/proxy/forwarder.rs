@@ -1393,7 +1393,7 @@ impl RequestForwarder {
                 crate::services::provider::dsh_direct::validate(provider)
                     .map_err(|e| ProxyError::ConfigError(e.to_string()))?;
             } else {
-                crate::native_provider_config::native_config(provider)
+                crate::services::provider::zcode_direct::validate(provider)
                     .map_err(|e| ProxyError::ConfigError(e.to_string()))?;
             }
             provider
@@ -2106,6 +2106,10 @@ impl RequestForwarder {
                 }
             }
         }
+        super::providers::transform_responses::normalize_codex_oauth_responses_request(
+            &mut filtered_body,
+            *app_type == AppType::ZCode && managed_native_account.is_some(),
+        )?;
         // 出站 body 定稿后刷新真值（覆盖 Codex chat 上游模型覆写、转换层模型改写）
         if let Some(m) = filtered_body
             .get("model")

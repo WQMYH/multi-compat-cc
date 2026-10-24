@@ -519,8 +519,15 @@ async fn write_proxy(
         }
         AppType::ZCode => {
             let base = format!("{}/zcode/v1", proxy_url.trim_end_matches('/'));
-            let projection =
-                zcode_direct::route_config(route, &base, PROXY_TOKEN_PLACEHOLDER).map_err(err)?;
+            let projection = zcode_direct::route_projection(
+                &state.db,
+                &state.codex_oauth_manager,
+                route,
+                &base,
+                PROXY_TOKEN_PLACEHOLDER,
+            )
+            .await
+            .map_err(err)?;
             let contract = contract::zcode(&projection);
             let unchanged = !force && live_now.has_contract(&contract.key);
             target.contract = Some(contract);
@@ -2721,6 +2728,207 @@ mod mode_tests {
 
     #[tokio::test]
     #[serial]
+    async fn zcode_native_official_switch_and_route_exit_use_common_provider_service() {
+        let _home = Home::new();
+        let api = Provider::with_id(
+            "api".into(),
+            "API fixture".into(),
+            json!({"kind":"openai","options":{"baseURL":"https://fixture.invalid/v1","apiKey":"fixture-only"},
+                "models":{"api-model":{}}}),
+            None,
+        );
+        let state = state_with(AppType::ZCode, &[api], "api").await;
+        let path = crate::zcode_config::get_zcode_provider_config_path();
+        let root = path.parent().unwrap();
+        fs::create_dir_all(root).unwrap();
+        let settings = br#"{"providerFamilyDomain":"bigmodel","providerFamilyConnectionSelections":{"bigmodel":{"kind":"individual-coding-plan"}}}"#;
+        fs::write(root.join("setting.json"), settings).unwrap();
+        fs::write(
+            root.join("credentials.json"),
+            b"invalid JSON: must not be read",
+        )
+        .unwrap();
+        let official_id = "account:bigmodel-individual-coding-plan";
+        ProviderService::switch(&state, AppType::ZCode, "api").unwrap();
+        let before = fs::read(&path).unwrap();
+        let original_rules = crate::zcode_config::read_zcode_provider_config().unwrap()["config"]
+            ["providerConfigRules"]
+            .clone();
+        assert!(ProviderService::list(&state, AppType::ZCode)
+            .unwrap()
+            .contains_key(official_id));
+        // A missing catalog must leave no staged reference or changed pointer behind.
+        assert!(ProviderService::switch(&state, AppType::ZCode, official_id)
+            .unwrap_err()
+            .to_string()
+            .contains("catalog"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(in_use(&state, &AppType::ZCode).as_deref(), Some("api"));
+        assert!(state
+            .db
+            .get_provider_by_id(official_id, "zcode")
+            .unwrap()
+            .is_none());
+        assert!(!crate::mode::operation::has_pending("zcode"));
+
+        let catalog_dir = root.join("runtime/provider/windows-x86_64/3.14.5/endpoint-fixture");
+        fs::create_dir_all(&catalog_dir).unwrap();
+        fs::write(catalog_dir.join("zcode-builtin.json"), serde_json::to_vec(&json!({"config":{
+            "providerConfigRules":{"providerRules":[{"providerId":official_id,"config":{"builtinModelIds":["native-first","native-second"]}}]}
+        }})).unwrap()).unwrap();
+        fs::create_dir_all(root.join("runtime/provider/windows-x86_64/3.9.9/endpoint-old"))
+            .unwrap();
+        ProviderService::switch(&state, AppType::ZCode, official_id).unwrap();
+        assert_eq!(
+            in_use(&state, &AppType::ZCode).as_deref(),
+            Some(official_id)
+        );
+        let live = crate::zcode_config::read_zcode_provider_config().unwrap();
+        assert_eq!(
+            live["config"]["defaultModelSelection"],
+            json!({"providerId":official_id,"modelId":"native-first"})
+        );
+        assert_eq!(live["config"]["providerConfigRules"], original_rules);
+        assert_eq!(
+            state
+                .db
+                .get_provider_by_id(official_id, "zcode")
+                .unwrap()
+                .unwrap()
+                .meta
+                .unwrap()
+                .live_config_managed,
+            Some(false)
+        );
+
+        // Observe a model picked in ZCode, not the stale CC pointer or the first catalog item.
+        let selected =
+            json!({"providerId":official_id,"modelId":"native-second","reasoningEffort":"high"});
+        let mut live = live;
+        live["config"]["defaultModelSelection"] = selected.clone();
+        fs::write(&path, serde_json::to_vec(&live).unwrap()).unwrap();
+        state.db.delete_provider("zcode", official_id).unwrap();
+        assert_eq!(
+            direct(&state, &AppType::ZCode).as_deref(),
+            Some(official_id)
+        );
+        enter_with_route(&state, &AppType::ZCode, false, Some("api"))
+            .await
+            .unwrap();
+        assert_eq!(in_use(&state, &AppType::ZCode).as_deref(), Some("api"));
+        assert_eq!(
+            direct(&state, &AppType::ZCode).as_deref(),
+            Some(official_id)
+        );
+        exit(&state, &AppType::ZCode).await.unwrap();
+        let live = crate::zcode_config::read_zcode_provider_config().unwrap();
+        assert_eq!(live["config"]["defaultModelSelection"], selected);
+        assert_eq!(live["config"]["providerConfigRules"], original_rules);
+        assert_eq!(
+            in_use(&state, &AppType::ZCode).as_deref(),
+            Some(official_id)
+        );
+        ProviderService::switch(&state, AppType::ZCode, "api").unwrap();
+        assert_eq!(in_use(&state, &AppType::ZCode).as_deref(), Some("api"));
+        // Native implicit defaults also survive a route round-trip without becoming explicit.
+        let mut live = crate::zcode_config::read_zcode_provider_config().unwrap();
+        live["config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("defaultModelSelection");
+        fs::write(&path, serde_json::to_vec(&live).unwrap()).unwrap();
+        assert_eq!(in_use(&state, &AppType::ZCode), None);
+        enter_with_route(&state, &AppType::ZCode, false, Some("api"))
+            .await
+            .unwrap();
+        exit(&state, &AppType::ZCode).await.unwrap();
+        assert!(
+            crate::zcode_config::read_zcode_provider_config().unwrap()["config"]
+                .get("defaultModelSelection")
+                .is_none()
+        );
+        assert_eq!(fs::read(root.join("setting.json")).unwrap(), settings);
+        assert_eq!(
+            fs::read(root.join("credentials.json")).unwrap(),
+            b"invalid JSON: must not be read"
+        );
+        assert!(!state.proxy_service.is_running().await);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn zcode_failed_catalog_fetch_rejects_stale_provider_without_native_write() {
+        let _home = Home::new();
+        let mut original = Provider::with_id(
+            "managed-stale".into(),
+            "Fixture".into(),
+            json!({"auth":{},"config":"model = \"model-a\"\n"}),
+            None,
+        );
+        original.meta = Some(serde_json::from_value(json!({"providerType":"codex_oauth",
+            "authBinding":{"source":"managed_account","authProvider":"codex_oauth","accountId":"missing-fixture-account"}})).unwrap());
+        let state = state_with(AppType::ZCode, &[original.clone()], "managed-stale").await;
+        let mut changed = original.clone();
+        changed.settings_config["config"] = json!("model = \"changed-model\"\n");
+        state.db.save_provider("zcode", &changed).unwrap();
+        let result = zcode_direct::route_projection(
+            &state.db,
+            &state.codex_oauth_manager,
+            &original,
+            "http://127.0.0.1:12345/zcode/v1",
+            PROXY_TOKEN_PLACEHOLDER,
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("provider changed"));
+        assert!(!crate::zcode_config::get_zcode_provider_config_path().exists());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn zcode_route_source_change_does_not_inherit_previous_model_capabilities() {
+        let _home = Home::new();
+        let known = Provider::with_id(
+            "known-source".into(),
+            "Known".into(),
+            json!({
+                "auth":{"OPENAI_API_KEY":"fixture-only"},
+                "config":"model = \"shared-model\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://fixture.invalid/v1\"\nwire_api = \"responses\"",
+                "modelCatalog":{"models":[{"model":"shared-model","contextWindow":400000,"reasoningLevels":["max"]}]}
+            }),
+            None,
+        );
+        let mut unknown = known.clone();
+        unknown.id = "unknown-source".into();
+        unknown
+            .settings_config
+            .as_object_mut()
+            .unwrap()
+            .remove("modelCatalog");
+        let state = state_with(AppType::ZCode, &[known.clone(), unknown], "known-source").await;
+        ProviderService::switch(&state, AppType::ZCode, "known-source").unwrap();
+        enter_with_route(&state, &AppType::ZCode, false, Some("known-source"))
+            .await
+            .unwrap();
+        enter_with_route(&state, &AppType::ZCode, false, Some("unknown-source"))
+            .await
+            .unwrap();
+        let live = crate::zcode_config::read_zcode_provider_config().unwrap();
+        assert!(!live["config"]["modelConfigRules"]["providerModelRules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|rule| rule["providerId"] == zcode_direct::ROUTE_ID
+                && (rule["config"]
+                    .pointer("/optionSpecs/reasoningLevel/values")
+                    .is_some()
+                    || rule["config"]
+                        .pointer("/properties/contextWindow")
+                        .is_some())));
+        exit(&state, &AppType::ZCode).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn zcode_account_routing_uses_shared_modes_and_restores_direct_provider() {
         let _home = Home::new();
         let api = Provider::with_id(
@@ -2870,7 +3078,7 @@ mod mode_tests {
         let status = state.proxy_service.get_status().await.unwrap();
         let response = reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(5)).build().unwrap()
             .post(format!("http://127.0.0.1:{}/zcode/v1/responses", status.port))
-            .json(&json!({"model":"model-b", "input":[{"role":"user","content":"synthetic-only"}], "stream":false}))
+            .json(&json!({"model":"model-b", "input":[{"role":"user","content":"synthetic-only"}], "stream":false, "store":true}))
             .send().await.unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert_eq!(
@@ -2884,6 +3092,11 @@ mod mode_tests {
             .expect("the shared route reached the synthetic upstream");
         assert_eq!(headers["authorization"], "Bearer fixture-only");
         assert_eq!(body["model"], "model-b");
+        assert_eq!(
+            body["store"], true,
+            "ordinary API storage policy must not change"
+        );
+        assert_eq!(body["stream"], false);
         assert!(body.get("input").is_some());
         assert!(body.get("messages").is_none());
         exit(&state, &AppType::ZCode).await.unwrap();

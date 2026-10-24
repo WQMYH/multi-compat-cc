@@ -1199,38 +1199,10 @@ fn scan_zcode_runtime_version() -> Option<String> {
         .join("runtime")
         .join("provider");
 
-    let mut best: Option<((u64, u64, u64), String)> = None;
-    // 单个平台/版本目录读失败只跳过该项，不能让整个扫描短路
-    for platform in std::fs::read_dir(&root).ok()?.flatten() {
-        let Ok(versions) = std::fs::read_dir(platform.path()) else {
-            continue;
-        };
-        for entry in versions.flatten() {
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if !file_type.is_dir() {
-                continue;
-            }
-            let Some(parsed) = parse_version_triple(&entry.file_name().to_string_lossy()) else {
-                continue;
-            };
-            if best.as_ref().is_none_or(|(best_v, _)| parsed > *best_v) {
-                best = Some((parsed, entry.file_name().to_string_lossy().into_owned()));
-            }
-        }
-    }
-    best.map(|(_, version)| version)
-}
-
-/// 解析 "3.14.5" 或 "3.14.5-xxx" 形态的前三段数字版本；不匹配返回 None。
-fn parse_version_triple(name: &str) -> Option<(u64, u64, u64)> {
-    let core = name.split(['-', '+', ' ']).next()?;
-    let mut parts = core.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let patch = parts.next()?.parse().ok()?;
-    Some((major, minor, patch))
+    crate::zcode_config::latest_runtime_dir(&root).and_then(|path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    })
 }
 
 fn probe_local_version(

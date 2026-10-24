@@ -80,24 +80,45 @@ const button = (sections: ProviderSection[], id: string, key: string) => {
   return found;
 };
 
-it("shows ZCode's native account configuration without claiming an active CC route", () => {
+it("lets ZCode's native account use the common selection and in-use flow", () => {
   const native = provider("account:bigmodel-individual-coding-plan", {
     category: "official",
     settingsConfig: { nativeManaged: true },
   });
+  const { sections, input } = build({
+    app: "zcode",
+    active: "direct",
+    view: "direct",
+    providers: [native, relay],
+    directId: relay.id,
+  });
+  button(sections, native.id, "switch").onClick();
+  expect(input.actions.switchDirect).toHaveBeenCalledWith(native);
+  expect(item(sections, relay.id).status?.label).toBe(
+    "providerCard.status.inUse",
+  );
+  const selected = buildSwitchSections({ ...input, directId: native.id });
+  expect(item(selected, native.id).status?.label).toBe(
+    "providerCard.status.inUse",
+  );
+  expect(item(selected, native.id).tone).toBe("direct");
+  expect(item(selected, relay.id).status).toBeUndefined();
+  button(selected, relay.id, "switch");
   for (const view of ["direct", "route"] as const) {
-    const { sections } = build({
+    const { sections: routed, input: routedInput } = build({
       app: "zcode",
       active: "route",
       view,
       providers: [native, relay],
-      directId: null,
+      directId: native.id,
       routeId: relay.id,
     });
-    const card = item(sections, native.id);
-    expect(card.status?.label).toBe("provider.inConfig");
-    expect(card.status?.dot).toBe("muted");
-    expect(card.buttons).toEqual([]);
+    const card = item(routed, native.id);
+    expect(card.status?.label).not.toBe("providerCard.status.inUse");
+    if (view === "direct") {
+      button(routed, native.id, "exitAndUse").onClick();
+      expect(routedInput.actions.exitAndUse).toHaveBeenCalledWith(native);
+    }
     expect(card.chips.some((chip) => chip.key === "official")).toBe(true);
     expect(card.editDisabledReason).toBe("provider.nativeAccountManaged");
     expect(card.deleteDisabledReason).toBe("provider.nativeAccountManaged");

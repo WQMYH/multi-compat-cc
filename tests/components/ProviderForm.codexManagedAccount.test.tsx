@@ -1,11 +1,14 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClientProvider } from "@tanstack/react-query";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { AddProviderDialog } from "@/components/providers/AddProviderDialog";
 import {
   ProviderForm,
   type ProviderFormValues,
 } from "@/components/providers/forms/ProviderForm";
 import { createTestQueryClient } from "../utils/testQueryClient";
+import { providersApi } from "@/lib/api";
+import { useAddProviderMutation } from "@/lib/query/mutations";
 
 const authState = vi.hoisted(() => ({
   codexReauthRequired: false,
@@ -162,6 +165,60 @@ describe("ProviderForm Codex Official managed account", () => {
   beforeEach(() => {
     authState.codexReauthRequired = false;
     toastMocks.error.mockReset();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("saves a managed account through the actual ZCode add dialog", async () => {
+    const add = vi.spyOn(providersApi, "add").mockResolvedValue(true);
+    function AddZcodeProvider() {
+      const mutation = useAddProviderMutation("zcode");
+      return (
+        <AddProviderDialog
+          open
+          appId="zcode"
+          onOpenChange={vi.fn()}
+          onSubmit={async (provider) => {
+            await mutation.mutateAsync(provider);
+          }}
+        />
+      );
+    }
+    render(
+      <QueryClientProvider client={createTestQueryClient()}>
+        <AddZcodeProvider />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /OpenAI Official/ }));
+    fireEvent.change(screen.getByRole("textbox", { name: "默认模型" }), {
+      target: { value: "gpt-6.1-sol" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "select-managed-account" }));
+    fireEvent.click(screen.getByRole("button", { name: "common.add" }));
+
+    await waitFor(() => expect(add).toHaveBeenCalledOnce());
+    expect(add).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: expect.stringMatching(/^[0-9a-f-]{36}$/),
+        settingsConfig: {
+          auth: {},
+          config: expect.stringContaining('model = "gpt-6.1-sol"'),
+        },
+        meta: expect.objectContaining({
+          authBinding: {
+            source: "managed_account",
+            authProvider: "codex_oauth",
+            accountId: "acct-managed",
+          },
+        }),
+      }),
+      "zcode",
+      undefined,
+      undefined,
+    );
+    expect(toastMocks.error).not.toHaveBeenCalled();
   });
 
   it.each(["dsh", "zcode"] as const)("reuses the existing managed account chooser for %s without another login", async (appId) => {
