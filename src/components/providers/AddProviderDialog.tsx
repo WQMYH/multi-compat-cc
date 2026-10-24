@@ -35,7 +35,7 @@ import { extractGrokBuildBaseUrl } from "@/utils/grokBuildConfig";
 import { GROKBUILD_OFFICIAL_PROVIDER_ID } from "@/utils/providerCapabilities";
 import type { OpenClawSuggestedDefaults } from "@/config/openclawProviderPresets";
 import type { UniversalProviderPreset } from "@/config/universalProviderPresets";
-import type { ManagedAuthProvider } from "@/lib/api";
+import type { AuthCenterTarget } from "@/lib/api";
 import type { AppMode } from "@/types/proxy";
 
 interface AddProviderDialogProps {
@@ -71,6 +71,7 @@ export function AddProviderDialog({
     appId !== "pi" &&
     appId !== "mcode" &&
     appId !== "zcode" &&
+    appId !== "kimi" &&
     appId !== "grokbuild" &&
     appId !== "claude-desktop";
   // 两步：先选预设，再填写（每次打开都从第 1 步开始）
@@ -88,7 +89,13 @@ export function AddProviderDialog({
     };
   }, []);
   const stepState = useMemo<PresetStepState>(
-    () => ({ appId: appId === "dsh" ? "codex" : appId, step, setStep, host: pickerHost, registerSelector }),
+    () => ({
+      appId: appId === "dsh" ? "codex" : appId,
+      step,
+      setStep,
+      host: pickerHost,
+      registerSelector,
+    }),
     [appId, step, pickerHost, registerSelector],
   );
   const [universalFormOpen, setUniversalFormOpen] = useState(false);
@@ -97,11 +104,13 @@ export function AddProviderDialog({
   const [isFormSubmitting, setIsFormSubmitting] = useState(false);
   // 表单用了聚合的简化布局：页头应用名后标「聚合模式」
   const [stackLayout, setStackLayout] = useState(false);
+  const [accountLogin, setAccountLogin] = useState(false);
   const [authSettingsTarget, setAuthSettingsTarget] =
-    useState<ManagedAuthProvider | null>(null);
+    useState<AuthCenterTarget | null>(null);
 
   useEffect(() => {
     setAuthSettingsTarget(null);
+    setAccountLogin(false);
   }, [appId, open]);
 
   // Claude：预设的关键字段套在当前 live 上显示（去掉当前供应商的关键字段），保存时
@@ -292,7 +301,8 @@ export function AddProviderDialog({
           appId === "hermes" ||
           appId === "pi" ||
           appId === "mcode" ||
-          appId === "zcode") &&
+          appId === "zcode" ||
+          appId === "kimi") &&
         values.providerKey
       ) {
         providerData.providerKey = values.providerKey;
@@ -481,7 +491,7 @@ export function AddProviderDialog({
   }, [open, waitingForClaudeBase, appId]);
 
   const footer =
-    step === "form" ? (
+    step === "form" && !accountLogin ? (
       <>
         <Button
           type="button"
@@ -515,6 +525,7 @@ export function AddProviderDialog({
       onManageAuthAccounts={setAuthSettingsTarget}
       onSubmittingChange={setIsFormSubmitting}
       onSubmitReadyChange={handleSubmitReadyChange}
+      onAccountLoginChange={setAccountLogin}
       showButtons={false}
       claudeLiveBase={
         appId === "claude" ? (claudeLiveBase ?? undefined) : undefined
@@ -537,7 +548,7 @@ export function AddProviderDialog({
   return (
     <FullScreenPanel
       isOpen={open}
-      trackUnsavedChanges={step === "form"}
+      trackUnsavedChanges={step === "form" && !accountLogin}
       title={t("provider.addNewProvider")}
       subtitle={
         stackLayout

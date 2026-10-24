@@ -170,9 +170,9 @@ pub struct ToolVersion {
     update_blocked_by_node: Option<tool_node_requirement::NodeRequirementGap>,
 }
 
-const VALID_TOOLS: [&str; 12] = [
+const VALID_TOOLS: [&str; 13] = [
     "claude", "codex", "gemini", "grok", "opencode", "openclaw", "hermes", "pi", "mcode", "dsh",
-    "agy", "zcode",
+    "kimi", "agy", "zcode",
 ];
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -628,6 +628,7 @@ fn tool_display_name(tool: &str) -> &'static str {
         "pi" => "Pi",
         "mcode" => "MiniMax Code",
         "dsh" => "DSH",
+        "kimi" => "Kimi Code",
         "agy" => "Antigravity CLI",
         "zcode" => "ZCode",
         _ => "Unknown",
@@ -666,6 +667,12 @@ const HERMES_INSTALL_UNIX: &str =
     "bash -c 'tmp=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh -o $tmp && bash $tmp; status=$?; rm -f $tmp; exit $status'";
 const HERMES_UPDATE_UNIX: &str =
     "hermes update || bash -c 'tmp=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh -o $tmp && bash $tmp; status=$?; rm -f $tmp; exit $status'";
+
+// The npm distribution needs Node >=22.19. The native installer bundles its runtime.
+const KIMI_INSTALL_UNIX: &str =
+    "bash -c 'tmp=$(mktemp) && curl -fsSL https://code.kimi.com/kimi-code/install.sh -o $tmp && bash $tmp; status=$?; rm -f $tmp; exit $status'";
+#[cfg(target_os = "windows")]
+const KIMI_INSTALL_WINDOWS_SCRIPT: &str = "irm https://code.kimi.com/kimi-code/install.ps1 | iex";
 
 /// Antigravity CLI 官方 installer：把原生二进制放进 `~/.local/bin`，再跑 `agy install`
 /// 把该目录加进 shell 配置。目标处已有 `agy` 时它只提示已安装、exit 0，所以只用于新装；
@@ -726,6 +733,14 @@ fn mcode_install_windows_command() -> String {
     format!(
         "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand {}",
         powershell_encoded_command(MCODE_INSTALL_WINDOWS_SCRIPT)
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn kimi_install_windows_command() -> String {
+    format!(
+        "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {}",
+        powershell_encoded_command(KIMI_INSTALL_WINDOWS_SCRIPT)
     )
 }
 
@@ -882,6 +897,7 @@ fn npm_install_command_for(tool: &str) -> Option<&'static str> {
         "openclaw" => Some("npm i -g openclaw@latest"),
         "pi" => Some("npm i -g @earendil-works/pi-coding-agent@latest"),
         "dsh" => Some("npm i -g @deepseek-ai/dsh@latest"),
+        "kimi" => Some("npm i -g @moonshot-ai/kimi-code@latest"),
         "mcode" => Some(
             "npm i -g @minimax-ai/code@latest --ignore-scripts=false --include=optional \"--allow-scripts=@minimax-ai/code,better-sqlite3\"",
         ),
@@ -919,6 +935,7 @@ fn official_update_args(tool: &str) -> Option<&'static str> {
         "claude" | "codex" | "grok" | "hermes" | "agy" => Some("update"),
         "openclaw" => Some("update --yes"),
         "opencode" => Some("upgrade"),
+        "kimi" => Some("upgrade --yes"),
         _ => None,
     }
 }
@@ -948,6 +965,21 @@ fn tool_action_shell_command_for_shell(
     action: ToolLifecycleAction,
     shell: LifecycleCommandShell,
 ) -> Option<String> {
+    if tool == "kimi" {
+        let install = match shell {
+            LifecycleCommandShell::Posix => KIMI_INSTALL_UNIX.to_string(),
+            #[cfg(target_os = "windows")]
+            LifecycleCommandShell::WindowsBatch => kimi_install_windows_command(),
+            #[cfg(not(target_os = "windows"))]
+            LifecycleCommandShell::WindowsBatch => return None,
+        };
+        return Some(match action {
+            ToolLifecycleAction::Install => install,
+            ToolLifecycleAction::Update => {
+                chain_update_commands("kimi upgrade --yes".into(), install, shell)
+            }
+        });
+    }
     // xAI's and MiniMax's primary Windows distribution is the official PowerShell
     // installer. Keep npm as the network/policy fallback, matching the POSIX installer chain.
     #[cfg(target_os = "windows")]
@@ -1280,6 +1312,9 @@ async fn get_single_tool_version_impl(
     let (local_version, local_error, installed_but_broken) = match probe {
         ShellProbe::Found(v) => (Some(v), None, false),
         ShellProbe::FoundButFailed(e) => (None, Some(e), true),
+        // 纯粹没装不带 error：版本列已显示「未安装」，再显示一行英文原因是重复的。
+        // WSL 的 shell 参数非法、执行失败等其它原因仍照常上报。
+        ShellProbe::NotFound(e) if e.ends_with(NOT_INSTALLED) => (None, None, false),
         ShellProbe::NotFound(e) => (None, Some(e), false),
     };
 
@@ -1309,6 +1344,7 @@ async fn get_single_tool_version_impl(
         }
         "mcode" => fetch_npm_latest_for_tool(&client, "@minimax-ai/code", tool, local).await,
         "dsh" => fetch_npm_latest_for_tool(&client, "@deepseek-ai/dsh", tool, local).await,
+        "kimi" => fetch_npm_latest_for_tool(&client, "@moonshot-ai/kimi-code", tool, local).await,
         "agy" => fetch_agy_latest_version(&client).await,
         _ => None,
     };
@@ -1733,7 +1769,7 @@ enum ShellProbe {
 /// 只执行已定位到的真实可执行文件。
 #[cfg(not(target_os = "windows"))]
 fn try_get_version(tool: &str) -> ShellProbe {
-    use std::process::Command;
+    use std::process::{Command, Stdio};
 
     let output = {
         let shell = std::env::var("SHELL")
@@ -1741,10 +1777,21 @@ fn try_get_version(tool: &str) -> ShellProbe {
             .filter(|s| is_valid_shell(s))
             .unwrap_or_else(|| "sh".to_string());
         let flag = default_flag_for_shell(&shell);
-        Command::new(shell)
-            .arg(flag)
+        let mut cmd = Command::new(shell);
+        cmd.arg(flag)
             .arg(format!("{tool} --version"))
-            .output()
+            // 与 `resolve_path_default` 相同：交互式 shell（-lic）不能读到继承来的
+            // stdin，也不能因持有控制终端被 SIGTTIN 停住（从终端启动时整个应用卡死）。
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        isolate_child_process_group(&mut cmd);
+        cmd.spawn().map_err(|e| e.to_string()).and_then(|child| {
+            wait_child_output(
+                child,
+                CommandDeadline::from_timeout(Some(INSTALL_PROBE_TIMEOUT)),
+            )
+        })
     };
 
     match output {
@@ -2503,6 +2550,13 @@ pub(super) fn build_tool_search_paths(tool: &str) -> Vec<std::path::PathBuf> {
     // 常见的安装路径（原生安装优先）
     // Preserve search priority without scanning all previous paths for every insertion.
     let mut search_paths = IndexSet::new();
+    if tool == "kimi" {
+        let install_dir = std::env::var_os("KIMI_INSTALL_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".kimi-code"));
+        push_unique_path(&mut search_paths, install_dir.join("bin"));
+    }
     if tool == "grok" {
         let extra_paths = grok_extra_search_paths(&home, std::env::var_os("GROK_BIN_DIR"));
         for path in extra_paths {
@@ -3305,6 +3359,7 @@ fn npm_package_for(tool: &str) -> Option<&'static str> {
         "pi" => Some("@earendil-works/pi-coding-agent"),
         "mcode" => Some("@minimax-ai/code"),
         "dsh" => Some("@deepseek-ai/dsh"),
+        "kimi" => Some("@moonshot-ai/kimi-code"),
         _ => None,
     }
 }
@@ -3679,7 +3734,7 @@ fn grok_native_update_command(update: String) -> String {
 fn prefers_official_update(tool: &str, shell: LifecycleCommandShell) -> bool {
     match shell {
         LifecycleCommandShell::Posix => {
-            matches!(tool, "claude" | "opencode" | "openclaw")
+            matches!(tool, "claude" | "opencode" | "openclaw" | "kimi")
         }
         LifecycleCommandShell::WindowsBatch => {
             matches!(
@@ -3688,7 +3743,7 @@ fn prefers_official_update(tool: &str, shell: LifecycleCommandShell) -> bool {
                 // 安装方式探测失败弹交互 prompt（spawn npm.cmd 没传 shell:true）；静默
                 // lifecycle 没有 stdin 会挂死，Windows 先锚到包管理器路径，等上游修了
                 // 再把 opencode 加回这里。
-                "claude" | "openclaw"
+                "claude" | "openclaw" | "kimi"
             )
         }
     }
@@ -4611,6 +4666,7 @@ fn posix_install_command_for(tool: &str) -> String {
         "opencode" => installer_with_npm_fallback(OPENCODE_INSTALL_UNIX, tool),
         "mcode" => installer_with_npm_fallback(MCODE_INSTALL_UNIX, tool),
         "hermes" => HERMES_INSTALL_UNIX.to_string(),
+        "kimi" => KIMI_INSTALL_UNIX.to_string(),
         "agy" => AGY_INSTALL_UNIX.to_string(),
         _ => static_fallback_command_for(tool, ToolLifecycleAction::Install),
     }
@@ -4745,6 +4801,36 @@ fn wsl_distro_for_tool(tool: &str) -> Option<String> {
     }?;
 
     wsl_distro_from_path(&override_dir)
+}
+
+/// `hermes dashboard` 的启动命令行（交给 `launch_terminal_running`）。
+///
+/// Windows 上 Hermes 配置目录指向 WSL（UNC 路径）时，要进对应发行版里启动，
+/// 否则跑起来的是 Windows 本机的 hermes（或报找不到命令），#8689。
+/// Web UI 探测的 `127.0.0.1` 端口由 WSL2 的 localhost 转发到发行版里，不用改。
+pub(crate) fn hermes_dashboard_command_line() -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(distro) = wsl_distro_for_tool("hermes") {
+            return wsl_hermes_dashboard_line(&distro);
+        }
+    }
+    Ok("hermes dashboard".to_string())
+}
+
+/// 用发行版里用户自己的登录交互 shell（`$SHELL -lic`）跑，PATH 才带得上
+/// `~/.local/bin` 这类在 `.bashrc` / `.profile` 里加的目录。只用一个 flag、
+/// 不像版本探测那样失败后换 flag 重试：dashboard 被 Ctrl+C 结束也是非零退出，
+/// 重试会把它再拉起来。
+#[cfg(target_os = "windows")]
+fn wsl_hermes_dashboard_line(distro: &str) -> Result<String, String> {
+    if !is_valid_wsl_distro_name(distro) {
+        return Err(format!("Invalid WSL distro name: {distro}"));
+    }
+    Ok(format!(
+        "wsl.exe -d {distro} -- sh -c {}",
+        windows_cmd_double_quote_arg(&wsl_auto_shell_command("hermes dashboard", Some("-lic")))
+    ))
 }
 
 /// 从 UNC 路径中提取 WSL 发行版名称
@@ -7047,6 +7133,57 @@ mod tests {
     }
 
     #[test]
+    fn kimi_install_uses_bundled_runtime_instead_of_system_node() {
+        let posix = tool_action_shell_command_for_shell(
+            "kimi",
+            ToolLifecycleAction::Install,
+            LifecycleCommandShell::Posix,
+        )
+        .unwrap();
+        assert_eq!(posix, KIMI_INSTALL_UNIX);
+        assert_eq!(posix_install_command_for("kimi"), posix);
+        assert!(!posix.contains("npm"));
+        let update = tool_action_shell_command_for_shell(
+            "kimi",
+            ToolLifecycleAction::Update,
+            LifecycleCommandShell::Posix,
+        )
+        .unwrap();
+        assert_eq!(update, format!("kimi upgrade --yes || {posix}"));
+        assert!(!update.contains("npm"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn kimi_windows_install_is_noninteractive_and_has_no_npm_fallback() {
+        use base64::Engine as _;
+        let command = tool_action_shell_command_for_shell(
+            "kimi",
+            ToolLifecycleAction::Install,
+            LifecycleCommandShell::WindowsBatch,
+        )
+        .unwrap();
+        assert!(command.starts_with("powershell -NoProfile -NonInteractive "));
+        let encoded = command.split("-EncodedCommand ").nth(1).unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let script = String::from_utf16(
+            &bytes
+                .chunks_exact(2)
+                .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(script, KIMI_INSTALL_WINDOWS_SCRIPT);
+        assert!(!command.contains("npm"));
+        assert_eq!(
+            wsl_tool_action_shell_command("kimi", ToolLifecycleAction::Install).as_deref(),
+            Some(KIMI_INSTALL_UNIX)
+        );
+    }
+
+    #[test]
     fn pi_lifecycle_metadata_matches_pinned_distribution() {
         let requested = vec!["unsupported".to_string(), "pi".to_string()];
         assert_eq!(normalize_requested_tools(&requested), vec!["pi"]);
@@ -8136,6 +8273,16 @@ mod tests {
                 !install_cmd.contains('|') && install_cmd.contains(" -o $tmp && bash $tmp"),
                 "WSL hermes 安装不应依赖 pipefail,得到: {install_cmd}"
             );
+        }
+
+        #[test]
+        fn wsl_hermes_dashboard_runs_inside_the_distro_login_shell() {
+            let line = wsl_hermes_dashboard_line("Ubuntu-22.04").expect("valid WSL command line");
+            assert_eq!(
+                line,
+                r#"wsl.exe -d Ubuntu-22.04 -- sh -c "\"${SHELL:-sh}\" -lic 'hermes dashboard'""#
+            );
+            assert!(wsl_hermes_dashboard_line("Ubuntu & calc").is_err());
         }
 
         #[test]

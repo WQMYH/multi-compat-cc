@@ -12,7 +12,7 @@ import {
   buildLocalProxyRequestOverrides,
   formatRequestOverrideObject,
 } from "@/lib/requestOverrides";
-import { providersApi, type AppId, type ManagedAuthProvider } from "@/lib/api";
+import { providersApi, type AppId, type AuthCenterTarget } from "@/lib/api";
 import type { ProviderEditorInactiveField } from "@/lib/api/providers";
 import {
   overlayClaudeProviderFields,
@@ -102,6 +102,7 @@ import { ClaudeDesktopProviderForm } from "./ClaudeDesktopProviderForm";
 import { GrokBuildProviderForm } from "./GrokBuildProviderForm";
 import { CodexFormFields } from "./CodexFormFields";
 import { GeminiFormFields } from "./GeminiFormFields";
+import { KimiProviderForm } from "./KimiProviderForm";
 import { AgyAccountSelect } from "./AgyOAuthSection";
 import { isMac } from "@/lib/platform";
 import { McodeProviderForm } from "./McodeProviderForm";
@@ -299,9 +300,11 @@ export interface ProviderFormProps {
   onCancel: () => void;
   onUniversalPresetSelect?: (preset: UniversalProviderPreset) => void;
   onManageUniversalProviders?: () => void;
-  onManageAuthAccounts?: (target: ManagedAuthProvider) => void;
+  onManageAuthAccounts?: (target: AuthCenterTarget) => void;
   onSubmittingChange?: (isSubmitting: boolean) => void;
   onSubmitReadyChange?: (isReady: boolean) => void;
+  /** Native account login supplies its own actions instead of the provider-save footer. */
+  onAccountLoginChange?: (accountLogin: boolean) => void;
   initialData?: {
     name?: string;
     websiteUrl?: string;
@@ -339,9 +342,14 @@ export function ProviderForm(props: ProviderFormProps) {
   if (props.appId === "dsh") {
     return <ProviderFormFull {...props} nativeTarget="dsh" appId="codex" />;
   }
-  if (props.appId === "zcode" && (!props.initialData || typeof props.initialData.settingsConfig?.config === "string")) {
+  if (
+    props.appId === "zcode" &&
+    (!props.initialData ||
+      typeof props.initialData.settingsConfig?.config === "string")
+  ) {
     return <ProviderFormFull {...props} nativeTarget="zcode" appId="codex" />;
   }
+  if (props.appId === "kimi") return <KimiProviderForm {...props} />;
   if (props.appId === "mcode") return <McodeProviderForm {...props} />;
   if (props.appId === "pi") {
     return <PiProviderForm {...props} />;
@@ -1359,11 +1367,7 @@ function ProviderFormFull({
     (appId === "claude" || appId === "codex") && category !== "official";
 
   const handleSubmit = async (values: ProviderFormData) => {
-    if (
-      nativeTarget &&
-      isCodexOfficialProvider &&
-      !codexModel.trim()
-    ) {
+    if (nativeTarget && isCodexOfficialProvider && !codexModel.trim()) {
       toast.error(
         t(`providerForm.${nativeTarget}DefaultModelRequired`, {
           defaultValue: `请先选择 ${nativeTarget === "zcode" ? "ZCode" : "DSH"} 默认模型`,
@@ -1371,11 +1375,7 @@ function ProviderFormFull({
       );
       return;
     }
-    if (
-      nativeTarget &&
-      isCodexOfficialProvider &&
-      !selectedCodexAccountId
-    ) {
+    if (nativeTarget && isCodexOfficialProvider && !selectedCodexAccountId) {
       toast.error(
         t("providerForm.dshManagedAccountRequired", {
           defaultValue: "请先选择 CC 已托管的 Codex 账号",
@@ -2963,9 +2963,7 @@ function ProviderFormFull({
                 "codex.followCodexLoginDescription",
               )}
               codexOauthAllowUnboundSelection={!nativeTarget}
-              codexOauthAllowUnboundSelectionWithoutStatus={
-                !nativeTarget
-              }
+              codexOauthAllowUnboundSelectionWithoutStatus={!nativeTarget}
               codexOauthRequireExplicitSelection={
                 requiresExplicitCodexOfficialSelection
               }

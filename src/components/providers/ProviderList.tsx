@@ -175,6 +175,7 @@ export function ProviderList({
   const isInConfig = useCallback(
     (provider: Provider): boolean => {
       switch (appId) {
+        case "kimi":
         case "mcode":
           return provider.meta?.liveConfigManaged === true;
         case "opencode":
@@ -388,6 +389,7 @@ export function ProviderList({
       isHermesManaged: (provider) =>
         isHermesReadOnlyProvider(provider.settingsConfig),
       piStateUnavailable: appId === "pi" && !isPiStateReady,
+      kimiCurrentId: currentProviderId,
       actions: {
         add: onSwitch,
         remove: (provider) =>
@@ -416,6 +418,7 @@ export function ProviderList({
     currentOmoSlimId,
     hermesModelConfig?.provider,
     isPiStateReady,
+    currentProviderId,
     onRemoveFromConfig,
     onDelete,
     onDisableOmo,
@@ -461,7 +464,10 @@ export function ProviderList({
           appId={appId}
           onCreate={appId === "pi" ? undefined : onCreate}
           onImport={
-            appId === "pi" || appId === "mcode" || appId === "dsh"
+            appId === "pi" ||
+            appId === "mcode" ||
+            appId === "dsh" ||
+            appId === "kimi"
               ? undefined
               : () => importMutation.mutate()
           }

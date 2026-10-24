@@ -104,7 +104,9 @@ describe("NewLayoutDialog", () => {
   it("stays closed when no app has providers", async () => {
     mocks.getAll.mockResolvedValue({});
     renderDialog();
-    await waitFor(() => expect(mocks.getAll).toHaveBeenCalledTimes(APP_IDS.length));
+    await waitFor(() =>
+      expect(mocks.getAll).toHaveBeenCalledTimes(APP_IDS.length),
+    );
     for (const app of APP_IDS) expect(mocks.getAll).toHaveBeenCalledWith(app);
     expect(screen.queryByText("newLayoutNotice.title")).not.toBeInTheDocument();
   });

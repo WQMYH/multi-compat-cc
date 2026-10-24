@@ -58,6 +58,8 @@ pub struct VisibleApps {
     #[serde(default = "default_true")]
     pub dsh: bool,
     #[serde(default = "default_true")]
+    pub kimi: bool,
+    #[serde(default = "default_true")]
     pub agy: bool,
     #[serde(default)]
     pub zcode: bool,
@@ -78,6 +80,7 @@ impl Default for VisibleApps {
             mcode: true,
             qoder: true,
             dsh: true,
+            kimi: true,
             agy: true,
             zcode: false, // 默认不显示，需用户手动启用
         }
@@ -99,6 +102,7 @@ impl VisibleApps {
             AppType::Hermes => self.hermes,
             AppType::Pi => self.pi,
             AppType::Mcode => self.mcode,
+            AppType::Kimi => self.kimi,
             AppType::Agy => self.agy,
             AppType::ZCode => self.zcode,
         }
@@ -1374,7 +1378,7 @@ pub fn get_current_provider(app_type: &AppType) -> Option<String> {
         AppType::Hermes => settings.current_provider_hermes.clone(),
         AppType::Dsh => settings.current_provider_dsh.clone(),
         AppType::Agy => settings.current_provider_agy.clone(),
-        AppType::Pi | AppType::Mcode => None,
+        AppType::Pi | AppType::Mcode | AppType::Kimi => None,
         AppType::ZCode => settings.current_provider_zcode.clone(),
     }
 }
@@ -1396,7 +1400,7 @@ pub fn set_current_provider(app_type: &AppType, id: Option<&str>) -> Result<(), 
         AppType::Hermes => settings.current_provider_hermes = id_owned.clone(),
         AppType::Dsh => settings.current_provider_dsh = id_owned.clone(),
         AppType::Agy => settings.current_provider_agy = id_owned.clone(),
-        AppType::Pi | AppType::Mcode => {}
+        AppType::Pi | AppType::Mcode | AppType::Kimi => {}
         AppType::ZCode => settings.current_provider_zcode = id_owned.clone(),
     })
 }

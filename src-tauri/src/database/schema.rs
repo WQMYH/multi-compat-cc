@@ -69,6 +69,7 @@ impl Database {
             enabled_opencode BOOLEAN NOT NULL DEFAULT 0,
             enabled_mcode BOOLEAN NOT NULL DEFAULT 0,
             enabled_agy BOOLEAN NOT NULL DEFAULT 0,
+            enabled_kimi BOOLEAN NOT NULL DEFAULT 0,
             enabled_hermes BOOLEAN NOT NULL DEFAULT 0,
             enabled_pi BOOLEAN NOT NULL DEFAULT 0,
             enabled_zcode BOOLEAN NOT NULL DEFAULT 0
@@ -102,6 +103,7 @@ impl Database {
             enabled_opencode BOOLEAN NOT NULL DEFAULT 0,
             enabled_mcode BOOLEAN NOT NULL DEFAULT 0,
             enabled_agy BOOLEAN NOT NULL DEFAULT 0,
+            enabled_kimi BOOLEAN NOT NULL DEFAULT 0,
             enabled_hermes BOOLEAN NOT NULL DEFAULT 0,
             enabled_zcode BOOLEAN NOT NULL DEFAULT 0,
             installed_at INTEGER NOT NULL DEFAULT 0,
@@ -606,6 +608,8 @@ impl Database {
                 }
                 version = Self::get_user_version(conn)?;
             }
+            // Official Kimi and local ZCode releases both used v22; repair either additive history.
+            Self::migrate_v21_to_v22(conn)?;
             Ok(())
         })();
 
@@ -1648,26 +1652,14 @@ impl Database {
         Ok(())
     }
 
-    /// v21 -> v22: persist ZCode enablement without colliding with the Agy migration.
-    /// Both columns must be added here: databases already at v15+ ran
-    /// migrate_v14_to_v15 before ZCode existed, so only this migration
-    /// can add `enabled_zcode` for existing users.
+    /// v21 -> v22: persist the independent Kimi and ZCode enablement flags.
     fn migrate_v21_to_v22(conn: &Connection) -> Result<(), AppError> {
-        if Self::table_exists(conn, "skills")? {
-            Self::add_column_if_missing(
-                conn,
-                "skills",
-                "enabled_zcode",
-                "BOOLEAN NOT NULL DEFAULT 0",
-            )?;
-        }
-        if Self::table_exists(conn, "mcp_servers")? {
-            Self::add_column_if_missing(
-                conn,
-                "mcp_servers",
-                "enabled_zcode",
-                "BOOLEAN NOT NULL DEFAULT 0",
-            )?;
+        for table in ["skills", "mcp_servers"] {
+            if Self::table_exists(conn, table)? {
+                for column in ["enabled_zcode", "enabled_kimi"] {
+                    Self::add_column_if_missing(conn, table, column, "BOOLEAN NOT NULL DEFAULT 0")?;
+                }
+            }
         }
         Ok(())
     }
@@ -3937,6 +3929,45 @@ mod tests {
     }
 
     #[test]
+    fn kimi_migration_preserves_existing_flags_and_defaults_to_disabled() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch("CREATE TABLE mcp_servers(id TEXT PRIMARY KEY, enabled_codex BOOLEAN); CREATE TABLE skills(id TEXT PRIMARY KEY, enabled_claude BOOLEAN); INSERT INTO mcp_servers VALUES ('m',1); INSERT INTO skills VALUES ('s',1);")?;
+        Database::set_user_version(&conn, 21)?;
+        Database::apply_schema_migrations_on_conn(&conn)?;
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+        for (table, flag) in [
+            ("mcp_servers", "enabled_codex"),
+            ("skills", "enabled_claude"),
+        ] {
+            let flags = conn.query_row(
+                &format!("SELECT {flag}, enabled_kimi FROM {table}"),
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )?;
+            assert_eq!(flags, (1, 0));
+        }
+        Database::apply_schema_migrations_on_conn(&conn)?;
+        Ok(())
+    }
+
+    #[test]
+    fn kimi_clean_database_persists_mcp_and_skill_flags_independently() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let server = serde_json::from_value(serde_json::json!({"id":"m", "name":"m", "server":{"command":"echo"}, "apps":{"kimi":true,"codex":true}})).unwrap();
+        db.save_mcp_server(&server)?;
+        db.update_mcp_server_app_enabled("m", &crate::app_config::AppType::Kimi, false)?;
+        let saved = db.get_all_mcp_servers()?;
+        assert!(!saved["m"].apps.kimi);
+        assert!(saved["m"].apps.codex);
+        let skill = serde_json::from_value(serde_json::json!({"id":"s", "name":"s", "description":"", "directory":"s", "apps":{"kimi":true,"claude":true}, "installedAt":0})).unwrap();
+        db.save_skill(&skill)?;
+        let saved = db.get_installed_skill("s")?.unwrap();
+        assert!(saved.apps.kimi && saved.apps.claude);
+        assert!(db.get_all_installed_skills()?["s"].apps.kimi);
+        Ok(())
+    }
+
+    #[test]
     fn agy_migration_preserves_existing_flags_and_defaults_to_disabled() -> Result<(), AppError> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("CREATE TABLE mcp_servers(id TEXT PRIMARY KEY, enabled_gemini BOOLEAN); CREATE TABLE skills(id TEXT PRIMARY KEY, enabled_codex BOOLEAN); INSERT INTO mcp_servers VALUES ('m',1); INSERT INTO skills VALUES ('s',1);")?;
@@ -4048,6 +4079,41 @@ mod tests {
         assert_eq!(mcp_values, (1, 0));
         assert_eq!(skill_values, (1, 0));
 
+        Ok(())
+    }
+
+    #[test]
+    fn v22_feature_columns_preserve_both_release_histories() -> Result<(), AppError> {
+        for existing in ["enabled_zcode", "enabled_kimi"] {
+            let conn = Connection::open_in_memory()?;
+            for table in ["skills", "mcp_servers"] {
+                conn.execute_batch(&format!(
+                    "CREATE TABLE {table}(id TEXT PRIMARY KEY, enabled_codex BOOLEAN, {existing} BOOLEAN, payload TEXT);
+                     INSERT INTO {table} VALUES ('kept',1,1,'unchanged');"
+                ))?;
+            }
+            Database::set_user_version(&conn, 22)?;
+            for _ in 0..2 {
+                Database::apply_schema_migrations_on_conn(&conn)?;
+                assert_eq!(Database::get_user_version(&conn)?, 22);
+                for table in ["skills", "mcp_servers"] {
+                    let row: (i64, i64, i64, String) = conn.query_row(
+                        &format!("SELECT enabled_codex, enabled_zcode, enabled_kimi, payload FROM {table} WHERE id='kept'"),
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )?;
+                    assert_eq!(
+                        row,
+                        (
+                            1,
+                            i64::from(existing == "enabled_zcode"),
+                            i64::from(existing == "enabled_kimi"),
+                            "unchanged".into()
+                        )
+                    );
+                }
+            }
+        }
         Ok(())
     }
 

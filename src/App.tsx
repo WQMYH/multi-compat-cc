@@ -50,6 +50,7 @@ import { useTauriEvent } from "@/hooks/useTauriEvent";
 import { useLastValidValue } from "@/hooks/useLastValidValue";
 import {
   extractErrorMessage,
+  translateKimiProviderMutationError,
   translatePiProviderMutationError,
 } from "@/utils/errorUtils";
 import { isTextEditableTarget } from "@/utils/domUtils";
@@ -133,11 +134,7 @@ import OpenClawHealthBanner from "@/components/openclaw/OpenClawHealthBanner";
 import HermesMemoryPanel, {
   HermesMemorySaveButton,
 } from "@/components/hermes/HermesMemoryPanel";
-import {
-  APP_IDS,
-  DEFAULT_VISIBLE_APPS,
-  isModeAppId,
-} from "@/config/appConfig";
+import { APP_IDS, DEFAULT_VISIBLE_APPS, isModeAppId } from "@/config/appConfig";
 
 interface SyncStatusUpdatedPayload {
   source?: string;
@@ -379,6 +376,27 @@ function App() {
     }
   };
 
+  // Kimi「添加」只写进 config.toml、不改默认模型；「切换」走 switchProvider
+  const handleAddKimiProvider = async (provider: Provider) => {
+    try {
+      await providersApi.addToLiveConfig(provider.id, "kimi");
+    } catch (error) {
+      toast.error(
+        t("notifications.addFailed", {
+          error: extractErrorMessage(error) || t("common.unknown"),
+        }),
+        { closeButton: true },
+      );
+      return;
+    } finally {
+      await queryClient.invalidateQueries({ queryKey: ["providers", "kimi"] });
+    }
+    toast.success(
+      t("notifications.addToConfigSuccess", { defaultValue: "已添加到配置" }),
+      { closeButton: true },
+    );
+  };
+
   const disableOmoMutation = useDisableCurrentOmo();
   const handleDisableOmo = () => {
     disableOmoMutation.mutate(undefined, {
@@ -605,7 +623,12 @@ function App() {
   useEffect(() => {
     const checkEnvOnSwitch = async () => {
       try {
-        if (activeApp === "mcode" || activeApp === "agy") return;
+        if (
+          activeApp === "mcode" ||
+          activeApp === "kimi" ||
+          activeApp === "agy"
+        )
+          return;
         const conflicts = await checkEnvConflicts(activeApp);
 
         if (conflicts.length > 0) {
@@ -709,11 +732,7 @@ function App() {
     }
     setCurrentView(page);
   };
-  useTrayAppPageSeen(
-    currentView === "providers"
-      ? activeApp
-      : null,
-  );
+  useTrayAppPageSeen(currentView === "providers" ? activeApp : null);
 
   useTrayNavigation((navigation) => {
     const navigate = () => {
@@ -812,6 +831,37 @@ function App() {
     setEditingProvider(null);
   };
 
+  // 累加式应用的「已添加」和「默认」都现读客户端文件，移除前后重读一遍
+  const refreshAdditiveLiveState = async (app: AppId) => {
+    if (app === "pi") {
+      await invalidatePiProviderCaches(queryClient);
+    } else if (app === "opencode") {
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ["opencodeLiveProviderIds"],
+        }),
+        queryClient.invalidateQueries({ queryKey: ["opencodeDefaultModel"] }),
+      ]);
+    } else if (app === "openclaw") {
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: openclawKeys.liveProviderIds,
+        }),
+        queryClient.invalidateQueries({ queryKey: openclawKeys.defaultModel }),
+        queryClient.invalidateQueries({ queryKey: openclawKeys.health }),
+      ]);
+    } else if (app === "hermes") {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: hermesKeys.liveProviderIds }),
+        queryClient.invalidateQueries({ queryKey: hermesKeys.modelConfig }),
+      ]);
+    } else if (app === "mcode" || app === "kimi") {
+      await queryClient.invalidateQueries({ queryKey: ["providers", app] });
+    } else if (app === "zcode") {
+      await invalidateZcodeProviderCaches(queryClient);
+    }
+  };
+
   const handleConfirmAction = async () => {
     if (!confirmAction) return;
     const { provider, action } = confirmAction;
@@ -824,44 +874,20 @@ function App() {
       } catch (error) {
         const detail = extractErrorMessage(error);
         const description =
-          activeApp === "pi"
-            ? translatePiProviderMutationError(detail, t) || detail
-            : detail;
-        if (activeApp === "pi") {
-          void invalidatePiProviderCaches(queryClient).catch(() => undefined);
-        }
+          (activeApp === "pi"
+            ? translatePiProviderMutationError(detail, t)
+            : activeApp === "kimi"
+              ? translateKimiProviderMutationError(detail, t)
+              : "") || detail;
+        // 默认模型可能在客户端里改过、页面还是旧的：失败了也重读，让「默认」和移除按钮跟上
+        void refreshAdditiveLiveState(activeApp).catch(() => undefined);
         toast.error(t("notifications.removeFromConfigFailed"), {
           description: description || t("common.unknown"),
           closeButton: true,
         });
         return;
       }
-      if (activeApp === "pi") {
-        await invalidatePiProviderCaches(queryClient);
-      }
-      // Invalidate queries to refresh the isInConfig state
-      if (activeApp === "opencode") {
-        await queryClient.invalidateQueries({
-          queryKey: ["opencodeLiveProviderIds"],
-        });
-      } else if (activeApp === "openclaw") {
-        await queryClient.invalidateQueries({
-          queryKey: openclawKeys.liveProviderIds,
-        });
-        await queryClient.invalidateQueries({
-          queryKey: openclawKeys.health,
-        });
-      } else if (activeApp === "hermes") {
-        await queryClient.invalidateQueries({
-          queryKey: hermesKeys.liveProviderIds,
-        });
-      } else if (activeApp === "mcode") {
-        await queryClient.invalidateQueries({
-          queryKey: ["providers", "mcode"],
-        });
-      } else if (activeApp === "zcode") {
-        await invalidateZcodeProviderCaches(queryClient);
-      }
+      await refreshAdditiveLiveState(activeApp);
       toast.success(
         activeApp === "pi"
           ? t("pi.provider.removed", {
@@ -1002,13 +1028,26 @@ function App() {
         existingKeys,
       );
       duplicatedProvider.addToLive = false;
-    } else if (activeApp === "mcode") {
+    } else if (activeApp === "mcode" || activeApp === "kimi") {
       // The MCode list already includes its live custom nodes; the backend
       // rejects a key that MCode itself owns.
       duplicatedProvider.providerKey = generateUniqueProviderCopyKey(
         provider.id,
         Object.keys(providers),
       );
+      if (activeApp === "kimi") {
+        const models = duplicatedProvider.settingsConfig.models ?? {};
+        duplicatedProvider.settingsConfig.models = Object.fromEntries(
+          Object.entries(models).map(([key, value]) => [
+            `${duplicatedProvider.providerKey}/${key.startsWith(`${provider.id}/`) ? key.slice(provider.id.length + 1) : key}`,
+            {
+              ...(value as Record<string, unknown>),
+              provider: duplicatedProvider.providerKey,
+            },
+          ]),
+        );
+        duplicatedProvider.addToLive = false;
+      }
     }
 
     if (provider.sortIndex !== undefined) {
@@ -1129,9 +1168,7 @@ function App() {
         </DropdownMenuTrigger>
       </HoverTip>
       <DropdownMenuContent align="end" className="min-w-[180px]">
-        <DropdownMenuItem
-          onSelect={() => openPage("sessions")}
-        >
+        <DropdownMenuItem onSelect={() => openPage("sessions")}>
           {t("appPage.viewSessions")}
         </DropdownMenuItem>
         {activeUsageApp && (
@@ -1144,9 +1181,7 @@ function App() {
             {t("appPage.viewUsage")}
           </DropdownMenuItem>
         )}
-        <DropdownMenuItem
-          onSelect={() => openSettings("appConfig", activeApp)}
-        >
+        <DropdownMenuItem onSelect={() => openSettings("appConfig", activeApp)}>
           {t("appPage.configDirectory")}
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={() => openPage("apps")}>
@@ -1197,6 +1232,7 @@ function App() {
         <>
           {currentView === "providers" &&
             activeApp !== "mcode" &&
+            activeApp !== "kimi" &&
             (settingsData?.showProfileSwitcher ?? false) && (
               <ProfileSwitcher activeApp={activeApp} />
             )}
@@ -1353,14 +1389,17 @@ function App() {
             onSwitch={(provider) =>
               void (activeApp === "pi"
                 ? handleEnablePiProvider(provider)
-                : switchProvider(provider))
+                : activeApp === "kimi"
+                  ? handleAddKimiProvider(provider)
+                  : switchProvider(provider))
             }
             onRemoveFromConfig={
               activeApp === "opencode" ||
               activeApp === "openclaw" ||
               activeApp === "hermes" ||
               activeApp === "pi" ||
-              activeApp === "mcode"
+              activeApp === "mcode" ||
+              activeApp === "kimi"
                 ? (provider) => setConfirmAction({ provider, action: "remove" })
                 : undefined
             }
@@ -1374,7 +1413,7 @@ function App() {
               activeApp === "openclaw" || activeApp === "opencode"
                 ? (provider, modelId) =>
                     void setAsDefaultModel(provider, modelId)
-                : activeApp === "hermes"
+                : activeApp === "hermes" || activeApp === "kimi"
                   ? (provider) => void switchProvider(provider)
                   : undefined
             }
@@ -1620,28 +1659,28 @@ function App() {
       </div>
 
       <>
-          <AddProviderDialog
-            open={isAddOpen}
-            onOpenChange={setIsAddOpen}
-            appId={activeApp}
-            onSubmit={addProvider}
-            modeView={formModeView}
-          />
+        <AddProviderDialog
+          open={isAddOpen}
+          onOpenChange={setIsAddOpen}
+          appId={activeApp}
+          onSubmit={addProvider}
+          modeView={formModeView}
+        />
 
-          <EditProviderDialog
-            open={Boolean(editingProvider)}
-            provider={effectiveEditingProvider}
-            onOpenChange={(open) => {
-              if (!open) {
-                setEditingProvider(null);
-              }
-            }}
-            onSubmit={handleEditProvider}
-            appId={activeApp}
-            isProxyTakeover={isCurrentAppTakeoverActive}
-            isCurrent={effectiveEditingProvider?.id === currentProviderId}
-            modeView={formModeView}
-          />
+        <EditProviderDialog
+          open={Boolean(editingProvider)}
+          provider={effectiveEditingProvider}
+          onOpenChange={(open) => {
+            if (!open) {
+              setEditingProvider(null);
+            }
+          }}
+          onSubmit={handleEditProvider}
+          appId={activeApp}
+          isProxyTakeover={isCurrentAppTakeoverActive}
+          isCurrent={effectiveEditingProvider?.id === currentProviderId}
+          modeView={formModeView}
+        />
       </>
 
       {effectiveUsageProvider && (
