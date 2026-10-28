@@ -24,6 +24,7 @@ const ENDPOINT_TIMEOUT_SECS: Record<AppId, number> = {
   kimi: 8,
   agy: 8,
   zcode: 8,
+  omp: 8,
 };
 
 interface TestResult {

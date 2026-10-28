@@ -51,14 +51,16 @@ pub struct VisibleApps {
     pub hermes: bool,
     #[serde(default = "default_true")]
     pub pi: bool,
+    #[serde(default)]
+    pub omp: bool,
     #[serde(default = "default_true")]
     pub mcode: bool,
     #[serde(default = "default_true")]
     pub qoder: bool,
     #[serde(default = "default_true")]
-    pub dsh: bool,
-    #[serde(default = "default_true")]
     pub kimi: bool,
+    #[serde(default = "default_true")]
+    pub dsh: bool,
     #[serde(default = "default_true")]
     pub agy: bool,
     #[serde(default)]
@@ -79,10 +81,11 @@ impl Default for VisibleApps {
             pi: true,
             mcode: true,
             qoder: true,
-            dsh: true,
             kimi: true,
+            dsh: true,
             agy: true,
             zcode: false, // 默认不显示，需用户手动启用
+            omp: true,
         }
     }
 }
@@ -92,7 +95,6 @@ impl VisibleApps {
     pub fn is_visible(&self, app: &AppType) -> bool {
         match app {
             AppType::Claude => self.claude,
-            AppType::Dsh => self.dsh,
             AppType::ClaudeDesktop => self.claude_desktop,
             AppType::Codex => self.codex,
             AppType::Gemini => self.gemini,
@@ -103,8 +105,10 @@ impl VisibleApps {
             AppType::Pi => self.pi,
             AppType::Mcode => self.mcode,
             AppType::Kimi => self.kimi,
+            AppType::Dsh => self.dsh,
             AppType::Agy => self.agy,
             AppType::ZCode => self.zcode,
+            AppType::Omp => self.omp,
         }
     }
 }
@@ -431,6 +435,10 @@ pub struct AppSettings {
     /// 静默启动（程序启动时不显示主窗口，仅托盘运行）
     #[serde(default)]
     pub silent_startup: bool,
+    /// 退出时是否处于轻量模式（主窗口已销毁、只留托盘）；下次启动按它恢复。
+    /// 只经 [`set_lightweight_mode`] 写，前端全量保存不透传。
+    #[serde(default)]
+    pub lightweight_mode: bool,
     /// 是否在主页面启用本地代理功能（默认关闭）
     #[serde(default)]
     pub enable_local_proxy: bool,
@@ -531,6 +539,9 @@ pub struct AppSettings {
     // ===== 主页面显示的应用 =====
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visible_apps: Option<VisibleApps>,
+    /// 应用页和侧栏的应用顺序（应用 ID）。缺的应用由前端按默认顺序插回，不认识的忽略
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_order: Option<Vec<String>>,
 
     // ===== 设备级目录覆盖 =====
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -551,6 +562,8 @@ pub struct AppSettings {
     pub pi_config_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zcode_config_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub omp_config_dir: Option<String>,
 
     // ===== 当前供应商 ID（设备级）=====
     /// 当前 Claude 供应商 ID（本地存储，优先于数据库 is_current）
@@ -656,6 +669,7 @@ impl Default for AppSettings {
             skip_claude_onboarding: false,
             launch_on_startup: false,
             silent_startup: false,
+            lightweight_mode: false,
             enable_local_proxy: false,
             enable_stack_mode: false,
             proxy_confirmed: None,
@@ -683,6 +697,7 @@ impl Default for AppSettings {
             language: None,
             quota_display: None,
             visible_apps: None,
+            app_order: None,
             claude_config_dir: None,
             codex_config_dir: None,
             gemini_config_dir: None,
@@ -692,6 +707,7 @@ impl Default for AppSettings {
             hermes_config_dir: None,
             pi_config_dir: None,
             zcode_config_dir: None,
+            omp_config_dir: None,
             current_provider_claude: None,
             current_provider_claude_desktop: None,
             current_provider_codex: None,
@@ -791,6 +807,13 @@ impl AppSettings {
 
         self.zcode_config_dir = self
             .zcode_config_dir
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        self.omp_config_dir = self
+            .omp_config_dir
             .as_ref()
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
@@ -1196,6 +1219,14 @@ pub fn clear_codex_unify_migrate_existing() -> Result<(), AppError> {
     })
 }
 
+/// 记下当前是否处于轻量模式（见 [`AppSettings::lightweight_mode`]），值没变就不写盘。
+pub fn set_lightweight_mode(enabled: bool) -> Result<(), AppError> {
+    if get_settings().lightweight_mode == enabled {
+        return Ok(());
+    }
+    mutate_settings(|settings| settings.lightweight_mode = enabled)
+}
+
 /// 客户端地址（见 [`AppSettings::proxy_client_host`]），去掉首尾空白；没设或为空时是 `None`。
 pub fn get_proxy_client_host() -> Option<String> {
     get_settings()
@@ -1283,6 +1314,13 @@ pub fn get_pi_override_dir() -> Option<PathBuf> {
     let settings = settings_store().read().ok()?;
     settings
         .pi_config_dir
+        .as_ref()
+        .map(|path| resolve_override_path(path))
+}
+pub fn get_omp_override_dir() -> Option<PathBuf> {
+    let settings = settings_store().read().ok()?;
+    settings
+        .omp_config_dir
         .as_ref()
         .map(|path| resolve_override_path(path))
 }
@@ -1378,7 +1416,7 @@ pub fn get_current_provider(app_type: &AppType) -> Option<String> {
         AppType::Hermes => settings.current_provider_hermes.clone(),
         AppType::Dsh => settings.current_provider_dsh.clone(),
         AppType::Agy => settings.current_provider_agy.clone(),
-        AppType::Pi | AppType::Mcode | AppType::Kimi => None,
+        AppType::Pi | AppType::Mcode | AppType::Kimi | AppType::Omp => None,
         AppType::ZCode => settings.current_provider_zcode.clone(),
     }
 }
@@ -1400,7 +1438,7 @@ pub fn set_current_provider(app_type: &AppType, id: Option<&str>) -> Result<(), 
         AppType::Hermes => settings.current_provider_hermes = id_owned.clone(),
         AppType::Dsh => settings.current_provider_dsh = id_owned.clone(),
         AppType::Agy => settings.current_provider_agy = id_owned.clone(),
-        AppType::Pi | AppType::Mcode | AppType::Kimi => {}
+        AppType::Pi | AppType::Mcode | AppType::Kimi | AppType::Omp => {}
         AppType::ZCode => settings.current_provider_zcode = id_owned.clone(),
     })
 }
@@ -1629,6 +1667,31 @@ mod tests {
             serde_json::to_value(&hidden).expect("serialize"),
             serde_json::json!({ "sidebarTodayItems": [] })
         );
+    }
+
+    #[test]
+    fn app_order_round_trips_as_camel_case() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "appOrder": ["codex", "claude", "future-app"]
+        }))
+        .expect("parse settings");
+        assert_eq!(
+            settings.app_order.as_deref(),
+            Some(
+                &[
+                    "codex".to_string(),
+                    "claude".to_string(),
+                    "future-app".to_string()
+                ][..]
+            )
+        );
+        let value = serde_json::to_value(&settings).expect("serialize settings");
+        assert_eq!(
+            value["appOrder"],
+            serde_json::json!(["codex", "claude", "future-app"])
+        );
+        let default = serde_json::to_value(AppSettings::default()).expect("serialize default");
+        assert!(default.get("appOrder").is_none());
     }
 
     #[test]

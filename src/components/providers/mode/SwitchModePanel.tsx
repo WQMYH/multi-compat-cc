@@ -125,6 +125,11 @@ export function SwitchModePanel({
   const queryClient = useQueryClient();
   const appName = APP_DISPLAY_NAME[app];
   const modes = modesFor(app);
+  const { data: dshInstallations } = useQuery({
+    queryKey: ["toolInstallations", "dsh"],
+    queryFn: () => settingsApi.listToolInstallations(["dsh"]),
+    enabled: app === "dsh",
+  });
   const {
     data: nativeRows,
     error: nativeError,
@@ -503,6 +508,25 @@ export function SwitchModePanel({
   };
 
   const notices: React.ReactNode[] = [];
+  const dshInstall = dshInstallations?.find((report) => report.tool === "dsh");
+  if (
+    app === "dsh" &&
+    nativeRows !== undefined &&
+    !nativeFetching &&
+    !nativeError &&
+    dshInstall &&
+    !dshInstall.installs.some((install) => install.is_path_default)
+  ) {
+    notices.push(
+      <Notice
+        key="dshCliPath"
+        tone="warning"
+        title={t("provider.dshCliNotOnPath")}
+      >
+        {t("provider.dshCliNotOnPathHint")}
+      </Notice>,
+    );
+  }
   if (nativeError)
     notices.push(
       <Notice

@@ -127,6 +127,68 @@ beforeEach(() => {
 });
 
 describe("SwitchModePanel — DSH native inventory", () => {
+  it("warns about an unregistered CLI without blocking DSH and clears after PATH recovery", async () => {
+    const native: Provider = {
+      ...provider("native-current:desktop"),
+      settingsConfig: {
+        nativeRef: true,
+        profile: "desktop",
+        provider: "deepseek-official",
+        model: "deepseek-flash",
+        nativeIsCurrent: true,
+      },
+    };
+    let onPath = false;
+    let scanned: unknown;
+    mockMode("direct", null, native.id);
+    server.use(
+      http.post(`${TAURI_ENDPOINT}/get_dsh_native_defaults`, () =>
+        HttpResponse.json([native]),
+      ),
+      http.post(
+        `${TAURI_ENDPOINT}/list_tool_installations`,
+        async ({ request }) => {
+          scanned = ((await request.json()) as { tools: string[] }).tools;
+          return HttpResponse.json([
+            {
+              tool: "dsh",
+              installs: [
+                {
+                  path: "C:/DSH/resources/runtime/cli/bin/dsh.cmd",
+                  version: "0.2.1",
+                  runnable: true,
+                  error: null,
+                  source: "system",
+                  is_path_default: onPath,
+                },
+              ],
+              is_conflict: false,
+              needs_confirmation: false,
+              command: "",
+              anchored: false,
+              unmanaged: true,
+            },
+          ]);
+        },
+      ),
+    );
+    const { queryClient } = renderPanel("dsh", {});
+    await screen.findByText("provider.dshCliNotOnPath");
+    expect(scanned).toEqual(["dsh"]);
+    expect(screen.getByTestId(`status-${native.id}`)).toHaveTextContent(
+      "providerCard.status.inUse",
+    );
+    onPath = true;
+    await queryClient.invalidateQueries({
+      queryKey: ["toolInstallations", "dsh"],
+    });
+    await waitFor(() =>
+      expect(
+        screen.queryByText("provider.dshCliNotOnPath"),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
   it("keeps the other profile's observed CC provider in use after a profile-local native selection", async () => {
     const native: Provider = {
       ...provider(`native-provider:desktop:${"1".repeat(64)}`),
@@ -209,7 +271,7 @@ describe("SwitchModePanel — DSH native inventory", () => {
       screen.queryByTestId(`status-${rows[1].id}`),
     ).not.toBeInTheDocument();
     expect(screen.queryByTestId("status-old-cc")).not.toBeInTheDocument();
-    await userEvent.click(screen.getByTestId(`setDefault-${rows[1].id}`));
+    await userEvent.click(screen.getByTestId(`menu-setDefault-${rows[1].id}`));
     await waitFor(() =>
       expect(selection).toEqual({ providerId: rows[1].id, modelId: "one" }),
     );

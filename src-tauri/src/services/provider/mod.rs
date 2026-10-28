@@ -5,6 +5,7 @@
 pub(crate) mod agy_direct;
 pub(crate) mod claude_direct;
 mod claude_editor;
+pub(crate) mod claude_official;
 pub(crate) mod codex_client_catalog;
 pub(crate) mod codex_direct;
 mod codex_editor;
@@ -20,6 +21,7 @@ pub(crate) mod grok_direct;
 mod grok_editor;
 pub(crate) mod icon;
 mod live;
+mod omp;
 #[cfg(test)]
 mod opencode_tests;
 mod pi;
@@ -47,6 +49,10 @@ pub use live::{
 
 pub fn import_pi_providers_from_live(state: &AppState) -> Result<usize, AppError> {
     pi::import_from_live(state)
+}
+
+pub fn import_omp_providers_from_live(state: &AppState) -> Result<usize, AppError> {
+    omp::import_from_live(state)
 }
 
 pub use claude_editor::{EditorSave, EditorView};
@@ -5500,6 +5506,9 @@ impl ProviderService {
         if app_type == AppType::Pi {
             return pi::list(state);
         }
+        if app_type == AppType::Omp {
+            return omp::list(state);
+        }
         if matches!(app_type, AppType::Mcode | AppType::Kimi) {
             let native = if app_type == AppType::Kimi {
                 crate::kimi_config::get_providers()?
@@ -5664,6 +5673,10 @@ impl ProviderService {
         }
         if app_type == AppType::Pi {
             return pi::add(state, provider, add_to_live);
+        }
+
+        if app_type == AppType::Omp {
+            return omp::add(state, provider, add_to_live);
         }
 
         let mut provider = provider;
@@ -6236,19 +6249,35 @@ impl ProviderService {
         original_id: Option<&str>,
         provider: Provider,
     ) -> Result<bool, AppError> {
+        let mut provider = provider;
         if app_type == AppType::Kimi {
-            Self::ensure_kimi_provider_editable(original_id.unwrap_or(&provider.id))?;
-            if crate::kimi_config::is_official_provider(&provider.settings_config) {
-                return Err(AppError::InvalidInput(
-                    "Manage Kimi official accounts in the Authorization Center".into(),
-                ));
+            // Official cards come from signing in. Their models, name and notes are
+            // editable; the connection stays as signed in, and no edit may turn
+            // another card into an official one.
+            let id = original_id.unwrap_or(&provider.id).to_string();
+            match Self::kimi_official_connection(state, &id)? {
+                Some(_) if provider.id != id => {
+                    return Err(AppError::InvalidInput(
+                        "Kimi official account keys cannot be changed".into(),
+                    ));
+                }
+                Some(connection) => provider.settings_config["provider"] = connection,
+                None if crate::kimi_config::is_official_provider(&provider.settings_config) => {
+                    return Err(AppError::InvalidInput(
+                        "Manage Kimi official accounts in the Authorization Center".into(),
+                    ));
+                }
+                None => {}
             }
         }
         if app_type == AppType::Pi {
             return pi::update(state, original_id, provider);
         }
 
-        let mut provider = provider;
+        if app_type == AppType::Omp {
+            return omp::update(state, original_id, provider);
+        }
+
         let original_id = original_id.unwrap_or(provider.id.as_str()).to_string();
         let provider_id_changed = original_id != provider.id;
         // 读旧行、判断谁是当前供应商、存行、写 live 都在切换锁里：进入代理和切换都等这次
@@ -6579,10 +6608,11 @@ impl ProviderService {
 
     pub(crate) fn update_pi_usage_script(
         state: &AppState,
+        app_type: AppType,
         id: &str,
         script: crate::provider::UsageScript,
     ) -> Result<bool, AppError> {
-        pi::update_usage_script(state, id, script)
+        pi::update_usage_script(state, app_type, id, script)
     }
 
     /// Delete a provider
@@ -6609,6 +6639,10 @@ impl ProviderService {
                 }
             }
             return Ok(());
+        }
+
+        if app_type == AppType::Omp {
+            return omp::delete(state, id);
         }
 
         // Additive mode apps - no current provider concept
@@ -6723,7 +6757,8 @@ impl ProviderService {
             return pi::remove(state, id);
         }
         if app_type == AppType::Kimi {
-            Self::ensure_kimi_provider_editable(id)?;
+            // An official account leaves Kimi's config but keeps its login and card,
+            // so「添加」can put it back.
             return crate::kimi_config::save_and_commit(id, None, false, || {
                 if let Some(mut provider) = state.db.get_provider_by_id(id, "kimi")? {
                     Self::set_provider_live_config_managed(&mut provider, false);
@@ -6731,6 +6766,10 @@ impl ProviderService {
                 }
                 Ok(())
             });
+        }
+
+        if app_type == AppType::Omp {
+            return omp::remove(state, id);
         }
 
         match app_type {
@@ -6789,6 +6828,23 @@ impl ProviderService {
         Ok(())
     }
 
+    /// The signed-in connection node of a Kimi official card: Kimi's live node
+    /// first, else the saved card (an official card removed from Kimi's config).
+    fn kimi_official_connection(state: &AppState, id: &str) -> Result<Option<Value>, AppError> {
+        if let Some(live) = crate::kimi_config::get_providers()?.get(id) {
+            return Ok(
+                crate::kimi_config::is_official_provider(live).then(|| live["provider"].clone())
+            );
+        }
+        Ok(state
+            .db
+            .get_provider_by_id(id, "kimi")?
+            .filter(|saved| crate::kimi_config::is_official_provider(&saved.settings_config))
+            .map(|saved| saved.settings_config["provider"].clone()))
+    }
+
+    /// Deleting an official account that is still in Kimi's config goes through
+    /// the Authorization Center (it also deletes the login); remove it first.
     fn ensure_kimi_provider_editable(id: &str) -> Result<(), AppError> {
         let native = crate::kimi_config::get_providers()?;
         if native
@@ -6850,6 +6906,10 @@ impl ProviderService {
                 "Antigravity 的卡片不需要启用，用「打开终端」启动即可",
                 "Antigravity cards are not enabled; use Open terminal to start one",
             ));
+        }
+
+        if app_type == AppType::Omp {
+            return omp::enable(state, id);
         }
 
         // Check if provider exists
@@ -7327,9 +7387,12 @@ impl ProviderService {
             AppType::OpenCode => Self::extract_opencode_common_config(&provider.settings_config),
             AppType::OpenClaw => Self::extract_openclaw_common_config(&provider.settings_config),
             AppType::Hermes => Ok(String::new()), // Hermes doesn't use common config snippets
-            AppType::Pi | AppType::Mcode | AppType::Kimi | AppType::Agy | AppType::ZCode => {
-                Ok(String::new())
-            }
+            AppType::Pi
+            | AppType::Mcode
+            | AppType::Kimi
+            | AppType::Omp
+            | AppType::ZCode
+            | AppType::Agy => Ok(String::new()),
         }
     }
 
@@ -7347,9 +7410,12 @@ impl ProviderService {
             AppType::OpenCode => Self::extract_opencode_common_config(settings_config),
             AppType::OpenClaw => Self::extract_openclaw_common_config(settings_config),
             AppType::Hermes => Ok(String::new()), // Hermes doesn't use common config snippets
-            AppType::Pi | AppType::Mcode | AppType::Kimi | AppType::Agy | AppType::ZCode => {
-                Ok(String::new())
-            }
+            AppType::Pi
+            | AppType::Mcode
+            | AppType::Kimi
+            | AppType::Omp
+            | AppType::ZCode
+            | AppType::Agy => Ok(String::new()),
         }
     }
 
@@ -7932,15 +7998,13 @@ impl ProviderService {
         app_type: AppType,
         updates: Vec<ProviderSortUpdate>,
     ) -> Result<bool, AppError> {
-        let mut providers = state.db.get_all_providers(app_type.as_str())?;
-
-        for update in updates {
-            if let Some(provider) = providers.get_mut(&update.id) {
-                provider.sort_index = Some(update.sort_index);
-                state.db.save_provider(app_type.as_str(), provider)?;
-            }
-        }
-
+        let updates: Vec<(String, usize)> = updates
+            .into_iter()
+            .map(|update| (update.id, update.sort_index))
+            .collect();
+        state
+            .db
+            .update_provider_sort_indexes(app_type.as_str(), &updates)?;
         Ok(true)
     }
 
@@ -8144,6 +8208,9 @@ impl ProviderService {
                         "ZCode configuration must be a JSON object",
                     ));
                 }
+            }
+            AppType::Omp => {
+                crate::omp_config::validate_provider(&provider.id, &provider.settings_config)?;
             }
         }
 
@@ -8360,7 +8427,7 @@ impl ProviderService {
                     .unwrap_or_default()
                     .into(),
             )),
-            AppType::OpenClaw | AppType::Hermes | AppType::Pi | AppType::Mcode => {
+            AppType::OpenClaw | AppType::Hermes | AppType::Pi | AppType::Mcode | AppType::Omp => {
                 // These native formats use apiKey and baseUrl directly on the object.
                 let api_key = provider
                     .settings_config

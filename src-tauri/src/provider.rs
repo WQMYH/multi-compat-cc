@@ -226,10 +226,11 @@ impl Provider {
                 str_at(settings.get("baseUrl")),
                 str_at(settings.get("apiKey")),
             ),
-            // Pi custom providers use the native models.json field names.
+            // Pi custom providers use the native models.json field names. Pi expands
+            // `$NAME` references in `apiKey`, so resolve them before sending (#8822).
             AppType::Pi => (
                 crate::pi_config::provider_base_url(settings).unwrap_or_default(),
-                str_at(settings.get("apiKey")),
+                crate::pi_config::resolve_usage_api_key(&str_at(settings.get("apiKey"))),
             ),
             // OpenCode (OMO) nests credentials under `options` (the SDK options object).
             AppType::OpenCode | AppType::Mcode => {
@@ -264,6 +265,12 @@ impl Provider {
                 );
                 (base_url, api_key)
             }
+            // Oh My Pi custom providers use the models.yml field names. omp reads `apiKey` as
+            // an environment variable name first, so resolve it before sending.
+            AppType::Omp => (
+                crate::omp_config::provider_base_url(settings).unwrap_or_default(),
+                crate::omp_config::resolve_usage_api_key(&str_at(settings.get("apiKey"))),
+            ),
         };
 
         // Normalize like the JS-script path (extract_base_url_from_provider) so a
@@ -832,7 +839,15 @@ impl UniversalProvider {
             "dsh" if self.apps.dsh => self.models.dsh.as_ref(),
             _ => return None,
         }?;
-        if models.model.as_deref().unwrap_or_default().trim().is_empty() { return None; }
+        if models
+            .model
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            return None;
+        }
         // Reuse the existing OpenAI provider representation, not another application's rows.
         let mut source = self.clone();
         source.apps.codex = true;
@@ -1802,7 +1817,10 @@ mod tests {
         );
         assert_eq!(
             provider.resolve_usage_credentials(&AppType::Dsh),
-            ("https://api.deepseek.com".into(), "fixture-deepseek-key".into()),
+            (
+                "https://api.deepseek.com".into(),
+                "fixture-deepseek-key".into()
+            ),
         );
     }
 
@@ -1896,6 +1914,17 @@ mod tests {
                 "sk-pi".to_string()
             )
         );
+    }
+
+    #[test]
+    fn resolve_credentials_pi_never_sends_key_references_literally() {
+        for reference in ["$CC_SWITCH_TEST_UNSET_8822", "!echo sk-from-command"] {
+            let p = provider_with(json!({
+                "baseUrl": "https://api.example.com/v1",
+                "apiKey": reference,
+            }));
+            assert_eq!(p.resolve_usage_credentials(&AppType::Pi).1, "");
+        }
     }
 
     #[test]
@@ -2005,14 +2034,26 @@ mod dsh_tree_legacy_tests {
 
     #[test]
     fn dsh_tree_preserves_legacy_qoder_fields_without_projecting_them() {
-        let mut provider = UniversalProvider::new("legacy".into(), "Legacy".into(), "custom".into(), "https://fixture.invalid/v1".into(), "fixture".into());
+        let mut provider = UniversalProvider::new(
+            "legacy".into(),
+            "Legacy".into(),
+            "custom".into(),
+            "https://fixture.invalid/v1".into(),
+            "fixture".into(),
+        );
         provider.apps.qoder = true;
-        provider.models.qoder = Some(CodexModelConfig { model: Some("saved-qoder-model".into()), ..Default::default() });
+        provider.models.qoder = Some(CodexModelConfig {
+            model: Some("saved-qoder-model".into()),
+            ..Default::default()
+        });
         let saved = serde_json::to_value(&provider).unwrap();
         let restored: UniversalProvider = serde_json::from_value(saved.clone()).unwrap();
         assert_eq!(serde_json::to_value(&restored).unwrap(), saved);
         assert!(restored.apps.qoder);
-        assert_eq!(restored.models.qoder.as_ref().unwrap().model.as_deref(), Some("saved-qoder-model"));
+        assert_eq!(
+            restored.models.qoder.as_ref().unwrap().model.as_deref(),
+            Some("saved-qoder-model")
+        );
         assert!(restored.to_native_provider("qoder").is_none());
     }
 }

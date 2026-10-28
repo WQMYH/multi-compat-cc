@@ -80,6 +80,9 @@ pub async fn upsert_mcp_server_in_config(
     use crate::app_config::McpServer;
 
     let app_ty = AppType::from_str(&app).map_err(|e| e.to_string())?;
+    if app_ty == AppType::Dsh {
+        return Err("DSH_MCP_UNSUPPORTED".into());
+    }
 
     // 读取现有的服务器（如果存在）
     let existing_server = {
@@ -134,9 +137,12 @@ pub async fn upsert_mcp_server_in_config(
 #[tauri::command]
 pub async fn delete_mcp_server_in_config(
     state: State<'_, AppState>,
-    _app: String, // 参数保留用于向后兼容，但在统一结构中不再需要
+    _app: String, // 保留其余应用的旧兼容语义；DSH 目标仍须在任何删除前拒绝。
     id: String,
 ) -> Result<bool, String> {
+    if matches!(AppType::from_str(&_app), Ok(AppType::Dsh)) {
+        return Err("DSH_MCP_UNSUPPORTED".into());
+    }
     McpService::delete_server(&state, &id).map_err(|e| e.to_string())
 }
 

@@ -8,7 +8,7 @@ function installAnchor(cliPath) {
   const require = createRequire(fs.realpathSync(cliPath));
   for (const directory of require.resolve.paths('@deepseek-ai/dsh') ?? []) {
     const file = path.join(directory, '@deepseek-ai/dsh/package.json');
-    if (fs.existsSync(file)) return file;
+    if (fs.existsSync(file)) return fs.realpathSync(file);
   }
   throw new Error('DSH_NATIVE_CONFIG_LIBRARY_UNAVAILABLE');
 }
@@ -83,7 +83,14 @@ function entryFor(entries, name) {
 async function nativeIdentity(row, require, home) {
   const credentials = entryFor(row.entries, 'credentials-local');
   if (!credentials) return undefined;
-  const load = async name => import(pathToFileURL(require.resolve(`@deepseek-ai/dsh-${name}`)).href);
+  const load = async name => {
+    // Resolve native peers and bundle plugins from their declared package owners.
+    const owner = name === 'credentials'
+      ? createRequire(fs.realpathSync(require.resolve('@deepseek-ai/dsh-credentials-local')))
+      : ['authorization', 'deepseek-account-platform'].includes(name)
+        ? createRequire(fs.realpathSync(require.resolve('@deepseek-ai/dsh-base/package.json'))) : require;
+    return import(pathToFileURL(owner.resolve(`@deepseek-ai/dsh-${name}`)).href);
+  };
   const { Context } = await import(pathToFileURL(require.resolve('@deepseek-ai/cordis')).href);
   const { interpolate } = await import(pathToFileURL(require.resolve('@deepseek-ai/cordis-plugin-loader')).href);
   const ctx = new Context();

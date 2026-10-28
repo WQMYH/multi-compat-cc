@@ -13,12 +13,13 @@ export const SESSION_APP_IDS = [
   "hermes",
   "gemini",
   "pi",
+  "omp",
   "grokbuild",
   "openclaw",
   "mcode",
   "kimi",
-  "agy",
   "dsh",
+  "agy",
 ] as const satisfies readonly AppId[];
 
 export type SessionAppId = (typeof SESSION_APP_IDS)[number];
@@ -36,6 +37,7 @@ export const SESSION_SOURCE_PATHS: Record<SessionAppId, string[]> = {
   openclaw: ["~/.openclaw/agents/<agent>/sessions"],
   hermes: ["~/.hermes/state.db", "~/.hermes/sessions"],
   pi: ["~/.pi/agent/sessions"],
+  omp: ["~/.omp/agent/sessions"],
   mcode: ["~/.minimax"],
   dsh: ["~/.dsh/sessions/<project>/<session>/session.jsonl.zstd"],
   kimi: ["~/.kimi-code/sessions"],

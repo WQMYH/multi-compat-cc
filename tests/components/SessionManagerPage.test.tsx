@@ -7,7 +7,8 @@ import {
   within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { DEFAULT_VISIBLE_APPS } from "@/config/appConfig";
 import { UNKNOWN_PROJECT_DIR_KEY } from "@/components/sessions/utils";
 import { SessionManagerPage } from "@/components/sessions/SessionManagerPage";
 import { piApi } from "@/lib/api/pi";
@@ -81,6 +82,9 @@ const EXPANDED_KEY = "cc-switch.sessionManager.expandedProjects";
 
 describe("SessionManagerPage", () => {
   beforeEach(() => {
+    // 固定日历时钟再生成会话，跨午夜也保持同一分桶参考点；异步计时器仍用真实时间。
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(2026, 9, 28, 12));
     toastSuccessMock.mockReset();
     toastErrorMock.mockReset();
     platform.mac = false;
@@ -145,8 +149,8 @@ describe("SessionManagerPage", () => {
         sessionId: "hermes-1",
         title: "Hermes Session",
         projectDir: null,
-        createdAt: now - 4 * HOUR,
-        lastActiveAt: now - 4 * HOUR,
+        createdAt: now - 24 * HOUR,
+        lastActiveAt: now - 24 * HOUR,
         sourcePath: "/mock/hermes/state.db",
       },
     ];
@@ -174,6 +178,41 @@ describe("SessionManagerPage", () => {
     };
 
     setSessionFixtures(sessions, messages);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("shows Oh My Pi sessions from its app and in the all-apps filter", async () => {
+    setSessionFixtures(
+      [
+        {
+          providerId: "omp",
+          sessionId: "omp-native-session",
+          title: "Native OMP conversation",
+          sourcePath: "/mock/omp/sessions/project/native.jsonl",
+          lastActiveAt: Date.now(),
+        },
+      ],
+      {},
+    );
+    setSettings({ visibleApps: { ...DEFAULT_VISIBLE_APPS, omp: true } });
+    renderPage("omp");
+    expect(
+      await screen.findByText("Native OMP conversation"),
+    ).toBeInTheDocument();
+    await openAppMenu();
+    const menu = await screen.findByRole("menu");
+    expect(
+      within(menu).getByRole("menuitemradio", { name: /Oh My Pi/ }),
+    ).toBeInTheDocument();
+    await userEvent.click(
+      within(menu).getByRole("menuitemradio", { name: /全部应用/ }),
+    );
+    expect(
+      await screen.findByText("Native OMP conversation"),
+    ).toBeInTheDocument();
   });
 
   it("surfaces a relative Pi sessionDir instead of presenting an empty scan as authoritative", async () => {
@@ -256,8 +295,8 @@ describe("SessionManagerPage", () => {
     await openAppMenu();
     const menu = await screen.findByRole("menu");
     const items = within(menu).getAllByRole("menuitemradio");
-    // 全部应用 + 11 个来源，按会话数从多到少
-    expect(items).toHaveLength(12);
+    // 全部应用 + 13 个来源，按会话数从多到少
+    expect(items).toHaveLength(14);
     expect(items[0]).toHaveTextContent("全部应用5");
     expect(items[1]).toHaveTextContent("Codex3");
     expect(items[items.length - 1]).toHaveTextContent("无会话");
@@ -269,6 +308,9 @@ describe("SessionManagerPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "按时间" }));
     expect(
       within(sessionList()).getByRole("heading", { name: "今天" }),
+    ).toBeInTheDocument();
+    expect(
+      within(sessionList()).getByRole("heading", { name: "昨天" }),
     ).toBeInTheDocument();
     expect(
       within(sessionList()).getByRole("heading", { name: "更早" }),
@@ -293,6 +335,7 @@ describe("SessionManagerPage", () => {
         kimi: false,
         agy: false,
         zcode: false,
+        omp: false,
       },
     });
     renderPage("codex");

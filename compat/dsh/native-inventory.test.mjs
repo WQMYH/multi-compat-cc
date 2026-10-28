@@ -9,7 +9,12 @@ import * as native from '../../src-runtime/dsh-native-defaults.mjs';
 test('native inheritance uses absent config rather than an incomplete replacement config', async () => {
   const { createRequire } = await import('node:module');
   const { pathToFileURL } = await import('node:url');
-  const require = createRequire(process.env.DSH_TEST_CLI);
+  const cliRequire = createRequire(fs.realpathSync(process.env.DSH_TEST_CLI));
+  const manifest = (cliRequire.resolve.paths('@deepseek-ai/dsh') ?? [])
+    .map(directory => path.join(directory, '@deepseek-ai/dsh/package.json'))
+    .find(file => fs.existsSync(file));
+  assert.ok(manifest, 'Resolve native libraries from the installed CLI package owner');
+  const require = createRequire(fs.realpathSync(manifest));
   const { composeEntries } = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-app-boot')).href);
   const base = [{ insert: [{ id: 'agent-default-model', name: '@deepseek-ai/dsh-agent-default-model', config: { provider: 'deepseek-official', model: 'deepseek-v4-pro' } }] }];
   assert.deepEqual(composeEntries([base, [{ id: 'agent-default-model', config: { other: 'keep' } }]])[0].config, { other: 'keep' });

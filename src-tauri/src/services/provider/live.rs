@@ -37,6 +37,7 @@ pub(crate) fn provider_exists_in_live_config(
             .map(|providers| providers.contains_key(provider_id)),
         AppType::ZCode => crate::zcode_config::get_providers()
             .map(|providers| providers.contains_key(provider_id)),
+        AppType::Omp => Ok(crate::omp_config::get_providers()?.contains_key(provider_id)),
         _ => Ok(false),
     }
 }
@@ -307,10 +308,11 @@ fn settings_contain_common_config(app_type: &AppType, settings: &Value, snippet:
         | AppType::Pi
         | AppType::Mcode
         | AppType::Kimi
+        | AppType::Dsh
         | AppType::Agy
         | AppType::ZCode
-        | AppType::ClaudeDesktop
-        | AppType::Dsh => false,
+        | AppType::Omp
+        | AppType::ClaudeDesktop => false,
     }
 }
 
@@ -388,9 +390,10 @@ pub(crate) fn remove_common_config_from_settings(
         | AppType::Mcode
         | AppType::ZCode
         | AppType::Kimi
+        | AppType::Dsh
         | AppType::ClaudeDesktop
         | AppType::Agy
-        | AppType::Dsh => Ok(settings.clone()),
+        | AppType::Omp => Ok(settings.clone()),
     }
 }
 
@@ -777,6 +780,11 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
                 }
             }
         }
+        AppType::Omp => {
+            return Err(AppError::InvalidInput(
+                "Oh My Pi providers use the Oh My Pi provider service".to_string(),
+            ));
+        }
     }
     Ok(())
 }
@@ -907,7 +915,10 @@ pub fn sync_current_to_live(state: &AppState) -> Result<(), AppError> {
 
     // Sync providers based on mode
     for app_type in AppType::all() {
-        if matches!(app_type, AppType::Pi | AppType::Mcode | AppType::Kimi) {
+        if matches!(
+            app_type,
+            AppType::Pi | AppType::Mcode | AppType::Kimi | AppType::Omp
+        ) {
             continue;
         }
         let result = if app_type.is_additive_mode() {
@@ -934,6 +945,9 @@ pub fn sync_current_to_live(state: &AppState) -> Result<(), AppError> {
 
     // Skill sync
     for app_type in AppType::all() {
+        if matches!(app_type, AppType::ClaudeDesktop | AppType::Dsh) {
+            continue;
+        }
         if let Err(e) = crate::services::skill::SkillService::sync_to_app(&state.db, &app_type) {
             log::warn!("同步 Skill 到 {app_type:?} 失败: {e}");
             failures.push(format!("skill/{}: {e}", app_type.as_str()));
@@ -1086,6 +1100,9 @@ pub fn read_live_settings(app_type: AppType) -> Result<Value, AppError> {
             let config = read_zcode_provider_config()?;
             Ok(config)
         }
+        AppType::Omp => Err(AppError::InvalidInput(
+            "Oh My Pi providers are read from Oh My Pi's native models file".to_string(),
+        )),
     }
 }
 
@@ -1207,7 +1224,8 @@ pub fn import_default_config(state: &AppState, app_type: AppType) -> Result<bool
         | AppType::Pi
         | AppType::Mcode
         | AppType::ZCode
-        | AppType::Kimi => {
+        | AppType::Kimi
+        | AppType::Omp => {
             unreachable!("additive mode apps are handled by early return")
         }
     };

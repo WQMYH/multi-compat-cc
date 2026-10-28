@@ -37,9 +37,7 @@ pub fn get_providers(
 pub fn get_current_provider(state: State<'_, AppState>, app: String) -> Result<String, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
     if crate::readonly_provider_preview() {
-        return state
-            .db
-            .get_current_provider(&app)
+        return crate::mode::current::stored_direct_pointer(&state.db, &app)
             .map(|id| id.unwrap_or_default())
             .map_err(|e| e.to_string());
     }
@@ -150,14 +148,13 @@ fn read_dsh_native_response(
     inventory: Option<serde_json::Map<String, serde_json::Value>>,
 ) -> Result<serde_json::Value, String> {
     use std::io::Write;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     let deadline = super::misc::CommandDeadline::from_timeout(Some(
         std::time::Duration::from_secs(if provider_id.is_some() { 25 } else { 10 }),
     ));
-    let cli = super::misc::locate_default_tool("dsh", deadline)?;
-    let node = super::misc::resolve_path_default("node", deadline)?.ok_or("DSH_NODE_NOT_FOUND")?;
+    let runtime = super::misc::dsh_runtime::resolve(deadline)?;
     let home = crate::services::provider::dsh_direct::root().map_err(|e| e.to_string())?;
-    let mut command = Command::new(node);
+    let mut command = runtime.command();
     command.args(["--permission", "--allow-fs-read=*"]);
     let mode = if provider_id.is_some() {
         "--cc-dsh-native-balance"
@@ -185,7 +182,7 @@ fn read_dsh_native_response(
     }
     #[cfg(not(windows))]
     super::misc::isolate_child_process_group(&mut command);
-    let input = serde_json::json!({"cliPath":cli,"home":home,"baseline":baseline,
+    let input = serde_json::json!({"cliPath":runtime.anchor,"home":home,"baseline":baseline,
             "providerId":provider_id,"balanceUrl":crate::services::balance::DEEPSEEK_BALANCE_URL,
             "excludeProviders":inventory.as_ref().map(|ids| ids.keys().cloned().collect::<Vec<_>>()).unwrap_or_default(),
             "ccProviders":inventory.unwrap_or_default()});
@@ -1179,18 +1176,28 @@ pub fn update_endpoint_last_used(
         .map_err(|e| e.to_string())
 }
 
-/// 排序就是故障转移队列的优先级，托盘按它列队列：改完重建托盘。
+/// 排序就是故障转移队列的优先级，托盘按它列队列：改完重建托盘。聚合名单也跟着重排，
+/// 客户端看到的聚合模型顺序才和界面一致。
+///
+/// 整段串行：异步命令不再在主线程排队，两次拖动的逐行写入会交错成哪次都不是的顺序。
+/// 聚合名单发布失败时报错（排序已经存下），再拖一次就会重试发布。
 #[tauri::command]
-pub fn update_providers_sort_order(
+pub async fn update_providers_sort_order(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
     app: String,
     updates: Vec<ProviderSortUpdate>,
 ) -> Result<bool, String> {
+    static SORT_ORDER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    let changed = ProviderService::update_sort_order(state.inner(), app_type, updates)
+    let _serial = SORT_ORDER_LOCK.lock().await;
+    let changed = ProviderService::update_sort_order(state.inner(), app_type.clone(), updates)
         .map_err(|e| e.to_string())?;
+    let synced = crate::mode::controller::sync_stack_order(state.inner(), &app_type).await;
     crate::tray::refresh_tray_menu(&app_handle);
+    synced.map_err(|error| {
+        format!("排序已保存，但聚合模型顺序没能更新: {error} (Sort order saved, but the aggregated model order could not be updated)")
+    })?;
     Ok(changed)
 }
 

@@ -250,6 +250,11 @@ describe("ProviderList Component", () => {
     const props = lastProps(observed.id);
     expect(props.presentation.chips).toEqual([
       { key: "official", label: "providerCard.chip.official", tone: "outline" },
+      {
+        key: "defaultModel",
+        label: "providerCard.chip.defaultModel",
+        tone: "outline",
+      },
     ]);
     expect(props.presentation.buttons).toEqual([]);
     expect(props.presentation.status.label).toBe("providerCard.status.inUse");

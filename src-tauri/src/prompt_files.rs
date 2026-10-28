@@ -43,6 +43,8 @@ pub fn prompt_file_path(app: &AppType) -> Result<PathBuf, AppError> {
         // 私有 --gemini_dir 也经软链共享它。别用 ~/.gemini/GEMINI.md：那是 Gemini CLI 的。
         AppType::Agy => crate::agy_config::customizations_dir(),
         AppType::ZCode => get_zcode_dir(),
+        // omp 只读按 profile 切换的 agent 目录里的 AGENTS.md（上游 discovery/builtin.ts）
+        AppType::Omp => crate::omp_config::get_omp_agent_dir()?,
         AppType::ClaudeDesktop | AppType::Dsh => unreachable!("handled above"),
     };
 
@@ -52,7 +54,12 @@ pub fn prompt_file_path(app: &AppType) -> Result<PathBuf, AppError> {
         AppType::Gemini => "GEMINI.md",
         AppType::GrokBuild | AppType::OpenCode | AppType::OpenClaw => "AGENTS.md",
         AppType::Hermes => "SOUL.md",
-        AppType::Pi | AppType::Mcode | AppType::Kimi | AppType::Agy | AppType::ZCode => "AGENTS.md",
+        AppType::Pi
+        | AppType::Mcode
+        | AppType::Agy
+        | AppType::Kimi
+        | AppType::ZCode
+        | AppType::Omp => "AGENTS.md",
         AppType::ClaudeDesktop | AppType::Dsh => unreachable!("handled above"),
     };
 

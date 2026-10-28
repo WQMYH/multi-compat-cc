@@ -24,12 +24,12 @@ import type {
   ToolUninstallCandidate,
   ToolUninstallPlan,
 } from "@/lib/api/settings";
+import type { DndContextProps, DragEndEvent } from "@dnd-kit/core";
+import { APP_IDS } from "@/config/appConfig";
 
 type ToolVersions = Awaited<ReturnType<typeof settingsApi.getToolVersions>>;
 
 const mocks = vi.hoisted(() => ({
-  visibleApps: undefined as VisibleApps | undefined,
-  updateSettings: vi.fn(),
   getToolVersions: vi.fn(),
   probeToolInstallations: vi.fn(),
   listToolInstallations: vi.fn(),
@@ -40,21 +40,37 @@ const mocks = vi.hoisted(() => ({
   success: vi.fn(),
   warning: vi.fn(),
   error: vi.fn(),
+  settings: {} as { visibleApps?: VisibleApps; appOrder?: string[] },
+  updateSettings: vi.fn(),
+  autoSaveSettings: vi.fn(async () => null),
+  dragEndHandlers: [] as ((event: DragEndEvent) => void)[],
+  desktopStatus: { supported: true, installed: true, configured: true },
 }));
 
 vi.mock("@/lib/api", () => ({ settingsApi: mocks }));
 vi.mock("@/lib/api/providers", () => ({
   providersApi: {
-    getClaudeDesktopStatus: async () => ({ supported: true, configured: true }),
+    getClaudeDesktopStatus: async () => mocks.desktopStatus,
   },
 }));
 vi.mock("@/hooks/useSettings", () => ({
   useSettings: () => ({
-    settings: { visibleApps: mocks.visibleApps },
+    settings: mocks.settings,
     updateSettings: mocks.updateSettings,
-    autoSaveSettings: vi.fn(async () => null),
+    autoSaveSettings: mocks.autoSaveSettings,
   }),
 }));
+vi.mock("@dnd-kit/core", async () => {
+  const actual =
+    await vi.importActual<typeof import("@dnd-kit/core")>("@dnd-kit/core");
+  return {
+    ...actual,
+    DndContext: (props: DndContextProps) => {
+      if (props.onDragEnd) mocks.dragEndHandlers.push(props.onDragEnd);
+      return <actual.DndContext {...props} />;
+    },
+  };
+});
 vi.mock("sonner", () => ({ toast: mocks }));
 vi.mock("@/lib/clipboard", () => ({ copyText: mocks.copyText }));
 
@@ -134,6 +150,16 @@ function isReady(name: string) {
   );
 }
 
+/** 某一组里各行的应用 ID，按显示顺序。 */
+function rowApps(region: string) {
+  return Array.from(
+    screen
+      .getByRole("region", { name: region })
+      .querySelectorAll<HTMLElement>("[data-tool-row]"),
+    (row) => row.dataset.toolRow,
+  );
+}
+
 /** 行尾「⋯」菜单（卸载在里面）。 */
 function rowMenu(name: string) {
   return card(name).getByRole("button", { name: "appPage.moreActions" });
@@ -208,6 +234,15 @@ describe("AppsPage concurrent CLI upgrades", () => {
     upgraded.clear();
     outdated.clear();
     missing.clear();
+    mocks.settings = {};
+    mocks.dragEndHandlers = [];
+    mocks.desktopStatus = {
+      supported: true,
+      installed: true,
+      configured: true,
+    };
+    mocks.updateSettings.mockReset();
+    mocks.autoSaveSettings.mockReset().mockResolvedValue(null);
     mocks.copyText.mockReset().mockResolvedValue(undefined);
     outdated.add("claude").add("codex").add("gemini");
     mocks.getToolVersions
@@ -248,6 +283,45 @@ describe("AppsPage concurrent CLI upgrades", () => {
         upgraded.add(tool);
         missing.delete(tool);
       });
+  });
+
+  it("detects the Desktop DSH CLI off PATH without offering npm lifecycle actions", async () => {
+    outdated.add("dsh");
+    mocks.listToolInstallations.mockImplementation(async (tools: string[]) =>
+      tools.map((tool) =>
+        report(
+          tool,
+          tool === "dsh"
+            ? {
+                unmanaged: true,
+                installs: [
+                  {
+                    path: "C:/fixture/DeepSeek Harness/resources/runtime/cli/bin/dsh.cmd",
+                    version: "0.2.1",
+                    runnable: true,
+                    error: null,
+                    source: "system",
+                    is_path_default: false,
+                  },
+                ],
+              }
+            : {},
+        ),
+      ),
+    );
+    await renderApps();
+    const dsh = card("DSH");
+    expect(
+      await dsh.findByText("provider.dshCliNotOnPath"),
+    ).toBeInTheDocument();
+    expect(
+      dsh.queryByRole("button", { name: "settings.toolUpdate" }),
+    ).toBeNull();
+    expect(
+      dsh.queryByRole("button", { name: "appPage.moreActions" }),
+    ).toBeNull();
+    expect(updateButton("Codex")).toBeEnabled();
+    expect(mocks.runToolLifecycleAction).not.toHaveBeenCalled();
   });
 
   it("copies only the selected application's manual command and switches installation methods", async () => {
@@ -435,8 +509,11 @@ describe("AppsPage concurrent CLI upgrades", () => {
       expect(dialog.getByText("pnpm remove -g openclaw")).toBeInTheDocument();
       expect(dialog.queryByText("Codex")).not.toBeInTheDocument();
       await chooseMethod("bun");
-      expect(dialog.getAllByRole("listitem")).toHaveLength(1);
+      expect(dialog.getAllByRole("listitem")).toHaveLength(2);
       expect(dialog.getByText("bun remove -g openclaw")).toBeInTheDocument();
+      expect(
+        dialog.getByText("bun remove -g @oh-my-pi/pi-coding-agent"),
+      ).toBeInTheDocument();
       expect(
         dialog.queryByText("bun remove -g opencode-ai"),
       ).not.toBeInTheDocument();
@@ -612,6 +689,109 @@ describe("AppsPage concurrent CLI upgrades", () => {
     expect(
       card("Codex").getByRole("button", { name: "settings.toolInstall" }),
     ).toBeEnabled();
+  });
+
+  it("groups apps into installed and not installed sections", async () => {
+    missing.add("codex");
+    await renderApps();
+    const installed = within(
+      screen.getByRole("region", { name: "appsPage.sectionInstalled" }),
+    );
+    const notInstalled = within(
+      screen.getByRole("region", { name: "appsPage.sectionNotInstalled" }),
+    );
+    expect(installed.getByText("Claude Code")).toBeInTheDocument();
+    expect(installed.getByText("Claude Desktop")).toBeInTheDocument();
+    expect(installed.queryByText("Codex")).toBeNull();
+    expect(notInstalled.getByText("Codex")).toBeInTheDocument();
+    expect(notInstalled.queryByText("Claude Code")).toBeNull();
+  });
+
+  it("groups Claude Desktop by whether it is installed, not whether it is connected", async () => {
+    mocks.desktopStatus = {
+      supported: true,
+      installed: true,
+      configured: false,
+    };
+    await renderApps();
+    expect(rowApps("appsPage.sectionInstalled")).toContain("claude-desktop");
+    expect(
+      card("Claude Desktop").getByText("appsPage.desktopNotConnected"),
+    ).toBeInTheDocument();
+  });
+
+  it("puts Claude Desktop under not installed when it is not on this machine", async () => {
+    mocks.desktopStatus = {
+      supported: true,
+      installed: false,
+      configured: false,
+    };
+    await renderApps();
+    expect(rowApps("appsPage.sectionNotInstalled")).toEqual(["claude-desktop"]);
+  });
+
+  it("orders rows by the saved app order within each section", async () => {
+    missing.add("codex").add("hermes");
+    mocks.settings = {
+      appOrder: [
+        "hermes",
+        "gemini",
+        "claude",
+        "claude-desktop",
+        "codex",
+        ...APP_IDS.filter(
+          (app) =>
+            !["hermes", "gemini", "claude", "claude-desktop", "codex"].includes(
+              app,
+            ),
+        ),
+      ],
+    };
+    await renderApps();
+    expect(rowApps("appsPage.sectionInstalled").slice(0, 4)).toEqual([
+      "gemini",
+      "claude",
+      "claude-desktop",
+      "grokbuild",
+    ]);
+    expect(rowApps("appsPage.sectionNotInstalled")).toEqual([
+      "hermes",
+      "codex",
+    ]);
+    // 只有已安装的能拖
+    expect(
+      within(
+        screen.getByRole("region", { name: "appsPage.sectionInstalled" }),
+      ).getAllByRole("button", { name: "appsPage.dragHandle" }),
+    ).toHaveLength(APP_IDS.length - 2);
+    expect(
+      within(
+        screen.getByRole("region", { name: "appsPage.sectionNotInstalled" }),
+      ).queryByRole("button", { name: "appsPage.dragHandle" }),
+    ).toBeNull();
+  });
+
+  it("saves the new order when a row is dropped onto another in its section", async () => {
+    await renderApps();
+    // jsdom 不做布局，算不出拖动落点：直接调各组 DndContext 收到的 onDragEnd
+    const onDragEnd = mocks.dragEndHandlers.at(-1);
+    expect(onDragEnd).toBeDefined();
+    act(() => {
+      onDragEnd?.({
+        active: { id: "claude" },
+        over: { id: "codex" },
+      } as unknown as DragEndEvent);
+    });
+    const next = [
+      "claude-desktop",
+      "codex",
+      "claude",
+      ...APP_IDS.filter(
+        (app) => !["claude", "claude-desktop", "codex"].includes(app),
+      ),
+    ];
+    expect(mocks.updateSettings).toHaveBeenCalledWith({ appOrder: next });
+    expect(mocks.autoSaveSettings).toHaveBeenCalledWith({ appOrder: next });
   });
 
   it("shows the selected path and command while retaining the resolved target for uninstall validation", async () => {
@@ -1931,7 +2111,7 @@ describe("AppsPage concurrent CLI upgrades", () => {
 
 describe("AppsPage visibility column", () => {
   beforeEach(() => {
-    mocks.visibleApps = undefined;
+    mocks.settings.visibleApps = undefined;
     mocks.updateSettings.mockReset();
     mocks.getToolVersions.mockResolvedValue([]);
     mocks.probeToolInstallations.mockResolvedValue([]);
@@ -1943,7 +2123,7 @@ describe("AppsPage visibility column", () => {
     const { APP_IDS, DEFAULT_VISIBLE_APPS } = await import(
       "@/config/appConfig"
     );
-    mocks.visibleApps = {
+    mocks.settings.visibleApps = {
       ...DEFAULT_VISIBLE_APPS,
       ...Object.fromEntries(APP_IDS.map((app) => [app, false])),
       dsh: true,
@@ -1957,9 +2137,9 @@ describe("AppsPage visibility column", () => {
       expect(toggle).toBeDisabled();
       fireEvent.click(toggle);
       expect(mocks.updateSettings).not.toHaveBeenCalled();
-      expect(mocks.visibleApps.qoder).toBe(true);
+      expect(mocks.settings.visibleApps.qoder).toBe(true);
     } finally {
-      mocks.visibleApps = undefined;
+      mocks.settings.visibleApps = undefined;
     }
   });
 

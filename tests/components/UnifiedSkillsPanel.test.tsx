@@ -884,6 +884,7 @@ describe("UnifiedSkillsPanel", () => {
       within(dialog).getByRole("button", { name: "skillsPage.import.submit" }),
     );
     await waitFor(() => expect(m.importSkills).toHaveBeenCalled());
+    expect(m.importSkills.mock.calls[0][0][0].apps).not.toHaveProperty("dsh");
     expect(m.importSkills.mock.calls[0][0]).toEqual([
       {
         directory: "shared-skill",

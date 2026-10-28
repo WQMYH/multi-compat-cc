@@ -17,64 +17,76 @@ const balanceUrl = 'https://api.deepseek.com/user/balance';
 test('native DSH balances stay with their actual auth owner, return amounts only and never mutate the store', async () => {
   assert.ok(process.env.DSH_TEST_CLI, 'Supply the installed CLI path; native-library acceptance cannot be skipped');
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-dsh-balance-'));
-  const calls = [];
-  let expired = false;
-  const server = http.createServer((req, res) => {
-    calls.push({ url: req.url, authorization: req.headers.authorization, account: req.headers['x-dsh-auth-token'] });
-    if (req.url === '/user/balance') {
-      res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify({ is_available: true, balance_infos: [{ currency: 'CNY', total_balance: '31.25', key }], secret: key }));
-    } else if (req.url === '/api/v0/users/get_user_summary') {
-      res.statusCode = expired ? 401 : 200;
-      res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify({ code: expired ? 40003 : 0, data: { biz_code: 0, biz_data: {
-        normal_wallets: [{ currency: 'CNY', balance: '8.50' }], bonus_wallets: [{ currency: 'CNY', balance: '99' }], secret: grant,
-      } } }));
-    } else {
-      res.statusCode = 500;
-      res.end('Unexpected route: no inference, login or other request is allowed');
-    }
-  });
-  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  const origin = `http://127.0.0.1:${server.address().port}`;
-  const write = (name, value) => {
-    const file = path.join(home, name);
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, value, { mode: 0o600 });
-  };
-  const snapshot = () => Object.fromEntries(fs.readdirSync(home, { recursive: true, withFileTypes: true })
-    .filter(entry => entry.isFile()).map(entry => [path.relative(home, path.join(entry.parentPath, entry.name)), fs.readFileSync(path.join(entry.parentPath, entry.name), 'utf8')]));
-  const input = { cliPath: process.env.DSH_TEST_CLI, home, balanceUrl };
-  const require = createRequire(fs.realpathSync(input.cliPath));
-  const boot = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-app-boot')).href);
-  const basePatch = path.join(path.dirname(require.resolve('@deepseek-ai/dsh-base/package.json')), 'cordis.patch.yml');
-  const stockAccount = boot.composeEntries([boot.loadOverlayPatches('dsh', basePatch)])
-    .find(entry => entry.name === '@deepseek-ai/dsh-deepseek-account-platform');
-  assert.ok(stockAccount, 'Exercise actual stock native account configuration, including Loader expressions');
-  const credentials = () => JSON.stringify({ version: 1, refs: { NATIVE_API_REF: key }, records: {
-    'deepseek-account-platform/default': { kind: 'grant', payload: { version: 1, issuer: origin, token: grant } },
-  } });
-  const run = providerId => new Promise((resolve, reject) => {
-    // Only the API's fixed official endpoint is redirected; platform queries exercise the native provider unchanged.
-    const shim = `const realFetch = globalThis.fetch; globalThis.fetch = (url, options) => realFetch(url === ${JSON.stringify(balanceUrl)} ? ${JSON.stringify(origin + '/user/balance')} : url, options);\n`;
-    const child = spawn(process.execPath, ['--permission', '--allow-fs-read=*', '--input-type=module', '--eval', shim + source, '--', '--cc-dsh-native-balance'], {
-      windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, NODE_OPTIONS: '', NATIVE_API_REF: 'wrong-cc-ambient-identity' },
-    });
-    let stdout = '', stderr = '';
-    const timer = setTimeout(() => child.kill(), 15_000);
-    child.stdout.on('data', data => { stdout += data; });
-    child.stderr.on('data', data => { stderr += data; });
-    child.on('error', reject);
-    child.on('close', code => {
-      clearTimeout(timer);
-      try {
-        for (const secret of [key, grant, 'wrong-cc-ambient-identity']) assert.ok(!(stdout + stderr).includes(secret), 'A native credential must not cross the process result/log boundary');
-        resolve({ code, value: JSON.parse(stdout), stderr });
-      } catch (error) { reject(error); }
-    });
-    child.stdin.end(JSON.stringify({ ...input, providerId }));
-  });
+  let server;
   try {
+    const calls = [];
+    let expired = false;
+    server = http.createServer((req, res) => {
+      calls.push({ url: req.url, authorization: req.headers.authorization, account: req.headers['x-dsh-auth-token'] });
+      if (req.url === '/user/balance') {
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ is_available: true, balance_infos: [{ currency: 'CNY', total_balance: '31.25', key }], secret: key }));
+      } else if (req.url === '/api/v0/users/get_user_summary') {
+        res.statusCode = expired ? 401 : 200;
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ code: expired ? 40003 : 0, data: { biz_code: 0, biz_data: {
+          normal_wallets: [{ currency: 'CNY', balance: '8.50' }], bonus_wallets: [{ currency: 'CNY', balance: '99' }], secret: grant,
+        } } }));
+      } else {
+        res.statusCode = 500;
+        res.end('Unexpected route: no inference, login or other request is allowed');
+      }
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', () => {
+        server.off('error', reject);
+        resolve();
+      });
+    });
+    const origin = `http://127.0.0.1:${server.address().port}`;
+    const write = (name, value) => {
+      const file = path.join(home, name);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, value, { mode: 0o600 });
+    };
+    const snapshot = () => Object.fromEntries(fs.readdirSync(home, { recursive: true, withFileTypes: true })
+      .filter(entry => entry.isFile()).map(entry => [path.relative(home, path.join(entry.parentPath, entry.name)), fs.readFileSync(path.join(entry.parentPath, entry.name), 'utf8')]));
+    const input = { cliPath: process.env.DSH_TEST_CLI, home, balanceUrl };
+    const cliRequire = createRequire(fs.realpathSync(input.cliPath));
+    const manifest = (cliRequire.resolve.paths('@deepseek-ai/dsh') ?? [])
+      .map(directory => path.join(directory, '@deepseek-ai/dsh/package.json'))
+      .find(file => fs.existsSync(file));
+    assert.ok(manifest, 'Resolve native libraries from the installed CLI package owner');
+    const require = createRequire(fs.realpathSync(manifest));
+    const boot = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-app-boot')).href);
+    const basePatch = path.join(path.dirname(require.resolve('@deepseek-ai/dsh-base/package.json')), 'cordis.patch.yml');
+    const stockAccount = boot.composeEntries([boot.loadOverlayPatches('dsh', basePatch)])
+      .find(entry => entry.name === '@deepseek-ai/dsh-deepseek-account-platform');
+    assert.ok(stockAccount, 'Exercise actual stock native account configuration, including Loader expressions');
+    const credentials = () => JSON.stringify({ version: 1, refs: { NATIVE_API_REF: key }, records: {
+      'deepseek-account-platform/default': { kind: 'grant', payload: { version: 1, issuer: origin, token: grant } },
+    } });
+    const run = providerId => new Promise((resolve, reject) => {
+      // Only the API's fixed official endpoint is redirected; platform queries exercise the native provider unchanged.
+      const shim = `const realFetch = globalThis.fetch; globalThis.fetch = (url, options) => realFetch(url === ${JSON.stringify(balanceUrl)} ? ${JSON.stringify(origin + '/user/balance')} : url, options);\n`;
+      const child = spawn(process.execPath, ['--permission', '--allow-fs-read=*', '--input-type=module', '--eval', shim + source, '--', '--cc-dsh-native-balance'], {
+        windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, NODE_OPTIONS: '', NATIVE_API_REF: 'wrong-cc-ambient-identity' },
+      });
+      let stdout = '', stderr = '';
+      const timer = setTimeout(() => child.kill(), 15_000);
+      child.stdout.on('data', data => { stdout += data; });
+      child.stderr.on('data', data => { stderr += data; });
+      child.on('error', reject);
+      child.on('close', code => {
+        clearTimeout(timer);
+        try {
+          for (const secret of [key, grant, 'wrong-cc-ambient-identity']) assert.ok(!(stdout + stderr).includes(secret), 'A native credential must not cross the process result/log boundary');
+          resolve({ code, value: JSON.parse(stdout), stderr });
+        } catch (error) { reject(error); }
+      });
+      child.stdin.end(JSON.stringify({ ...input, providerId }));
+    });
     write('profiles/desktop/package.json', JSON.stringify({ dsh: { profile: { bundles: ['@fixture/defaults'] } } }));
     write('profiles/desktop/node_modules/@fixture/defaults/package.json', JSON.stringify({ name: '@fixture/defaults', version: '1.0.0', dsh: { bundle: { patch: 'defaults.yml' } } }));
     write('profiles/desktop/node_modules/@fixture/defaults/defaults.yml', JSON.stringify([{ insert: [
@@ -146,9 +158,17 @@ test('native DSH balances stay with their actual auth owner, return amounts only
     assert.notEqual((await run(row.id)).code, 0);
     assert.deepEqual(snapshot(), before, 'Native legacy migration is not authorized by a balance query');
   } finally {
-    await new Promise(resolve => server.close(resolve));
-    assert.equal(path.dirname(home), path.resolve(os.tmpdir()));
-    assert.ok(path.basename(home).startsWith('cc-dsh-balance-'));
-    fs.rmSync(home, { recursive: true, force: true });
+    try {
+      if (server?.listening) {
+        await new Promise((resolve, reject) => {
+          server.close(error => error ? reject(error) : resolve());
+          server.closeAllConnections();
+        });
+      }
+    } finally {
+      assert.equal(path.dirname(home), path.resolve(os.tmpdir()));
+      assert.ok(path.basename(home).startsWith('cc-dsh-balance-'));
+      fs.rmSync(home, { recursive: true, force: true });
+    }
   }
 });

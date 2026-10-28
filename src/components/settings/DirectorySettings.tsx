@@ -28,6 +28,7 @@ interface DirectorySettingsProps {
   hermesDir?: string;
   piDir?: string;
   zcodeDir?: string;
+  ompDir?: string;
   onDirectoryChange: (app: DirectoryAppId, value?: string) => void;
   onBrowseDirectory: (app: DirectoryAppId) => Promise<void>;
   onResetDirectory: (app: DirectoryAppId) => Promise<void>;
@@ -48,6 +49,7 @@ export function DirectorySettings({
   hermesDir,
   piDir,
   zcodeDir,
+  ompDir,
   onDirectoryChange,
   onBrowseDirectory,
   onResetDirectory,
@@ -204,6 +206,17 @@ export function DirectorySettings({
           onChange={(val) => onDirectoryChange("zcode", val)}
           onBrowse={() => onBrowseDirectory("zcode")}
           onReset={() => onResetDirectory("zcode")}
+        />
+
+        <DirectoryInput
+          label={t("settings.ompConfigDir")}
+          description={undefined}
+          value={ompDir}
+          resolvedValue={resolvedDirs.omp}
+          placeholder={t("settings.browsePlaceholderOmp")}
+          onChange={(val) => onDirectoryChange("omp", val)}
+          onBrowse={() => onBrowseDirectory("omp")}
+          onReset={() => onResetDirectory("omp")}
         />
       </section>
     </div>

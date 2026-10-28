@@ -149,6 +149,12 @@ pub fn local_direct_pointer(app: &AppType) -> Option<String> {
     crate::settings::get_current_provider(app)
 }
 
+/// 数据库原样保存的直连指针；只用于只读预览和原生网关的独立命名空间。
+/// 不读取本机设置或代理路由；普通应用的当前供应商仍经 `provider_for` 读取。
+pub fn stored_direct_pointer(db: &Database, app: &str) -> Result<Option<String>, AppError> {
+    db.get_current_provider(app)
+}
+
 /// 删除前检查：直连指针（同 [`provider_for`] 的 `Direct`）或代理路由指着它，就算正在用。
 ///
 /// 和界面上禁用删除的判断是同一个集合。不再单独看 DB 的 `is_current`：本地记录有效时
@@ -192,6 +198,9 @@ mod tests {
                 continue;
             }
             let text = fs::read_to_string(&path).unwrap();
+            if text.lines().any(|line| line == "#![cfg(test)]") {
+                continue;
+            }
             // 测试模块里造数据可以直接读写，只查生产代码：跳过顶层的
             // `#[cfg(test)] mod xxx { … }`（到下一个顶格的 `}` 为止）。
             let mut in_tests = false;
