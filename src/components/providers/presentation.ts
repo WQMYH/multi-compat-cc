@@ -88,74 +88,15 @@ export interface ProviderSection {
   items: { provider: Provider; presentation: CardPresentation }[];
 }
 
-export const isDshNativeRef = (provider: Provider): boolean =>
-  provider.settingsConfig.nativeRef === true &&
-  ["desktop", "web"].some(
-    (profile) =>
-      provider.settingsConfig.profile === profile &&
-      (provider.id === `native-current:${profile}` ||
-        (provider.settingsConfig.nativeProvider === true &&
-          new RegExp(`^native-provider:${profile}:[a-f0-9]{64}$`).test(
-            provider.id,
-          ))),
-  );
-
 export const isZcodeNativeRef = (provider: Provider): boolean =>
   provider.settingsConfig.nativeManaged === true &&
   provider.id.startsWith("account:");
 
-export function providerDisplayName(
-  app: AppId,
-  provider: Provider,
-  t: TFunction,
-): string {
-  if (
-    app !== "dsh" ||
-    !isDshNativeRef(provider) ||
-    !["deepseek-official", "deepseek-account"].includes(
-      provider.settingsConfig.provider,
-    )
-  )
-    return provider.name;
-  const name = t(
-    provider.settingsConfig.provider === "deepseek-official"
-      ? "provider.dshDeepseekApi"
-      : "provider.dshDeepseekAccount",
-  );
-  if (provider.settingsConfig.nativeProvider === true) return name;
-  const model = provider.settingsConfig.model;
-  return `${t(provider.settingsConfig.provider === "deepseek-official" ? "provider.dshDeepseekApi" : "provider.dshDeepseekAccount")} · ${model === "deepseek-flash" ? "Flash" : model === "deepseek-pro" ? "Pro" : model}`;
-}
-
-export function providerIdentityChips(
-  app: AppId,
-  provider: Provider,
-  t: TFunction,
-  routingReason?: string,
-): CardChip[] {
-  const chips: CardChip[] = [];
-  if (isOfficialAccount(app, provider))
-    chips.push({
-      key: "official",
-      label: t("providerCard.chip.official"),
-      tone: "outline",
-    });
-  if (providerNeedsRouting(app, provider))
-    chips.push({
-      key: "needsRoute",
-      label: t("providerCard.chip.needsRoute"),
-      tone: "outline",
-      title: routingReason,
-    });
-  return chips;
-}
-
 /** 走路由时不能用的官方订阅（Codex 官方账号可以，靠客户端自己的登录）。 */
 export function blockedFromRouting(app: AppId, provider: Provider): boolean {
   return (
-    (app === "dsh" && isDshNativeRef(provider)) ||
-    (isOfficialAccount(app, provider) &&
-      !supportsOfficialProxyTakeover(app, provider))
+    isOfficialAccount(app, provider) &&
+    !supportsOfficialProxyTakeover(app, provider)
   );
 }
 
@@ -197,8 +138,6 @@ export interface SwitchModeInput {
   active: AppMode;
   view: AppMode;
   directId: string | null;
-  /** Effective direct targets of clients with more than one native profile. Derived, never persisted here. */
-  directIds?: ReadonlySet<string>;
   routeId: string | null;
   failoverOn: boolean;
   /** 队列里的 id，按优先级 */
@@ -219,7 +158,6 @@ export interface SwitchModeInput {
     stackAdd: (provider: Provider) => void;
     stackRemove: (provider: Provider) => void;
     stackSetDefault: (provider: Provider) => void;
-    selectNativeModel?: (provider: Provider, modelId: string) => void;
   };
 }
 
@@ -231,7 +169,7 @@ export function buildSwitchSections(input: SwitchModeInput): ProviderSection[] {
   const deleteBlockedReason = (id: string) => {
     if (active !== "direct" && id === routeId)
       return t("providerCard.reason.inUseCannotDelete");
-    if (input.directIds?.has(id) ?? id === directId)
+    if (id === directId)
       return active === "direct"
         ? t("providerCard.reason.inUseCannotDelete")
         : t("providerCard.reason.directDefaultCannotDelete");
@@ -255,103 +193,15 @@ export function buildSwitchSections(input: SwitchModeInput): ProviderSection[] {
         };
       }
       const reason = deleteBlockedReason(item.provider.id);
-      const nativeRef = input.app === "dsh" && isDshNativeRef(item.provider);
-      // DSH keeps identity requirements visible in every mode, not only Direct.
-      const chips =
-        input.app === "dsh"
-          ? [
-              ...item.presentation.chips,
-              ...providerIdentityChips(
-                input.app,
-                item.provider,
-                t,
-                input.routingReason(item.provider),
-              ).filter(
-                (chip) =>
-                  !item.presentation.chips.some(
-                    (existing) => existing.key === chip.key,
-                  ),
-              ),
-            ]
-          : item.presentation.chips;
-      const models: { model: string; displayName?: string }[] = nativeRef
-        ? (item.provider.settingsConfig.modelCatalog?.models ?? [])
-        : [];
-      const chooseModel =
-        nativeRef &&
-        item.provider.settingsConfig.nativeProvider === true &&
-        input.view === "direct" &&
-        input.active === "direct" &&
-        input.actions.selectNativeModel;
-      if (
-        nativeRef &&
-        item.provider.settingsConfig.nativeIsCurrent === true &&
-        item.provider.settingsConfig.model
-      ) {
-        chips.push({
-          key: "defaultModel",
-          tone: "outline",
-          label: t("providerCard.chip.defaultModel", {
-            model: item.provider.settingsConfig.model,
-          }),
-        });
-      }
-      return {
-        ...item,
-        presentation: {
-          ...item.presentation,
-          chips,
-          ...(chooseModel && models.length
-            ? {
-                menuItems: [
-                  ...(item.presentation.menuItems ?? []),
-                  {
-                    key: "setDefault",
-                    label: t("providerCard.action.setDefault"),
-                    onSelect: () =>
-                      input.actions.selectNativeModel?.(
-                        item.provider,
-                        models[0].model,
-                      ),
-                    submenu:
-                      models.length > 1
-                        ? {
-                            title: t("providerCard.action.setDefault"),
-                            options: models.map((model) => ({
-                              key: model.model,
-                              label: model.displayName || model.model,
-                              detail: model.displayName
-                                ? model.model
-                                : undefined,
-                              onSelect: () =>
-                                input.actions.selectNativeModel?.(
-                                  item.provider,
-                                  model.model,
-                                ),
-                            })),
-                          }
-                        : undefined,
-                  },
-                ],
-              }
-            : {}),
-          ...(nativeRef && input.view !== "direct"
-            ? {
-                buttons: item.presentation.buttons.map((button) => ({
-                  ...button,
-                  disabledReason: t("provider.nativeManagedReadOnly"),
-                })),
-              }
-            : {}),
-          ...(reason ? { deleteDisabledReason: reason } : {}),
-          ...(nativeRef
-            ? {
-                editDisabledReason: t("provider.nativeManagedReadOnly"),
-                deleteDisabledReason: t("provider.nativeManagedReadOnly"),
-              }
-            : {}),
-        },
-      };
+      return reason
+        ? {
+            ...item,
+            presentation: {
+              ...item.presentation,
+              deleteDisabledReason: reason,
+            },
+          }
+        : item;
     }),
   }));
 }
@@ -364,7 +214,6 @@ function buildSwitchSectionsByView(input: SwitchModeInput): ProviderSection[] {
     active,
     view,
     directId,
-    directIds,
     routeId,
     failoverOn,
     queue,
@@ -395,8 +244,12 @@ function buildSwitchSectionsByView(input: SwitchModeInput): ProviderSection[] {
       title: t("provider.directProviderHint"),
     }),
   };
-  const base = (p: Provider) =>
-    providerIdentityChips(app, p, t, input.routingReason(p));
+  const base = (p: Provider) => {
+    const chips: CardChip[] = [];
+    if (official(p)) chips.push(chip.official());
+    if (providerNeedsRouting(app, p)) chips.push(chip.needsRoute(p));
+    return chips;
+  };
   const officialOnly = (p: Provider) => (official(p) ? [chip.official()] : []);
   const blocked = (p: Provider, label: string, reason: string) => ({
     provider: p,
@@ -421,7 +274,7 @@ function buildSwitchSectionsByView(input: SwitchModeInput): ProviderSection[] {
         items: providers.map((p) => {
           const chips = base(p);
           if (active === "direct") {
-            if (directIds?.has(p.id) ?? p.id === directId) {
+            if (p.id === directId) {
               return {
                 provider: p,
                 presentation: {
@@ -453,8 +306,7 @@ function buildSwitchSectionsByView(input: SwitchModeInput): ProviderSection[] {
             };
           }
           // 实际在路由 / 聚合，正在查看直连
-          if (directIds?.has(p.id) ?? p.id === directId)
-            chips.push(chip.directWhenDirect());
+          if (p.id === directId) chips.push(chip.directWhenDirect());
           return {
             provider: p,
             presentation: {

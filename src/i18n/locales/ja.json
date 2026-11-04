@@ -100,13 +100,6 @@
   },
   "provider": {
     "nativeAccountManaged": "ローカルの接続設定を検出しました。ログイン状態、アカウントの切り替えと編集は {{app}} で管理します。",
-    "dshNativeDefault": "ネイティブの既定",
-    "dshDeepseekApi": "DeepSeek 公式 API",
-    "dshDeepseekAccount": "DeepSeek プラットフォームアカウント",
-    "nativeManagedReadOnly": "ネイティブアプリで管理されています。ここで選択し、認証情報は DSH で編集します。",
-    "nativeDefaultsReadFailed": "DSH の既定モデルを読み込めません",
-    "dshCliNotOnPath": "DSH は検出されましたが、PATH に CLI が見つかりません",
-    "dshCliNotOnPathHint": "CC はインストール済みの DSH 設定を引き続き読み取れます。ターミナルで dsh を使うには、DSH デスクトップで CLI コマンドを登録するか、「アプリ」で CLI を修復してから、新しいターミナルを開いてください。",
     "connectivityCheck": "接続チェック",
     "tabProvider": "プロバイダー",
     "tabUniversal": "統一プロバイダー",
@@ -1635,8 +1628,7 @@
   },
   "providerForm": {
     "nativeDefaultModelHint": "{{client}} の新しいセッションの既定モデルです。このプロバイダーまたは管理対象アカウントが対応するモデルを選択してください。",
-    "dshDefaultModelRequired": "先に DSH の既定モデルを選択してください",
-    "dshManagedAccountRequired": "先に CC で管理している Codex アカウントを選択してください",
+    "nativeManagedAccountRequired": "先に CC で管理している Codex アカウントを選択してください",
     "nativeConfig": {
       "title": "設定ファイル {{path}}（このプロバイダーのみ）",
       "hint": "このプロバイダーの部分をアプリ本来の形式で表示し、保存時にこのファイルへ書き込みます。デフォルトモデルなどのグローバル設定はここにはありません。ここに書いたコメントは保存されません。",
@@ -4428,7 +4420,6 @@
       "exitTitle": "{{app}} を「{{from}}」から直接接続に戻しますか？",
       "exitLead": "{{app}} は {{provider}} に直接接続し、リクエストは CC Switch を経由しなくなります。",
       "exitNoteFile": "{{file}} のアドレスとキーを {{provider}} のものに書き戻します。ほかの設定は変わりません。",
-      "exitNoteNativeSelection": "{{file}} で各クライアントの既定の {{provider}} 選択を復元します。認証情報と履歴は元の場所に保持します。",
       "exitNoteRouteKept": "ルーティング先、フェイルオーバーのキューと設定は保持され、次にルーティングを開始すると復元されます。",
       "desktopExitNoteRouteKept": "ルーティング先は保持され、次にルーティングを開始すると復元されます。",
       "confirmDirect": "直接接続に戻す",

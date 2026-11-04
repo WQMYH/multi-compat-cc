@@ -735,13 +735,7 @@ function ToolRow({
   const canUninstall = isToolPresent(info, report);
   // 桌面分发的工具应用内自更新、由安装器管理卸载：
   // 不提供安装/升级动作，也不提供 npm 卸载
-  const isDesktopOnly =
-    DESKTOP_ONLY_TOOLS.has(tool) ||
-    (tool === "dsh" && Boolean(report?.unmanaged));
-  const dshCliNotOnPath =
-    tool === "dsh" &&
-    Boolean(defaultInstall) &&
-    !report?.installs.some((install) => install.is_path_default);
+  const isDesktopOnly = DESKTOP_ONLY_TOOLS.has(tool);
   const action: Exclude<ToolLifecycleAction, "uninstall"> | null = isDesktopOnly
     ? null
     : ((busyAction !== "uninstall" ? busyAction : undefined) ??
@@ -931,13 +925,8 @@ function ToolRow({
     ) : null;
 
   const footer =
-    wslControls || errorLine || nodeLine || conflictList || dshCliNotOnPath ? (
+    wslControls || errorLine || nodeLine || conflictList ? (
       <div className="space-y-2">
-        {dshCliNotOnPath && (
-          <p className="text-caption text-warning-text">
-            {t("provider.dshCliNotOnPath")}
-          </p>
-        )}
         {errorLine}
         {nodeLine}
         {wslControls}

@@ -66,7 +66,6 @@ import {
   type CardPresentation,
   type ProviderSection,
   type SwitchModeInput,
-  isDshNativeRef,
   isZcodeNativeRef,
 } from "@/components/providers/presentation";
 
@@ -547,10 +546,6 @@ export function ProviderList({
   // 「当前」只用来决定官方订阅 / OAuth 额度自动刷新：Pi 没有当前项，OMO / Hermes 各看自己的当前项；
   // Antigravity 没有「启用」，每张卡都随时能打开，额度一律照常显示
   const isCurrentFor = (provider: Provider) => {
-    if (appId === "dsh" && switchMode?.directIds)
-      return (
-        switchMode.active === "direct" && switchMode.directIds.has(provider.id)
-      );
     if (isPiFamilyApp(appId)) return false;
     if (appId === "agy") return true;
     if (provider.category === "omo") return provider.id === currentOmoId;
@@ -570,8 +565,7 @@ export function ProviderList({
       onEdit={onEdit}
       onDelete={onDelete}
       onDuplicate={
-        (appId === "dsh" && provider.settingsConfig.nativeRef) ||
-        (appId === "zcode" && isZcodeNativeRef(provider))
+        appId === "zcode" && isZcodeNativeRef(provider)
           ? undefined
           : onDuplicate
       }
@@ -582,10 +576,7 @@ export function ProviderList({
       // Antigravity 的「打开终端」已经是主按钮，「更多」菜单里不再重复
       onOpenTerminal={appId === "agy" ? undefined : onOpenTerminal}
       onTest={
-        (appId === "dsh" && provider.settingsConfig.nativeRef) ||
-        (appId === "zcode" && isZcodeNativeRef(provider))
-          ? undefined
-          : handleTest
+        appId === "zcode" && isZcodeNativeRef(provider) ? undefined : handleTest
       }
       isTesting={isChecking(provider.id)}
     />
@@ -754,9 +745,7 @@ interface SortableProviderCardProps {
 }
 
 function SortableProviderCard(props: SortableProviderCardProps) {
-  const nativeRef =
-    (props.appId === "dsh" && isDshNativeRef(props.provider)) ||
-    (props.appId === "zcode" && isZcodeNativeRef(props.provider));
+  const nativeRef = props.appId === "zcode" && isZcodeNativeRef(props.provider);
   const {
     setNodeRef,
     attributes,

@@ -100,13 +100,6 @@
   },
   "provider": {
     "nativeAccountManaged": "已識別本機連線設定；登入狀態、帳號切換和編輯由 {{app}} 管理。",
-    "dshNativeDefault": "原生預設",
-    "dshDeepseekApi": "DeepSeek 官方 API",
-    "dshDeepseekAccount": "DeepSeek 平台帳號",
-    "nativeManagedReadOnly": "由原生應用管理；可在此選擇，帳號憑證在 DSH 中編輯。",
-    "nativeDefaultsReadFailed": "無法讀取 DSH 預設模型",
-    "dshCliNotOnPath": "已識別 DSH，未在 PATH 中偵測到 CLI",
-    "dshCliNotOnPathHint": "CC 仍可讀取已安裝的 DSH 設定。如需在終端機直接執行 dsh，請在 DSH 桌面版註冊 CLI 命令，或透過「應用程式」修復 CLI 安裝，然後重新開啟終端機。",
     "connectivityCheck": "檢測連通",
     "tabProvider": "供應商",
     "tabUniversal": "通用供應商",
@@ -1636,8 +1629,7 @@
   },
   "providerForm": {
     "nativeDefaultModelHint": "{{client}} 新對話使用的預設模型，請選擇目前供應商或託管帳號支援的模型。",
-    "dshDefaultModelRequired": "請先選擇 DSH 預設模型",
-    "dshManagedAccountRequired": "請先選擇 CC 已託管的 Codex 帳號",
+    "nativeManagedAccountRequired": "請先選擇 CC 已託管的 Codex 帳號",
     "nativeConfig": {
       "title": "設定檔 {{path}}（只顯示這一家）",
       "hint": "按應用自己的格式顯示這一家在檔案裡的部分，儲存後寫進這個檔案；預設模型等全域設定不在這裡。在這裡寫的註解不會儲存。",
@@ -4429,7 +4421,6 @@
       "exitTitle": "把 {{app}} 從「{{from}}」切回直連？",
       "exitLead": "{{app}} 會直接連線 {{provider}}，請求不再經過 CC Switch。",
       "exitNoteFile": "會把 {{file}} 裡的位址和金鑰改回 {{provider}} 的，其他設定不動。",
-      "exitNoteNativeSelection": "在 {{file}} 恢復各端的 {{provider}} 預設選擇；憑證與歷史保留在原位置。",
       "exitNoteRouteKept": "路由目標、故障轉移佇列和設定都會保留，下次開始路由時恢復。",
       "desktopExitNoteRouteKept": "路由目標會保留，下次開始路由時恢復。",
       "confirmDirect": "回到直連",

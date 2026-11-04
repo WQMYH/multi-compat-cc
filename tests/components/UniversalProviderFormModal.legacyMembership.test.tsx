@@ -36,7 +36,7 @@ vi.mock("@/components/ConfirmDialog", () => ({
   }) => (isOpen ? <button onClick={onConfirm}>confirm-sync</button> : null),
 }));
 
-describe("DSH-only universal provider editing", () => {
+describe("legacy universal provider membership", () => {
   it.each([false, true])(
     "preserves legacy memberships while saving (sync=%s)",
     (sync) => {
@@ -69,6 +69,7 @@ describe("DSH-only universal provider editing", () => {
         />,
       );
       expect(screen.queryByText("Qoder CN")).toBeNull();
+      expect(screen.queryByText("DSH")).toBeNull();
       fireEvent.change(screen.getByLabelText("名称"), {
         target: { value: "Renamed" },
       });

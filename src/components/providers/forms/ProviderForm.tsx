@@ -300,7 +300,7 @@ type LocalProxyRequestOverridesBuildResult = ReturnType<
 
 export interface ProviderFormProps {
   appId: AppId;
-  nativeTarget?: "dsh" | "zcode";
+  nativeTarget?: "zcode";
   providerId?: string;
   submitLabel: string;
   onSubmit: (values: ProviderFormValues) => Promise<void> | void;
@@ -1423,14 +1423,14 @@ function ProviderFormFull({
     if (nativeTarget && isCodexOfficialProvider && !codexModel.trim()) {
       toast.error(
         t(`providerForm.${nativeTarget}DefaultModelRequired`, {
-          defaultValue: `请先选择 ${nativeTarget === "zcode" ? "ZCode" : "DSH"} 默认模型`,
+          defaultValue: "请先选择 ZCode 默认模型",
         }),
       );
       return;
     }
     if (nativeTarget && isCodexOfficialProvider && !selectedCodexAccountId) {
       toast.error(
-        t("providerForm.dshManagedAccountRequired", {
+        t("providerForm.nativeManagedAccountRequired", {
           defaultValue: "请先选择 CC 已托管的 Codex 账号",
         }),
       );

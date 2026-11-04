@@ -28,8 +28,8 @@ export const APP_IDS: AppId[] = [
   "hermes",
   "pi",
   "mcode",
-  "dsh",
   "kimi",
+  "dsh",
   "agy",
   "zcode",
   "omp",
@@ -116,7 +116,7 @@ export function isProxyAppId(appId: string): appId is ProxyAppId {
  * 有直连 / 路由模式的应用（后端 `AppType::has_route_mode`）：上面四个，加上 Claude Desktop。
  * Desktop 经同一个路由服务转发，但没有故障转移和路由设置（不在 `PROXY_APP_IDS` 里）。
  */
-export type ModeAppId = ProxyAppId | "claude-desktop" | "dsh" | "zcode";
+export type ModeAppId = ProxyAppId | "claude-desktop" | "zcode";
 
 export const MODE_APP_IDS: ModeAppId[] = [
   ...PROXY_APP_IDS,
@@ -131,7 +131,7 @@ export function isModeAppId(appId: string): appId is ModeAppId {
 /** 支持 Stack 模式的应用（后端 `mode::stack::supports_stack` 的镜像）。 */
 export type StackAppId = Extract<
   ModeAppId,
-  "claude" | "codex" | "claude-desktop" | "dsh"
+  "claude" | "codex" | "claude-desktop"
 >;
 
 export const STACK_APP_IDS: StackAppId[] = [
@@ -222,13 +222,6 @@ export function usesGeminiStyleForm(appId: string): boolean {
 }
 
 export const APP_ICON_MAP: Record<AppId, AppConfig> = {
-  dsh: {
-    label: "DSH",
-    icon: <ProviderIcon icon="deepseek" name="DSH" size={14} />,
-    activeClass: "bg-blue-500/10 text-blue-600 dark:text-blue-400",
-    badgeClass:
-      "bg-blue-500/10 text-blue-700 dark:text-blue-300 border-0 gap-1.5",
-  },
   claude: {
     label: "Claude",
     icon: <ClaudeIcon size={14} />,
@@ -313,6 +306,13 @@ export const APP_ICON_MAP: Record<AppId, AppConfig> = {
       "bg-violet-500/10 ring-1 ring-violet-500/20 hover:bg-violet-500/20 text-violet-600 dark:text-violet-400",
     badgeClass:
       "bg-violet-500/10 text-violet-700 dark:text-violet-300 hover:bg-violet-500/20 border-0 gap-1.5",
+  },
+  dsh: {
+    label: "DeepSeek Harness",
+    icon: <ProviderIcon icon="deepseek" name="DeepSeek Harness" size={14} />,
+    activeClass: "bg-blue-500/10 text-blue-600 dark:text-blue-400",
+    badgeClass:
+      "bg-blue-500/10 text-blue-700 dark:text-blue-300 border-0 gap-1.5",
   },
   kimi: {
     label: "Kimi Code",

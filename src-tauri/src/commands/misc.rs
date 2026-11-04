@@ -1,8 +1,5 @@
 #![allow(non_snake_case)]
 
-#[path = "dsh_runtime.rs"]
-pub(super) mod dsh_runtime;
-
 use crate::app_config::AppType;
 use crate::init_status::{InitErrorPayload, SkillsMigrationPayload};
 use crate::services::ProviderService;
@@ -631,8 +628,8 @@ fn tool_display_name(tool: &str) -> &'static str {
         "pi" => "Pi",
         "omp" => "Oh My Pi",
         "mcode" => "MiniMax Code",
-        "dsh" => "DSH",
         "kimi" => "Kimi Code",
+        "dsh" => "DeepSeek Harness",
         "agy" => "Antigravity CLI",
         "zcode" => "ZCode",
         _ => "Unknown",
@@ -2661,17 +2658,12 @@ fn merge_path_segments_win(parts: &[&str]) -> String {
 /// 构建某工具的候选搜索目录（原生安装优先，PATH 兜底）。
 /// 单探兜底 (`scan_cli_version`) 与全量枚举 (`enumerate_tool_installations`) 共用，
 /// 确保两条路径看到的是同一组安装位置。
-pub(super) fn build_tool_search_paths(tool: &str) -> Vec<std::path::PathBuf> {
+fn build_tool_search_paths(tool: &str) -> Vec<std::path::PathBuf> {
     let home = dirs::home_dir().unwrap_or_default();
 
     // 常见的安装路径（原生安装优先）
     // Preserve search priority without scanning all previous paths for every insertion.
     let mut search_paths = IndexSet::new();
-    if tool == "dsh" {
-        for directory in dsh_runtime::desktop_cli_dirs() {
-            push_unique_path(&mut search_paths, directory);
-        }
-    }
     if tool == "kimi" {
         let install_dir = std::env::var_os("KIMI_INSTALL_DIR")
             .filter(|value| !value.is_empty())
@@ -3302,7 +3294,7 @@ pub(crate) fn login_shell_path(deadline: Option<CommandDeadline>) -> Option<Stri
 /// 用与 `try_get_version` 相同的登录 shell 解析 PATH 默认命中的可执行文件路径，
 /// canonicalize 后作为"命令行默认 / 升级目标"的锚点（与升级会作用的那处对齐）。
 #[cfg(not(target_os = "windows"))]
-pub(super) fn resolve_path_default(
+fn resolve_path_default(
     tool: &str,
     deadline: Option<CommandDeadline>,
 ) -> Result<Option<std::path::PathBuf>, String> {
@@ -3367,7 +3359,7 @@ fn windows_path_lookup_command(
 }
 
 #[cfg(target_os = "windows")]
-pub(super) fn resolve_path_default(
+fn resolve_path_default(
     tool: &str,
     deadline: Option<CommandDeadline>,
 ) -> Result<Option<std::path::PathBuf>, String> {
@@ -4337,7 +4329,7 @@ fn default_install(installs: &[ToolInstallation]) -> Option<&ToolInstallation> {
     })
 }
 
-pub(super) fn locate_default_tool(
+fn locate_default_tool(
     tool: &str,
     deadline: Option<CommandDeadline>,
 ) -> Result<std::path::PathBuf, String> {
@@ -4470,7 +4462,7 @@ pub(crate) fn terminate_child_tree(child: &mut std::process::Child) -> bool {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(super) fn isolate_child_process_group(cmd: &mut std::process::Command) {
+fn isolate_child_process_group(cmd: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
 
     // setsid 而非 process_group(0)：新会话自带新进程组（组长=自身，
@@ -4490,7 +4482,7 @@ pub(super) fn isolate_child_process_group(cmd: &mut std::process::Command) {
     }
 }
 
-pub(super) fn wait_child_output(
+fn wait_child_output(
     mut child: std::process::Child,
     deadline: Option<CommandDeadline>,
 ) -> Result<std::process::Output, String> {
@@ -4979,9 +4971,6 @@ fn resolve_update_command(tool: &str, installs: &[ToolInstallation]) -> UpdateCo
 /// 的 shim、Windows npm 的 `.cmd` 是文本脚本，都不算——它们背后可能正是 npm 全局包，
 /// 拒绝会误伤，保持旧的静态命令。
 fn is_unmanaged_native_install(inst: &ToolInstallation) -> bool {
-    if dsh_runtime::is_desktop_cli(&inst.real) {
-        return true;
-    }
     let real = inst
         .real
         .to_string_lossy()

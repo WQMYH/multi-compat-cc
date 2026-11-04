@@ -93,7 +93,6 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
     sessions.extend(r9);
     sessions.extend(mcode::scan_sessions());
     sessions.extend(kimi::scan_sessions());
-    sessions.extend(dsh::scan_sessions());
     sessions.extend(agy::scan_sessions());
     sessions.extend(dsh::scan_sessions());
 
@@ -131,7 +130,11 @@ pub fn load_messages(provider_id: &str, source_path: &str) -> Result<Vec<Session
         "pi" => pi::load_messages(path),
         "kimi" => kimi::load_messages(path),
         "omp" => omp::load_messages(path),
-        "dsh" => dsh::load_messages(path),
+        "dsh" => {
+            let (_, source) =
+                content::resolve_under_roots(provider_id, path, &dsh::session_roots())?;
+            dsh::load_messages(&source)
+        }
         _ => Err(format!("Unsupported provider: {provider_id}")),
     }
 }
@@ -310,6 +313,15 @@ where
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn dsh_message_loader_rejects_a_session_outside_its_root() {
+        let outside = tempdir().expect("outside directory");
+        let source = outside.path().join("session.v1.jsonl");
+        std::fs::write(&source, "{\"type\":\"session\"}\n").expect("write fixture");
+
+        assert!(load_messages("dsh", source.to_str().unwrap()).is_err());
+    }
 
     fn write_codex_session(path: &Path, session_id: &str) {
         std::fs::write(

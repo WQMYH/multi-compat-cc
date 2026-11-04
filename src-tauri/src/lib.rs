@@ -33,7 +33,6 @@ mod mcode_config;
 mod mcp;
 pub mod mode;
 mod model_capabilities;
-mod native_provider_config;
 mod omp_config;
 mod openclaw_config;
 mod opencode_config;
@@ -1977,8 +1976,6 @@ pub fn run() {
             commands::auth_poll_for_account,
             commands::auth_cancel_login,
             commands::auth_list_accounts,
-            commands::get_dsh_native_defaults,
-            commands::native_application_preview_mode,
             commands::auth_get_status,
             commands::auth_remove_account,
             commands::auth_set_default_account,
@@ -2467,7 +2464,6 @@ fn readonly_preview_command(command: &str) -> bool {
     matches!(
         command,
         "get_providers"
-            | "get_dsh_native_defaults"
             | "queryProviderUsage"
             | "get_current_provider"
             | "get_settings"
@@ -2493,7 +2489,6 @@ fn readonly_preview_command(command: &str) -> bool {
             | "get_app_config_dir"
             | "is_portable_mode"
             | "get_tool_versions"
-            | "native_application_preview_mode"
     )
 }
 

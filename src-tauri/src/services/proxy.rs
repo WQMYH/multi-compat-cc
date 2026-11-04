@@ -182,14 +182,13 @@ impl ProxyService {
     /// 各应用是否处于代理模式（读设备本地的模式状态，不读会随云同步的
     /// `proxy_config.enabled`）。
     pub async fn get_takeover_status(&self) -> Result<ProxyTakeoverStatus, String> {
-        let [claude, codex, gemini, grokbuild, claude_desktop, dsh, zcode] =
+        let [claude, codex, gemini, grokbuild, claude_desktop, zcode] =
             crate::mode::current::proxy_flags([
                 AppType::Claude,
                 AppType::Codex,
                 AppType::Gemini,
                 AppType::GrokBuild,
                 AppType::ClaudeDesktop,
-                AppType::Dsh,
                 AppType::ZCode,
             ]);
         Ok(ProxyTakeoverStatus {
@@ -198,7 +197,6 @@ impl ProxyService {
             gemini,
             grokbuild,
             claude_desktop,
-            dsh,
             zcode,
             // OpenCode and OpenClaw don't support proxy features
             opencode: false,
@@ -306,8 +304,6 @@ impl ProxyService {
                 Ok(config) => Self::is_grok_live_taken_over(&config),
                 Err(_) => false,
             },
-            AppType::Dsh => super::provider::dsh_direct::proxy_default_baseline()
-                .is_ok_and(|baseline| baseline.is_some()),
             _ => false,
         }
     }

@@ -39,7 +39,7 @@ export const SESSION_SOURCE_PATHS: Record<SessionAppId, string[]> = {
   pi: ["~/.pi/agent/sessions"],
   omp: ["~/.omp/agent/sessions"],
   mcode: ["~/.minimax"],
-  dsh: ["~/.dsh/sessions/<project>/<session>/session.jsonl.zstd"],
+  dsh: ["~/.dsh/sessions/<project>/<session>/session.v*.jsonl[.zstd]"],
   kimi: ["~/.kimi-code/sessions"],
   agy: [
     "~/.gemini/antigravity-cli/brain/<conversation>/.system_generated/logs",

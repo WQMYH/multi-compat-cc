@@ -169,16 +169,6 @@ function App() {
   const [activeApp, setActiveApp] = useState<AppId>(getInitialApp);
   const sharedFeatureApp = sharedFeatureAppOf(activeApp);
   const [currentView, setCurrentView] = useState<View>(readStoredView);
-  useEffect(() => {
-    void invoke<boolean>("native_application_preview_mode")
-      .then((readonly) => {
-        if (readonly) {
-          setActiveApp("dsh");
-          setCurrentView("providers");
-        }
-      })
-      .catch(() => undefined);
-  }, []);
   const [settingsSection, setSettingsSection] =
     useState<SettingsSection>("general");
   const [appConfigScrollTarget, setAppConfigScrollTarget] = useState<AppId>();

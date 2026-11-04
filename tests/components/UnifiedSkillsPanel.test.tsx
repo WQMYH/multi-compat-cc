@@ -895,7 +895,7 @@ describe("UnifiedSkillsPanel", () => {
     const dialog = screen.getByRole("dialog");
     expect(within(dialog).queryByText("Pi")).not.toBeInTheDocument();
     await userEvent.click(
-      within(dialog).getByRole("checkbox", { name: "DSH" }),
+      within(dialog).getByRole("checkbox", { name: "DeepSeek Harness" }),
     );
     await userEvent.click(
       within(dialog).getByRole("button", { name: "skillsPage.import.submit" }),

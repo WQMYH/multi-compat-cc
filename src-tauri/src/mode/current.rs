@@ -84,18 +84,6 @@ pub fn provider_for(
             }
         }
     }
-    if *app == AppType::Dsh {
-        if let Some(id) = &direct {
-            if db
-                .get_provider_by_id(id, app.as_str())?
-                .is_some_and(|provider| {
-                    crate::services::provider::dsh_direct::needs_routing(&provider)
-                })
-            {
-                return Ok(None);
-            }
-        }
-    }
     Ok(direct)
 }
 

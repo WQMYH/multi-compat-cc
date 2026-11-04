@@ -1,4 +1,6 @@
-use cc_switch_lib::{AppType, McpApps, McpServer, McpService, Provider, ProviderService};
+use cc_switch_lib::{
+    AppType, McpApps, McpServer, McpService, Provider, ProviderMeta, ProviderService,
+};
 use serde_json::json;
 use std::{ffi::OsString, fs, path::PathBuf};
 
@@ -90,6 +92,63 @@ fn dsh_provider_lifecycle_preserves_native_plugins_and_reusable_profiles() {
         .get_provider_by_id("draft", "dsh")
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn dsh_provider_listing_bootstraps_official_profiles_and_preserves_legacy_rows() {
+    use sha2::{Digest, Sha256};
+
+    let _guard = test_mutex().lock().unwrap();
+    reset_test_fs();
+    let home = DshHome::new();
+    let state = create_test_state().unwrap();
+    let mut managed = provider("official-managed");
+    managed.meta = Some(ProviderMeta {
+        live_config_managed: Some(true),
+        ..Default::default()
+    });
+    state.db.save_provider("dsh", &managed).unwrap();
+
+    let mut current = provider("native-current:web");
+    current.settings_config = json!({"nativeRef": true, "profile": "web"});
+    let inventory_id = format!(
+        "native-provider:desktop:{:x}",
+        Sha256::digest(b"deepseek-official")
+    );
+    let mut inventory = provider(&inventory_id);
+    inventory.settings_config = json!({
+        "nativeRef": true, "nativeProvider": true,
+        "profile": "desktop", "provider": "deepseek-official"
+    });
+    let mut toml = provider("legacy-toml");
+    toml.settings_config = json!({"config": "model = \"legacy-model\""});
+    for legacy in [&mut current, &mut inventory, &mut toml] {
+        legacy.meta = managed.meta.clone();
+        state.db.save_provider("dsh", legacy).unwrap();
+    }
+
+    let listed = ProviderService::list(&state, AppType::Dsh).unwrap();
+    assert_eq!(
+        listed["official-managed"]
+            .meta
+            .as_ref()
+            .unwrap()
+            .live_config_managed,
+        Some(true)
+    );
+    assert!(!listed.contains_key(&current.id));
+    assert!(!listed.contains_key(&inventory.id));
+    let profile = fs::read_to_string(home.config()).unwrap();
+    assert!(profile.contains("official-managed"));
+    for legacy in [current, inventory, toml] {
+        assert!(!profile.contains(&legacy.id));
+        let saved = state
+            .db
+            .get_provider_by_id(&legacy.id, "dsh")
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.settings_config, legacy.settings_config);
+    }
 }
 
 #[test]

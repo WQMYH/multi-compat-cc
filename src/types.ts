@@ -321,8 +321,8 @@ export interface VisibleApps {
   pi: boolean;
   mcode: boolean;
   qoder: boolean;
-  dsh: boolean;
   kimi: boolean;
+  dsh?: boolean;
   agy: boolean;
   zcode: boolean;
   omp: boolean;

@@ -234,7 +234,7 @@ export const TOOL_DISPLAY_NAMES: Record<ToolName, string> = {
   hermes: "Hermes",
   pi: "Pi",
   mcode: "MiniMax Code",
-  dsh: "DSH",
+  dsh: "DeepSeek Harness",
   kimi: "Kimi Code",
   agy: "Antigravity CLI",
   zcode: "ZCode",

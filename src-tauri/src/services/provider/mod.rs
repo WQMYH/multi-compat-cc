@@ -12,7 +12,6 @@ mod codex_editor;
 mod codex_login;
 pub(crate) mod codex_official_models;
 pub(crate) mod codex_terminal;
-pub(crate) mod dsh_direct;
 mod editor_toml;
 mod endpoints;
 mod gemini_auth;
@@ -71,6 +70,29 @@ use live::{
     remove_opencode_provider_from_live, remove_zcode_provider_from_live,
 };
 use usage::validate_usage_script;
+
+/// Identify observations saved by the retired DSH direct-mode implementation.
+pub(crate) fn is_legacy_dsh_observation(provider: &Provider) -> bool {
+    use sha2::{Digest, Sha256};
+
+    let settings = &provider.settings_config;
+    let Some(profile) = settings["profile"]
+        .as_str()
+        .filter(|profile| matches!(*profile, "desktop" | "web"))
+    else {
+        return false;
+    };
+    settings["nativeRef"] == true
+        && (provider.id == format!("native-current:{profile}")
+            || (settings["nativeProvider"] == true
+                && settings["provider"].as_str().is_some_and(|id| {
+                    provider.id
+                        == format!(
+                            "native-provider:{profile}:{:x}",
+                            Sha256::digest(id.as_bytes())
+                        )
+                })))
+}
 
 /// Codex official providers are safe to select during takeover: Codex keeps
 /// ownership of the active ChatGPT login and the proxy only forwards the
@@ -5547,7 +5569,7 @@ impl ProviderService {
             };
             let mut saved = state.db.get_all_providers(app_type.as_str())?;
             if app_type == AppType::Dsh {
-                saved.retain(|_, provider| !dsh_direct::is_native_ref(provider));
+                saved.retain(|_, provider| !is_legacy_dsh_observation(provider));
             }
             let nicknames = if app_type == AppType::Kimi {
                 crate::services::kimi_oauth::account_nicknames()

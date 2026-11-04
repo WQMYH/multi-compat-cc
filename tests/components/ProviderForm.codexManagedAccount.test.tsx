@@ -221,7 +221,7 @@ describe("ProviderForm Codex Official managed account", () => {
     expect(toastMocks.error).not.toHaveBeenCalled();
   });
 
-  it.each(["dsh", "zcode"] as const)("reuses the existing managed account chooser for %s without another login", async (appId) => {
+  it.each(["zcode"] as const)("reuses the existing managed account chooser for %s without another login", async (appId) => {
     const onSubmit = vi.fn();
     render(<QueryClientProvider client={createTestQueryClient()}>
       <ProviderForm appId={appId} submitLabel="save-provider" onSubmit={onSubmit} onCancel={vi.fn()} />
@@ -230,7 +230,7 @@ describe("ProviderForm Codex Official managed account", () => {
     {
       expect(screen.queryByRole("button", { name: "select-native-login" })).not.toBeInTheDocument();
       fireEvent.click(screen.getByRole("button", { name: "save-provider" }));
-      await waitFor(() => expect(toastMocks.error).toHaveBeenCalledWith(`请先选择 ${appId === "dsh" ? "DSH" : "ZCode"} 默认模型`));
+      await waitFor(() => expect(toastMocks.error).toHaveBeenCalledWith("请先选择 ZCode 默认模型"));
       expect(onSubmit).not.toHaveBeenCalled();
       fireEvent.change(screen.getByRole("textbox", { name: "默认模型" }), { target: { value: "gpt-6.1-sol" } });
       fireEvent.click(screen.getByRole("button", { name: "save-provider" }));
@@ -248,11 +248,11 @@ describe("ProviderForm Codex Official managed account", () => {
     }
   });
 
-  it.each(["dsh", "zcode"] as const)("repairs an existing %s managed account row with no model through the shared editor", async (appId) => {
+  it.each(["zcode"] as const)("repairs an existing %s managed account row with no model through the shared editor", async (appId) => {
     const onSubmit = vi.fn();
     render(<QueryClientProvider client={createTestQueryClient()}>
       <ProviderForm appId={appId} providerId={`existing-${appId}`} submitLabel="save-provider" onSubmit={onSubmit} onCancel={vi.fn()}
-        initialData={{ name: "Existing DSH account", category: "official", settingsConfig: { auth: {}, config: "" },
+        initialData={{ name: "Existing ZCode account", category: "official", settingsConfig: { auth: {}, config: "" },
           meta: { providerType: "codex_oauth", authBinding: { source: "managed_account", authProvider: "codex_oauth", accountId: "acct-managed" } } }} />
     </QueryClientProvider>);
     fireEvent.change(await screen.findByRole("textbox", { name: "默认模型" }), { target: { value: "gpt-6.1-sol" } });

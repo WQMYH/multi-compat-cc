@@ -285,45 +285,6 @@ describe("AppsPage concurrent CLI upgrades", () => {
       });
   });
 
-  it("detects the Desktop DSH CLI off PATH without offering npm lifecycle actions", async () => {
-    outdated.add("dsh");
-    mocks.listToolInstallations.mockImplementation(async (tools: string[]) =>
-      tools.map((tool) =>
-        report(
-          tool,
-          tool === "dsh"
-            ? {
-                unmanaged: true,
-                installs: [
-                  {
-                    path: "C:/fixture/DeepSeek Harness/resources/runtime/cli/bin/dsh.cmd",
-                    version: "0.2.1",
-                    runnable: true,
-                    error: null,
-                    source: "system",
-                    is_path_default: false,
-                  },
-                ],
-              }
-            : {},
-        ),
-      ),
-    );
-    await renderApps();
-    const dsh = card("DSH");
-    expect(
-      await dsh.findByText("provider.dshCliNotOnPath"),
-    ).toBeInTheDocument();
-    expect(
-      dsh.queryByRole("button", { name: "settings.toolUpdate" }),
-    ).toBeNull();
-    expect(
-      dsh.queryByRole("button", { name: "appPage.moreActions" }),
-    ).toBeNull();
-    expect(updateButton("Codex")).toBeEnabled();
-    expect(mocks.runToolLifecycleAction).not.toHaveBeenCalled();
-  });
-
   it("waits for Codex loading even while the check-updates label is hidden in the DOM", async () => {
     const getVersions = mocks.getToolVersions.getMockImplementation()!;
     const codexReady = deferred<void>();

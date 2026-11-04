@@ -33,7 +33,6 @@ const CLIENT_FILE: Partial<Record<AppId, string>> = {
   codex: "~/.codex/config.toml",
   gemini: "~/.gemini/.env",
   grokbuild: "~/.grok/config.toml",
-  dsh: "~/.dsh/profiles/{desktop,web}/cordis.patch.yml",
 };
 
 export type ModeDialogState =
@@ -382,8 +381,8 @@ function ExitBody({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const targetId = state.useProviderId ?? directId;
-  const target = providers.find((p) => p.id === targetId);
-  const provider = target?.name ?? t("mode.noProvider");
+  const provider =
+    providers.find((p) => p.id === targetId)?.name ?? t("mode.noProvider");
 
   // Claude Desktop 没有单个配置文件可指，也没有故障转移队列和路由设置
   const notes =
@@ -395,15 +394,10 @@ function ExitBody({
             : t("mode.dialog.desktopExitNoteRouteKept"),
         ]
       : [
-          t(
-            app === "dsh" && target?.settingsConfig.nativeRef === true
-              ? "mode.dialog.exitNoteNativeSelection"
-              : "mode.dialog.exitNoteFile",
-            {
-              file: CLIENT_FILE[app] ?? "",
-              provider,
-            },
-          ),
+          t("mode.dialog.exitNoteFile", {
+            file: CLIENT_FILE[app] ?? "",
+            provider,
+          }),
           active === "stack"
             ? t("mode.dialog.leaveStackNote")
             : t("mode.dialog.exitNoteRouteKept"),

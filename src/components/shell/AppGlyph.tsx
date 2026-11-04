@@ -15,7 +15,7 @@ export const APP_DISPLAY_NAME: Record<AppId, string> = {
   hermes: "Hermes",
   pi: "Pi",
   mcode: "MiniMax Code",
-  dsh: "DSH",
+  dsh: "DeepSeek Harness",
   kimi: "Kimi Code",
   agy: "Antigravity",
   zcode: "ZCode",

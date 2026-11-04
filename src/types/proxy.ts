@@ -44,7 +44,6 @@ export interface ProxyServerInfo {
 export interface ProxyTakeoverStatus {
   claude: boolean;
   "claude-desktop"?: boolean;
-  dsh?: boolean;
   codex: boolean;
   gemini: boolean;
   grokbuild: boolean;

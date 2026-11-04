@@ -47,7 +47,6 @@ pub const TRAY_APPS: [AppType; 5] = [
 fn app_display_name(app: &AppType) -> &'static str {
     match app {
         AppType::Claude => "Claude Code",
-        AppType::Dsh => "DSH",
         AppType::ClaudeDesktop => "Claude Desktop",
         AppType::Codex => "Codex",
         AppType::Gemini => "Gemini CLI",
@@ -58,6 +57,7 @@ fn app_display_name(app: &AppType) -> &'static str {
         AppType::Pi => "Pi",
         AppType::Mcode => "MiniMax Code",
         AppType::Kimi => "Kimi Code",
+        AppType::Dsh => "DeepSeek Harness",
         AppType::Agy => "Antigravity",
         AppType::ZCode => "ZCode",
         AppType::Omp => "Oh My Pi",

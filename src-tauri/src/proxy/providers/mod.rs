@@ -198,7 +198,7 @@ impl ProviderType {
                 }
                 ProviderType::Claude
             }
-            AppType::Codex | AppType::Dsh | AppType::ZCode => ProviderType::Codex,
+            AppType::Codex | AppType::ZCode => ProviderType::Codex,
             AppType::Gemini => {
                 // 检测是否为 CLI 模式（OAuth）
                 let adapter = GeminiAdapter::new();
@@ -217,9 +217,12 @@ impl ProviderType {
             }
             AppType::GrokBuild => ProviderType::Codex,
             AppType::OpenCode | AppType::OpenClaw | AppType::Hermes => ProviderType::Codex,
-            AppType::Pi | AppType::Mcode | AppType::Kimi | AppType::Omp | AppType::Agy => {
-                return None
-            }
+            AppType::Pi
+            | AppType::Mcode
+            | AppType::Kimi
+            | AppType::Dsh
+            | AppType::Omp
+            | AppType::Agy => return None,
         };
         Some(provider_type)
     }
@@ -271,11 +274,16 @@ impl std::str::FromStr for ProviderType {
 pub fn get_adapter(app_type: &AppType) -> Option<Box<dyn ProviderAdapter>> {
     Some(match app_type {
         AppType::Claude | AppType::ClaudeDesktop => Box::new(ClaudeAdapter::new()),
-        AppType::Codex | AppType::Dsh | AppType::ZCode => Box::new(CodexAdapter::new()),
+        AppType::Codex | AppType::ZCode => Box::new(CodexAdapter::new()),
         AppType::Gemini => Box::new(GeminiAdapter::new()),
         AppType::GrokBuild => Box::new(CodexAdapter::new()),
         AppType::OpenCode | AppType::OpenClaw | AppType::Hermes => Box::new(CodexAdapter::new()),
-        AppType::Pi | AppType::Mcode | AppType::Kimi | AppType::Omp | AppType::Agy => return None,
+        AppType::Pi
+        | AppType::Mcode
+        | AppType::Kimi
+        | AppType::Dsh
+        | AppType::Omp
+        | AppType::Agy => return None,
     })
 }
 

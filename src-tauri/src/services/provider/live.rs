@@ -915,7 +915,7 @@ pub(crate) fn initialize_dsh_profiles(state: &AppState) -> Result<(), AppError> 
         .filter(|(_, provider)| {
             // Rows from the previous direct-mode projection are kept in the
             // database, but must not be replayed as official DSH profile nodes.
-            if super::dsh_direct::is_native_ref(provider)
+            if super::is_legacy_dsh_observation(provider)
                 || (provider.settings_config["config"].is_string()
                     && provider.settings_config["api"].is_null())
             {
