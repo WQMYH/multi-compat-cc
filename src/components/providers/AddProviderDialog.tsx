@@ -71,6 +71,7 @@ export function AddProviderDialog({
     appId !== "pi" &&
     appId !== "omp" &&
     appId !== "mcode" &&
+    appId !== "dsh" &&
     appId !== "zcode" &&
     appId !== "kimi" &&
     appId !== "grokbuild" &&
@@ -90,13 +91,7 @@ export function AddProviderDialog({
     };
   }, []);
   const stepState = useMemo<PresetStepState>(
-    () => ({
-      appId: appId === "dsh" ? "codex" : appId,
-      step,
-      setStep,
-      host: pickerHost,
-      registerSelector,
-    }),
+    () => ({ appId, step, setStep, host: pickerHost, registerSelector }),
     [appId, step, pickerHost, registerSelector],
   );
   const [universalFormOpen, setUniversalFormOpen] = useState(false);
@@ -304,6 +299,7 @@ export function AddProviderDialog({
           appId === "mcode" ||
           appId === "zcode" ||
           appId === "kimi" ||
+          appId === "dsh" ||
           appId === "omp") &&
         values.providerKey
       ) {
@@ -339,7 +335,7 @@ export function AddProviderDialog({
                 preset.endpointCandidates.forEach(addUrl);
               }
             }
-          } else if (appId === "codex" || appId === "dsh") {
+          } else if (appId === "codex") {
             const presets = codexProviderPresets;
             const presetIndex = parseInt(values.presetId.replace("codex-", ""));
             if (
@@ -396,7 +392,7 @@ export function AddProviderDialog({
           if (env?.ANTHROPIC_BASE_URL) {
             addUrl(env.ANTHROPIC_BASE_URL);
           }
-        } else if (appId === "codex" || appId === "dsh") {
+        } else if (appId === "codex") {
           const config = parsedConfig.config as string | undefined;
           if (config) {
             const extractedBaseUrl = extractCodexBaseUrl(config);
@@ -596,7 +592,6 @@ export function AddProviderDialog({
           onClose={handleUniversalFormClose}
           onSave={handleUniversalProviderSave}
           initialPreset={selectedUniversalPreset}
-          targetApp={appId === "dsh" ? appId : undefined}
         />
       )}
 

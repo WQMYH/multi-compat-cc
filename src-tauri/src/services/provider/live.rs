@@ -30,6 +30,9 @@ pub(crate) fn provider_exists_in_live_config(
         AppType::Hermes => crate::hermes_config::get_providers()
             .map(|providers| providers.contains_key(provider_id)),
         AppType::Pi => crate::pi_config::pi_provider_exists(provider_id),
+        AppType::Dsh => {
+            crate::dsh_config::get_providers().map(|providers| providers.contains_key(provider_id))
+        }
         AppType::Kimi => {
             crate::kimi_config::get_providers().map(|providers| providers.contains_key(provider_id))
         }
@@ -405,10 +408,6 @@ pub(crate) fn write_live_for_state(
     provider: &Provider,
 ) -> Result<(), AppError> {
     let db = state.db.as_ref();
-    if matches!(app_type, AppType::Dsh) {
-        super::dsh_direct::reapply(db, provider)?;
-        return Ok(());
-    }
     if *app_type == AppType::ZCode
         && provider
             .settings_config
@@ -569,7 +568,7 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
                 "Claude Code configuration must be written through the key-field write flow",
             ));
         }
-        AppType::Dsh | AppType::ClaudeDesktop => {
+        AppType::ClaudeDesktop => {
             return Err(AppError::localized(
                 "claude_desktop.live.requires_db_context",
                 "Claude Desktop 配置写入需要通过供应商切换流程执行",
@@ -725,6 +724,9 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
         AppType::Hermes => {
             crate::hermes_config::set_provider(&provider.id, provider.settings_config.clone())?;
             log::debug!("Hermes provider '{}' written to live config", provider.id);
+        }
+        AppType::Dsh => {
+            crate::dsh_config::set_provider(&provider.id, provider.settings_config.clone())?
         }
         AppType::Kimi => {
             crate::kimi_config::set_provider(&provider.id, provider.settings_config.clone())?
@@ -903,6 +905,40 @@ pub(crate) fn sync_current_provider_for_app_respecting_mode(
     sync_live_for_provider_respecting_mode(state, app_type, provider, None).map(Some)
 }
 
+/// Populate newly encountered DSH profiles with managed providers and enabled MCP servers.
+/// The native writer records completion locally so later native deletions remain intentional.
+pub(crate) fn initialize_dsh_profiles(state: &AppState) -> Result<(), AppError> {
+    let providers = state
+        .db
+        .get_all_providers("dsh")?
+        .into_iter()
+        .filter(|(_, provider)| {
+            // Rows from the previous direct-mode projection are kept in the
+            // database, but must not be replayed as official DSH profile nodes.
+            if super::dsh_direct::is_native_ref(provider)
+                || (provider.settings_config["config"].is_string()
+                    && provider.settings_config["api"].is_null())
+            {
+                return false;
+            }
+            provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.live_config_managed)
+                == Some(true)
+        })
+        .map(|(id, provider)| (id, provider.settings_config))
+        .collect();
+    let servers = state
+        .db
+        .get_all_mcp_servers()?
+        .into_iter()
+        .filter(|(_, server)| server.apps.dsh)
+        .map(|(id, server)| (id, server.server))
+        .collect();
+    crate::dsh_config::initialize_profiles(&providers, &servers)
+}
+
 /// Sync current provider to live configuration
 ///
 /// 使用有效的当前供应商 ID（验证过存在性）。
@@ -912,12 +948,15 @@ pub(crate) fn sync_current_provider_for_app_respecting_mode(
 /// For additive mode apps (OpenCode), all providers are synced instead of just the current one.
 pub fn sync_current_to_live(state: &AppState) -> Result<(), AppError> {
     let mut failures = Vec::new();
+    if let Err(error) = initialize_dsh_profiles(state) {
+        failures.push(format!("provider/dsh: {error}"));
+    }
 
     // Sync providers based on mode
     for app_type in AppType::all() {
         if matches!(
             app_type,
-            AppType::Pi | AppType::Mcode | AppType::Kimi | AppType::Omp
+            AppType::Pi | AppType::Mcode | AppType::Kimi | AppType::Dsh | AppType::Omp
         ) {
             continue;
         }
@@ -945,7 +984,7 @@ pub fn sync_current_to_live(state: &AppState) -> Result<(), AppError> {
 
     // Skill sync
     for app_type in AppType::all() {
-        if matches!(app_type, AppType::ClaudeDesktop | AppType::Dsh) {
+        if matches!(app_type, AppType::ClaudeDesktop) {
             continue;
         }
         if let Err(e) = crate::services::skill::SkillService::sync_to_app(&state.db, &app_type) {
@@ -994,7 +1033,6 @@ pub fn read_live_settings(app_type: AppType) -> Result<Value, AppError> {
             }
             read_json_file(&path)
         }
-        AppType::Dsh => super::dsh_direct::read_live(),
         AppType::ClaudeDesktop => Err(AppError::localized(
             "claude_desktop.live.read_unsupported",
             "Claude Desktop 3P 配置不支持作为通用 live 配置导入，请使用“从 Claude 导入兼容供应商”。",
@@ -1079,6 +1117,7 @@ pub fn read_live_settings(app_type: AppType) -> Result<Value, AppError> {
         }
         AppType::Mcode => Ok(json!(crate::mcode_config::get_providers()?)),
         AppType::Kimi => Ok(json!(crate::kimi_config::get_providers()?)),
+        AppType::Dsh => Ok(json!(crate::dsh_config::get_providers()?)),
         AppType::Pi => Err(AppError::InvalidInput(
             "Pi providers are read from Pi's native models file".to_string(),
         )),
@@ -1138,7 +1177,6 @@ pub fn import_default_config(state: &AppState, app_type: AppType) -> Result<bool
     }
 
     let settings_config = match app_type {
-        AppType::Dsh => super::dsh_direct::read_live()?,
         AppType::Codex => crate::codex_config::read_codex_live_settings()?,
         AppType::GrokBuild => {
             let mut settings = crate::grok_config::read_grok_live_settings()?;
@@ -1225,6 +1263,7 @@ pub fn import_default_config(state: &AppState, app_type: AppType) -> Result<bool
         | AppType::Mcode
         | AppType::ZCode
         | AppType::Kimi
+        | AppType::Dsh
         | AppType::Omp => {
             unreachable!("additive mode apps are handled by early return")
         }
@@ -1298,7 +1337,7 @@ pub fn should_import_default_config_on_startup(
     state: &AppState,
     app_type: &AppType,
 ) -> Result<bool, AppError> {
-    if app_type.is_additive_mode() || matches!(app_type, AppType::Dsh) {
+    if app_type.is_additive_mode() {
         return Ok(false);
     }
 

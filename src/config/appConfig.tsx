@@ -78,7 +78,7 @@ export function orderAppIds(saved: readonly string[] | undefined): AppId[] {
 }
 
 /** App IDs shown in Skills panels. */
-export type SkillsAppId = Exclude<AppId, "claude-desktop" | "openclaw" | "dsh">;
+export type SkillsAppId = Exclude<AppId, "claude-desktop" | "openclaw">;
 export const SKILLS_APP_IDS: SkillsAppId[] = [
   "claude",
   "codex",
@@ -89,6 +89,7 @@ export const SKILLS_APP_IDS: SkillsAppId[] = [
   "pi",
   "mcode",
   "kimi",
+  "dsh",
   "agy",
   "zcode",
   "omp",
@@ -120,7 +121,6 @@ export type ModeAppId = ProxyAppId | "claude-desktop" | "dsh" | "zcode";
 export const MODE_APP_IDS: ModeAppId[] = [
   ...PROXY_APP_IDS,
   "claude-desktop",
-  "dsh",
   "zcode",
 ];
 
@@ -138,7 +138,6 @@ export const STACK_APP_IDS: StackAppId[] = [
   "claude",
   "codex",
   "claude-desktop",
-  "dsh",
 ];
 
 export function isStackAppId(appId: string): appId is StackAppId {
@@ -147,12 +146,21 @@ export function isStackAppId(appId: string): appId is StackAppId {
 
 export type AdditiveAppId = Extract<
   AppId,
-  "opencode" | "openclaw" | "hermes" | "pi" | "mcode" | "kimi" | "zcode" | "omp"
+  | "opencode"
+  | "openclaw"
+  | "hermes"
+  | "pi"
+  | "mcode"
+  | "kimi"
+  | "dsh"
+  | "zcode"
+  | "omp"
 >;
 
 export const ADDITIVE_APP_IDS: AdditiveAppId[] = [
   "mcode",
   "kimi",
+  "dsh",
   "opencode",
   "openclaw",
   "hermes",
@@ -188,7 +196,7 @@ export function usesEditorView(appId: AppId): boolean {
 }
 
 /** Claude Desktop、OpenClaw 不由 CC Switch 管理 MCP；Pi 1.0 起内置 MCP（`~/.pi/agent/mcp.json`） */
-export type McpAppId = Exclude<AppId, "claude-desktop" | "openclaw" | "dsh">;
+export type McpAppId = Exclude<AppId, "claude-desktop" | "openclaw">;
 export const MCP_APP_IDS: McpAppId[] = [
   "claude",
   "codex",
@@ -199,6 +207,7 @@ export const MCP_APP_IDS: McpAppId[] = [
   "pi",
   "mcode",
   "kimi",
+  "dsh",
   "agy",
   "zcode",
   "omp",

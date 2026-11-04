@@ -5,6 +5,7 @@ import {
   DEFAULT_VISIBLE_APPS,
   MCP_APP_IDS,
   SKILLS_APP_IDS,
+  isAdditiveAppId,
   isModeAppId,
   isStackAppId,
 } from "@/config/appConfig";
@@ -28,16 +29,17 @@ describe("native provider applications", () => {
       expect(getCurrent).toHaveBeenCalledOnce();
       expect(getCurrent).toHaveBeenCalledWith(app);
       vi.restoreAllMocks();
-      expect(MCP_APP_IDS).not.toContain(app);
-      expect(SKILLS_APP_IDS).not.toContain(app);
+      expect(MCP_APP_IDS).toContain(app);
+      expect(SKILLS_APP_IDS).toContain(app);
     },
   );
   it("keeps the existing file-backed provider query enabled", () => {
     expect(providersQueryOptions("codex").enabled).toBe(true);
   });
-  it("uses the shared mode controls for DSH", () => {
-    expect(isModeAppId("dsh")).toBe(true);
-    expect(isStackAppId("dsh")).toBe(true);
+  it("uses the shared additive provider controls for DSH", () => {
+    expect(isAdditiveAppId("dsh")).toBe(true);
+    expect(isModeAppId("dsh")).toBe(false);
+    expect(isStackAppId("dsh")).toBe(false);
     expect(APP_IDS).not.toContain("qoder");
     expect(TOOL_NAMES).not.toContain("qodercn");
     expect(TOOL_NAMES).toContain("dsh");

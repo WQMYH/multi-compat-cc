@@ -46,10 +46,10 @@ export const SESSION_SOURCE_PATHS: Record<SessionAppId, string[]> = {
   ],
 };
 
-/** MiniMax Code 的会话只能在 MiniMax Code 里删（后端也会拒绝）。 */
+/** 这些应用的会话由各自的客户端删除。 */
 export const canDeleteSession = (session: SessionMeta) =>
   Boolean(session.sourcePath) &&
-  !["mcode", "agy", "kimi"].includes(session.providerId);
+  !["mcode", "agy", "kimi", "dsh"].includes(session.providerId);
 
 export interface SessionProjectGroup {
   key: string;

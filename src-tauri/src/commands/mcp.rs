@@ -11,6 +11,31 @@ use crate::claude_mcp;
 use crate::services::McpService;
 use crate::store::AppState;
 
+/// Start a bounded, one-shot batch only while the MCP page is mounted.
+#[tauri::command]
+pub fn start_mcp_connectivity_checks(
+    state: State<'_, AppState>,
+    server_ids: Vec<String>,
+    on_result: tauri::ipc::Channel<crate::services::mcp_connectivity::ConnectivityResult>,
+) -> Result<String, String> {
+    let servers = McpService::get_all_servers(&state).map_err(|e| e.to_string())?;
+    Ok(crate::services::mcp_connectivity::start_checks(
+        // Use the page's enabled selection: app toggles update it optimistically,
+        // so the database's enablement flags can still lag behind the UI.
+        servers
+            .into_iter()
+            .filter(|(id, _)| server_ids.contains(id))
+            .map(|(_, server)| server)
+            .collect(),
+        move |result| on_result.send(result).is_ok(),
+    ))
+}
+
+#[tauri::command]
+pub fn cancel_mcp_connectivity_checks(batch_id: String) {
+    crate::services::mcp_connectivity::cancel_checks(&batch_id);
+}
+
 /// 获取 Claude MCP 状态
 #[tauri::command]
 pub async fn get_claude_mcp_status() -> Result<claude_mcp::McpStatus, String> {
@@ -80,9 +105,6 @@ pub async fn upsert_mcp_server_in_config(
     use crate::app_config::McpServer;
 
     let app_ty = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    if app_ty == AppType::Dsh {
-        return Err("DSH_MCP_UNSUPPORTED".into());
-    }
 
     // 读取现有的服务器（如果存在）
     let existing_server = {
@@ -137,12 +159,9 @@ pub async fn upsert_mcp_server_in_config(
 #[tauri::command]
 pub async fn delete_mcp_server_in_config(
     state: State<'_, AppState>,
-    _app: String, // 保留其余应用的旧兼容语义；DSH 目标仍须在任何删除前拒绝。
+    _app: String, // 参数保留用于向后兼容，但在统一结构中不再需要
     id: String,
 ) -> Result<bool, String> {
-    if matches!(AppType::from_str(&_app), Ok(AppType::Dsh)) {
-        return Err("DSH_MCP_UNSUPPORTED".into());
-    }
     McpService::delete_server(&state, &id).map_err(|e| e.to_string())
 }
 

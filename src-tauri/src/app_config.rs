@@ -49,7 +49,8 @@ impl McpApps {
             AppType::Mcode => self.mcode,
             AppType::Kimi => self.kimi,
             AppType::Pi => self.pi,
-            AppType::ClaudeDesktop | AppType::Dsh => false,
+            AppType::ClaudeDesktop => false,
+            AppType::Dsh => self.dsh,
             AppType::Omp => self.omp,
             AppType::Agy => self.agy,
             AppType::ZCode => self.zcode,
@@ -69,7 +70,8 @@ impl McpApps {
             AppType::Mcode => self.mcode = enabled,
             AppType::Kimi => self.kimi = enabled,
             AppType::Pi => self.pi = enabled,
-            AppType::ClaudeDesktop | AppType::Dsh => {} // Claude Desktop 3P provider config doesn't support MCP here
+            AppType::ClaudeDesktop => {} // Claude Desktop 3P provider config doesn't support MCP here
+            AppType::Dsh => self.dsh = enabled,
             AppType::Agy => self.agy = enabled,
             AppType::ZCode => self.zcode = enabled,
             AppType::Omp => self.omp = enabled,
@@ -100,6 +102,9 @@ impl McpApps {
         if self.kimi {
             apps.push(AppType::Kimi);
         }
+        if self.dsh {
+            apps.push(AppType::Dsh);
+        }
         if self.mcode {
             apps.push(AppType::Mcode);
         }
@@ -128,6 +133,7 @@ impl McpApps {
             && !self.hermes
             && !self.agy
             && !self.kimi
+            && !self.dsh
             && !self.mcode
             && !self.pi
             && !self.zcode
@@ -179,7 +185,8 @@ impl SkillApps {
             AppType::Pi => self.pi,
             AppType::Mcode => self.mcode,
             AppType::OpenClaw => false, // OpenClaw doesn't support Skills
-            AppType::ClaudeDesktop | AppType::Dsh => false,
+            AppType::ClaudeDesktop => false,
+            AppType::Dsh => self.dsh,
             AppType::Kimi => self.kimi,
             AppType::Agy => self.agy,
             AppType::ZCode => self.zcode,
@@ -199,7 +206,8 @@ impl SkillApps {
             AppType::Pi => self.pi = enabled,
             AppType::Mcode => self.mcode = enabled,
             AppType::OpenClaw => {} // OpenClaw doesn't support Skills, ignore
-            AppType::ClaudeDesktop | AppType::Dsh => {} // Claude Desktop 3P profiles don't use CC Switch skill sync
+            AppType::ClaudeDesktop => {} // Claude Desktop 3P profiles don't use CC Switch skill sync
+            AppType::Dsh => self.dsh = enabled,
             AppType::Kimi => self.kimi = enabled,
             AppType::Agy => self.agy = enabled,
             AppType::ZCode => self.zcode = enabled,
@@ -231,6 +239,9 @@ impl SkillApps {
         if self.kimi {
             apps.push(AppType::Kimi);
         }
+        if self.dsh {
+            apps.push(AppType::Dsh);
+        }
         if self.mcode {
             apps.push(AppType::Mcode);
         }
@@ -259,6 +270,7 @@ impl SkillApps {
             && !self.hermes
             && !self.agy
             && !self.kimi
+            && !self.dsh
             && !self.mcode
             && !self.pi
             && !self.zcode
@@ -532,6 +544,7 @@ impl AppType {
                 | AppType::Mcode
                 | AppType::ZCode
                 | AppType::Kimi
+                | AppType::Dsh
                 | AppType::Omp
         )
     }
@@ -547,8 +560,7 @@ impl AppType {
     /// 加上 Claude Desktop。Desktop 经同一个路由服务转发，但没有 `proxy_config` 行、不做故障
     /// 转移，所以不算 [`Self::supports_local_proxy`]。
     pub fn has_route_mode(&self) -> bool {
-        self.supports_local_proxy()
-            || matches!(self, AppType::ClaudeDesktop | AppType::Dsh | AppType::ZCode)
+        self.supports_local_proxy() || matches!(self, AppType::ClaudeDesktop | AppType::ZCode)
     }
 
     /// Return an iterator over all app types
@@ -1164,8 +1176,9 @@ mod tests {
     fn source11_dsh_uses_the_shared_application_and_mode_contract() {
         let app = AppType::from_str("dsh").expect("DSH must be a normal CC application");
         assert_eq!(app.as_str(), "dsh");
-        assert!(app.has_route_mode());
-        assert!(crate::mode::stack::supports_stack(&app));
+        assert!(app.is_additive_mode());
+        assert!(!app.has_route_mode());
+        assert!(!crate::mode::stack::supports_stack(&app));
         assert!(AppType::from_str("qoder").is_err());
     }
 

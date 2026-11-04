@@ -20,13 +20,6 @@ pub struct McpAppSyncOutcome {
 }
 
 impl McpService {
-    fn ensure_supported_target(app: &AppType) -> Result<(), AppError> {
-        if *app == AppType::Dsh {
-            return Err(AppError::Message("DSH_MCP_UNSUPPORTED".into()));
-        }
-        Ok(())
-    }
-
     /// 获取所有 MCP 服务器（统一结构）
     pub fn get_all_servers(state: &AppState) -> Result<IndexMap<String, McpServer>, AppError> {
         state.db.get_all_mcp_servers()
@@ -40,12 +33,6 @@ impl McpService {
             .as_ref()
             .map(|s| s.apps.clone())
             .unwrap_or_default();
-
-        // Preserve an unchanged legacy flag as metadata, but never accept a
-        // new DSH selection or treat the old flag as native write authority.
-        if server.apps.dsh != prev_apps.dsh {
-            return Err(AppError::Message("DSH_MCP_UNSUPPORTED".into()));
-        }
 
         // Keep our disabled OMP tombstone in step with edits while the checkbox is off.
         let managed_omp = server.apps.omp
@@ -72,15 +59,27 @@ impl McpService {
                 state.db.save_mcp_server(&server)
             }
         };
+        // MCode / Pi 的文件和数据库一起提交：任一步失败都恢复原样
+        let save_with_dsh = || {
+            if server.apps.dsh || prev_apps.dsh {
+                mcp::dsh::sync_and_commit(
+                    &server.id,
+                    server.apps.dsh.then_some(&server.server),
+                    save_with_omp,
+                )
+            } else {
+                save_with_omp()
+            }
+        };
         let save_with_kimi = || {
             if server.apps.kimi || prev_apps.kimi {
                 mcp::kimi::sync_and_commit(
                     &server.id,
                     server.apps.kimi.then_some(&server.server),
-                    save_with_omp,
+                    save_with_dsh,
                 )
             } else {
-                save_with_omp()
+                save_with_dsh()
             }
         };
         let save_with_agy = || {
@@ -97,6 +96,7 @@ impl McpService {
         let save_with_pi = || {
             if server.apps.pi || prev_apps.pi {
                 mcp::pi::sync_and_commit(
+                    &state.db,
                     &server.id,
                     mcp::pi::PiChange::from_enabled(server.apps.pi.then_some(&server.server)),
                     save_with_agy,
@@ -149,12 +149,18 @@ impl McpService {
         let server = state.db.get_all_mcp_servers()?.shift_remove(id);
 
         if let Some(server) = server {
-            let delete_from_db = || state.db.delete_mcp_server(id);
+            let delete_with_dsh = || {
+                if server.apps.dsh {
+                    mcp::dsh::sync_and_commit(id, None, || state.db.delete_mcp_server(id))
+                } else {
+                    state.db.delete_mcp_server(id)
+                }
+            };
             let delete_with_kimi = || {
                 if server.apps.kimi {
-                    mcp::kimi::sync_and_commit(id, None, delete_from_db)
+                    mcp::kimi::sync_and_commit(id, None, delete_with_dsh)
                 } else {
-                    delete_from_db()
+                    delete_with_dsh()
                 }
             };
             let delete_with_omp = || {
@@ -177,7 +183,12 @@ impl McpService {
             };
             let delete_with_pi = || {
                 if server.apps.pi {
-                    mcp::pi::sync_and_commit(id, mcp::pi::PiChange::Remove, delete_with_agy)
+                    mcp::pi::sync_and_commit(
+                        &state.db,
+                        id,
+                        mcp::pi::PiChange::Remove,
+                        delete_with_agy,
+                    )
                 } else {
                     delete_with_agy()
                 }
@@ -220,7 +231,6 @@ impl McpService {
         app: AppType,
         enabled: bool,
     ) -> Result<(), AppError> {
-        Self::ensure_supported_target(&app)?;
         let _guard = state.proxy_service.lock_switch_for_app(app.as_str()).await;
         Self::toggle_app(state, server_id, app, enabled)
     }
@@ -232,10 +242,14 @@ impl McpService {
         app: AppType,
         enabled: bool,
     ) -> Result<(), AppError> {
-        Self::ensure_supported_target(&app)?;
         if matches!(
             app,
-            AppType::Mcode | AppType::Kimi | AppType::Omp | AppType::Pi | AppType::Agy
+            AppType::Mcode
+                | AppType::Kimi
+                | AppType::Dsh
+                | AppType::Omp
+                | AppType::Pi
+                | AppType::Agy
         ) {
             if let Some(server) = state.db.get_all_mcp_servers()?.get(server_id) {
                 let spec = enabled.then_some(&server.server);
@@ -250,6 +264,8 @@ impl McpService {
                         mcp::agy::AgyChange::from_enabled(spec),
                         commit,
                     )?;
+                } else if app == AppType::Dsh {
+                    mcp::dsh::sync_and_commit(server_id, spec, commit)?;
                 } else if app == AppType::Kimi {
                     mcp::kimi::sync_and_commit(server_id, spec, commit)?;
                 } else if app == AppType::Mcode {
@@ -262,6 +278,7 @@ impl McpService {
                     )?;
                 } else {
                     mcp::pi::sync_and_commit(
+                        &state.db,
                         server_id,
                         mcp::pi::PiChange::from_enabled(spec),
                         commit,
@@ -357,7 +374,7 @@ impl McpService {
             }
             AppType::Mcode => mcp::mcode::sync(&server.id, Some(&server.server))?,
             AppType::Kimi => mcp::kimi::sync(&server.id, Some(&server.server))?,
-            AppType::Dsh => Self::ensure_supported_target(app)?,
+            AppType::Dsh => mcp::dsh::sync(&server.id, Some(&server.server))?,
             AppType::Pi => mcp::pi::sync(&server.id, Some(&server.server))?,
             AppType::Agy => mcp::agy::sync(&server.id, Some(&server.server))?,
             AppType::ZCode => {
@@ -418,7 +435,7 @@ impl McpService {
             }
             AppType::Mcode => mcp::mcode::sync(id, None)?,
             AppType::Kimi => mcp::kimi::sync(id, None)?,
-            AppType::Dsh => Self::ensure_supported_target(app)?,
+            AppType::Dsh => mcp::dsh::sync(id, None)?,
             AppType::Pi => mcp::pi::sync(id, None)?,
             AppType::Agy => mcp::agy::sync(id, None)?,
             AppType::ZCode => {
@@ -460,20 +477,14 @@ impl McpService {
     /// 定向重投影，避免把无关应用的失败面（如 ~/.claude.json 坏 JSON）
     /// 牵连进目标应用的关键路径。
     pub fn sync_enabled_for_app(state: &AppState, app: &AppType) -> Result<(), AppError> {
-        Self::ensure_supported_target(app)?;
         let servers = Self::get_all_servers(state)?;
         Self::project_servers_to_app(state, &servers, app)
     }
 
-    /// 由 CC Switch 管理 MCP 的应用（Claude Desktop、OpenClaw、DSH 不参与重新同步）
+    /// 由 CC Switch 管理 MCP 的应用（Claude Desktop、OpenClaw 不支持）
     pub fn live_sync_apps() -> Vec<AppType> {
         AppType::all()
-            .filter(|app| {
-                !matches!(
-                    app,
-                    AppType::OpenClaw | AppType::ClaudeDesktop | AppType::Dsh
-                )
-            })
+            .filter(|app| !matches!(app, AppType::OpenClaw | AppType::ClaudeDesktop))
             .collect()
     }
 
@@ -525,7 +536,6 @@ impl McpService {
         servers: &IndexMap<String, McpServer>,
         app: &AppType,
     ) -> Result<(), AppError> {
-        Self::ensure_supported_target(app)?;
         if matches!(app, AppType::OpenClaw | AppType::ClaudeDesktop) {
             return Ok(());
         }
@@ -612,7 +622,6 @@ impl McpService {
     /// [已废弃] 同步启用的 MCP 到指定应用（兼容旧 API）
     #[deprecated(since = "3.7.0", note = "Use sync_all_enabled instead")]
     pub fn sync_enabled(state: &AppState, app: AppType) -> Result<(), AppError> {
-        Self::ensure_supported_target(&app)?;
         let servers = Self::get_all_servers(state)?;
 
         for server in servers.values() {
@@ -905,6 +914,7 @@ impl McpService {
             ("hermes", Self::import_from_hermes(state)),
             ("mcode", mcp::mcode::import(state)),
             ("kimi", mcp::kimi::import(state)),
+            ("dsh", mcp::dsh::import(state)),
             ("agy", mcp::agy::import(state)),
             ("pi", mcp::pi::import(state)),
             ("zcode", Self::import_from_zcode(state)),

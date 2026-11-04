@@ -22,26 +22,52 @@ const COPILOT_UNIT_PREMIUM: &str = "requests";
 
 /// 获取所有供应商
 #[tauri::command]
-pub fn get_providers(
+pub async fn get_providers(
     state: State<'_, AppState>,
     app: String,
 ) -> Result<IndexMap<String, Provider>, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    if crate::readonly_provider_preview() {
-        return state.db.get_all_providers(&app).map_err(|e| e.to_string());
-    }
-    ProviderService::list(state.inner(), app_type).map_err(|e| e.to_string())
+    // 启动会话同步也使用同一个数据库连接，等待它的锁不能占住 UI 线程。
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if crate::readonly_provider_preview() {
+            let mut providers = state
+                .db
+                .get_all_providers(&app)
+                .map_err(|e| e.to_string())?;
+            if app_type == AppType::Dsh {
+                providers.retain(|_, provider| {
+                    !crate::services::provider::dsh_direct::is_native_ref(provider)
+                });
+            }
+            return Ok(providers);
+        }
+        ProviderService::list(&state, app_type).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("读取供应商列表任务失败: {e}"))?
 }
 
 #[tauri::command]
-pub fn get_current_provider(state: State<'_, AppState>, app: String) -> Result<String, String> {
+pub async fn get_current_provider(
+    state: State<'_, AppState>,
+    app: String,
+) -> Result<String, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    if crate::readonly_provider_preview() {
-        return crate::mode::current::stored_direct_pointer(&state.db, &app)
-            .map(|id| id.unwrap_or_default())
-            .map_err(|e| e.to_string());
-    }
-    ProviderService::current(state.inner(), app_type).map_err(|e| e.to_string())
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if crate::readonly_provider_preview() {
+            if app_type == AppType::Dsh {
+                return Ok(String::new());
+            }
+            return crate::mode::current::stored_direct_pointer(&state.db, &app)
+                .map(|id| id.unwrap_or_default())
+                .map_err(|e| e.to_string());
+        }
+        ProviderService::current(&state, app_type).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("读取当前供应商任务失败: {e}"))?
 }
 
 #[tauri::command]
@@ -51,20 +77,11 @@ pub async fn get_dsh_native_defaults(
 ) -> Result<Vec<Provider>, String> {
     let db = state.db.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let baseline = crate::services::provider::dsh_direct::native_default_baseline()
-            .map_err(|e| e.to_string())?;
-        let rows = if inventory.unwrap_or(false) {
-            read_dsh_native_providers(&db, baseline)?
+        if inventory.unwrap_or(false) {
+            read_dsh_native_providers(&db, None)
         } else {
-            read_dsh_native_defaults(baseline)?
-        };
-        let (native, observed): (Vec<_>, Vec<_>) = rows
-            .into_iter()
-            .partition(|row| row.settings_config.get("nativeObservedProfile").is_none());
-        let mut result = crate::services::provider::dsh_direct::register_native_refs(&db, native)
-            .map_err(|e| e.to_string())?;
-        result.extend(observed);
-        Ok(result)
+            read_dsh_native_defaults(None)
+        }
     })
     .await
     .map_err(|_| "DSH_NATIVE_DEFAULTS_TASK_FAILED".to_string())?
@@ -86,10 +103,14 @@ pub(crate) fn read_dsh_native_providers(
         .values()
         .filter(|provider| !crate::services::provider::dsh_direct::is_native_ref(provider))
         .map(|provider| {
-            (
-                crate::services::provider::dsh_direct::id_for(&provider.id),
-                serde_json::json!(provider.id),
-            )
+            let native_id = if provider.settings_config["config"].is_string()
+                && provider.settings_config["api"].is_null()
+            {
+                crate::services::provider::dsh_direct::id_for(&provider.id)
+            } else {
+                provider.id.clone()
+            };
+            (native_id, serde_json::json!(provider.id))
         })
         .collect();
     let mut rows: Vec<Provider> =
@@ -153,7 +174,7 @@ fn read_dsh_native_response(
         std::time::Duration::from_secs(if provider_id.is_some() { 25 } else { 10 }),
     ));
     let runtime = super::misc::dsh_runtime::resolve(deadline)?;
-    let home = crate::services::provider::dsh_direct::root().map_err(|e| e.to_string())?;
+    let home = crate::dsh_config::data_dir();
     let mut command = runtime.command();
     command.args(["--permission", "--allow-fs-read=*"]);
     let mode = if provider_id.is_some() {
@@ -350,39 +371,54 @@ pub async fn get_provider_editor_view(
 }
 
 #[tauri::command]
-pub fn delete_provider(
+pub async fn delete_provider(
     state: State<'_, AppState>,
     app: String,
     id: String,
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    ProviderService::delete(state.inner(), app_type, &id)
-        .map(|_| true)
-        .map_err(|e| e.to_string())
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        ProviderService::delete(&state, app_type, &id)
+            .map(|_| true)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("供应商删除任务失败: {e}"))?
 }
 
 #[tauri::command]
-pub fn add_provider_to_live_config(
+pub async fn add_provider_to_live_config(
     state: tauri::State<'_, AppState>,
     app: String,
     id: String,
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    ProviderService::add_to_live_config(state.inner(), app_type, &id)
-        .map(|_| true)
-        .map_err(|e| e.to_string())
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        ProviderService::add_to_live_config(&state, app_type, &id)
+            .map(|_| true)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("供应商添加到应用任务失败: {e}"))?
 }
 
 #[tauri::command]
-pub fn remove_provider_from_live_config(
+pub async fn remove_provider_from_live_config(
     state: tauri::State<'_, AppState>,
     app: String,
     id: String,
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    ProviderService::remove_from_live_config(state.inner(), app_type, &id)
-        .map(|_| true)
-        .map_err(|e| e.to_string())
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        ProviderService::remove_from_live_config(&state, app_type, &id)
+            .map(|_| true)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("供应商从应用移除任务失败: {e}"))?
 }
 
 fn switch_provider_internal(
@@ -844,9 +880,7 @@ async fn query_provider_usage_inner(
     if app_type == AppType::Dsh && provider_id.starts_with("native-current:") {
         let provider_id = provider_id.to_owned();
         return tauri::async_runtime::spawn_blocking(move || {
-            let baseline = crate::services::provider::dsh_direct::native_default_baseline()
-                .map_err(|e| e.to_string())?;
-            dsh_native_balance_result(read_dsh_native_response(baseline, Some(&provider_id), None))
+            dsh_native_balance_result(read_dsh_native_response(None, Some(&provider_id), None))
         })
         .await
         .map_err(|_| "DSH_NATIVE_BALANCE_TASK_FAILED".to_string())?;

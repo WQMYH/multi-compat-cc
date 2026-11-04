@@ -521,36 +521,6 @@ export const hermesProviderPresets: HermesProviderPreset[] = [
     icon: "grooroute",
   },
   {
-    name: "DIT.ai",
-    websiteUrl: "https://dit.ai",
-    apiKeyUrl: "https://dit.ai?utm_source=ccswitch",
-    settingsConfig: {
-      name: "dit_ai",
-      base_url: "https://api.dit.ai",
-      api_key: "",
-      api_mode: "anthropic_messages",
-      models: [
-        {
-          id: "claude-opus-5-5",
-          name: "Claude Opus 5.5",
-          context_length: 1000000,
-        },
-        {
-          id: "claude-sonnet-5-5",
-          name: "Claude Sonnet 5.5",
-          context_length: 1000000,
-        },
-      ],
-    },
-    category: "aggregator",
-    suggestedDefaults: {
-      model: { default: "claude-opus-5-5", provider: "dit_ai" },
-    },
-    isPartner: true,
-    partnerPromotionKey: "dit",
-    icon: "dit",
-  },
-  {
     name: "BuyToken",
     websiteUrl: "https://buytoken.work",
     apiKeyUrl: "https://buytoken.work/sign-up?aff=cc-switch",
@@ -814,6 +784,41 @@ export const hermesProviderPresets: HermesProviderPreset[] = [
     suggestedDefaults: {
       model: { default: "gpt-6.1-sol", provider: "subrouter" },
     },
+  },
+  {
+    name: "OspreyAI",
+    websiteUrl: "https://open.ospreyai.cn",
+    apiKeyUrl: "https://open.ospreyai.cn",
+    settingsConfig: {
+      name: "ospreyai",
+      base_url: "https://open.ospreyai.cn",
+      api_key: "",
+      api_mode: "anthropic_messages",
+      models: [
+        {
+          id: "claude-opus-5-5",
+          name: "Claude Opus 5.5",
+          context_length: 1000000,
+        },
+        {
+          id: "claude-sonnet-5-5",
+          name: "Claude Sonnet 5.5",
+          context_length: 1000000,
+        },
+        {
+          id: "claude-fable-5-1",
+          name: "Claude Fable 5.1",
+          context_length: 1000000,
+        },
+      ],
+    },
+    category: "aggregator",
+    suggestedDefaults: {
+      model: { default: "claude-opus-5-5", provider: "ospreyai" },
+    },
+    isPartner: true,
+    partnerPromotionKey: "ospreyai",
+    icon: "ospreyai",
   },
   {
     name: "Shengsuanyun",
@@ -1327,11 +1332,11 @@ export const hermesProviderPresets: HermesProviderPreset[] = [
   },
   {
     name: "A6API",
-    websiteUrl: "https://www.a6api.com",
-    apiKeyUrl: "https://a6api.com/register?aff=AqNr",
+    websiteUrl: "https://www.a6api.vip",
+    apiKeyUrl: "https://a6api.vip/register?aff=AqNr",
     settingsConfig: {
       name: "a6api",
-      base_url: "https://api.a6api.com/v1",
+      base_url: "https://api.a6api.vip/v1",
       api_key: "",
       api_mode: "chat_completions",
       models: [
@@ -2365,7 +2370,7 @@ export const hermesProviderPresets: HermesProviderPreset[] = [
       "https://platform.qianwenai.com/home/api-keys?utm_content=g_20000002972",
     settingsConfig: {
       name: "qianwenai",
-      base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      base_url: "https://maas.qianwenaiapi.com/compatible-mode/v1",
       api_key: "",
       api_mode: "chat_completions",
       models: [
@@ -2415,8 +2420,7 @@ export const hermesProviderPresets: HermesProviderPreset[] = [
       "https://platform.qianwenai.com/home/api-keys?utm_content=g_20000002978",
     settingsConfig: {
       name: "qianwenai_token_plan",
-      base_url:
-        "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
+      base_url: "https://token-plan.maas.qianwenaiapi.com/apps/anthropic",
       api_key: "",
       api_mode: "anthropic_messages",
       models: [
@@ -2443,7 +2447,7 @@ export const hermesProviderPresets: HermesProviderPreset[] = [
     apiKeyUrl: "https://home.qwencloud.com/api-keys?utm_content=g_20000002975",
     settingsConfig: {
       name: "qwencloud",
-      base_url: "https://dashscope-intl.aliyuncs.com/apps/anthropic",
+      base_url: "https://ap-southeast-1.maas.qwencloudapi.com/apps/anthropic",
       api_key: "",
       api_mode: "anthropic_messages",
       models: [
@@ -2496,8 +2500,7 @@ export const hermesProviderPresets: HermesProviderPreset[] = [
     apiKeyUrl: "https://home.qwencloud.com/api-keys?utm_content=g_20000002981",
     settingsConfig: {
       name: "qwencloud_token_plan",
-      base_url:
-        "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
+      base_url: "https://token-plan.maas.qwencloudapi.com/apps/anthropic",
       api_key: "",
       api_mode: "anthropic_messages",
       models: [
@@ -2580,7 +2583,8 @@ export const hermesProviderPresets: HermesProviderPreset[] = [
     family: "streamlake",
     regionKey: "cn",
     websiteUrl: "https://www.streamlake.com",
-    apiKeyUrl: "https://console.streamlake.com/console/wanqing/api-key",
+    apiKeyUrl:
+      "https://console.streamlake.com/console/wanqing/api-key?channel=ccswitch",
     settingsConfig: {
       name: "streamlake",
       base_url:
@@ -2600,7 +2604,7 @@ export const hermesProviderPresets: HermesProviderPreset[] = [
     family: "streamlake",
     regionKey: "intl",
     websiteUrl: "https://console.streamlake.ai",
-    apiKeyUrl: "https://console.streamlake.ai/console/api-key",
+    apiKeyUrl: "https://console.streamlake.ai/console/api-key?channel=ccswitch",
     settingsConfig: {
       name: "streamlake_en",
       base_url:
@@ -3981,11 +3985,11 @@ export const hermesProviderPresets: HermesProviderPreset[] = [
   },
   {
     name: "TokenFlux",
-    websiteUrl: "https://tokenflux.dev",
-    apiKeyUrl: "https://tokenflux.dev/keys",
+    websiteUrl: "https://tokenflux.com",
+    apiKeyUrl: "https://tokenflux.com/keys",
     settingsConfig: {
       name: "tokenflux",
-      base_url: "https://tokenflux.dev",
+      base_url: "https://tokenflux.com",
       api_key: "",
       api_mode: "anthropic_messages",
       models: [

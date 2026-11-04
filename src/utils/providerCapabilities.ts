@@ -129,7 +129,7 @@ export function supportsConnectivityCheck(
   appId: AppId,
   provider: Pick<Provider, "category">,
 ): boolean {
-  if (appId === "mcode" || appId === "kimi") return false;
+  if (appId === "mcode" || appId === "dsh" || appId === "kimi") return false;
   return (
     provider.category !== "official" &&
     provider.category !== "omo" &&
@@ -142,7 +142,7 @@ export function supportsOfficialProxyTakeover(
   appId: AppId,
   provider: Pick<Provider, "id" | "category" | "meta" | "settingsConfig">,
 ): boolean {
-  if (appId === "dsh" || appId === "zcode") {
+  if (appId === "zcode") {
     return Boolean(
       resolveManagedAccountId(provider.meta, "codex_oauth")?.trim(),
     );
@@ -175,7 +175,7 @@ export function providerNeedsRouting(
   appId: AppId,
   provider: Provider,
 ): boolean {
-  if (appId === "dsh" || appId === "zcode") {
+  if (appId === "zcode") {
     return (
       Boolean(resolveManagedAccountId(provider.meta, "codex_oauth")?.trim()) ||
       isOAuthProviderType(provider.meta?.providerType) ||

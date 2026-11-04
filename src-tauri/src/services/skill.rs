@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::timeout;
 
 use crate::app_config::{AppType, InstalledSkill, SkillApps, UnmanagedSkill};
@@ -576,7 +576,17 @@ fn parse_agents_lock() -> HashMap<String, LockRepoInfo> {
 pub struct SkillService {
     #[cfg(test)]
     repo_fixture: Option<PathBuf>,
+    /// 发现结果按仓库缓存（键是 owner/name/branch），只存读成功的仓库。
+    /// 发现要把每个仓库的归档整包下下来，添加、启用仓库或导入后的重拉不该把
+    /// 没变的仓库再下一遍；手动刷新会绕过它（`force_refresh`）。
+    discovery_cache: Mutex<HashMap<RepoCacheKey, (Instant, Vec<DiscoverableSkill>)>>,
 }
+
+/// owner / name / branch（branch 是配置值，不是解析后的分支）
+type RepoCacheKey = (String, String, String);
+
+/// 发现缓存的有效期：GitHub 归档本身也有几分钟的 CDN 缓存，再短意义不大
+const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 
 impl Default for SkillService {
     fn default() -> Self {
@@ -589,6 +599,7 @@ impl SkillService {
         Self {
             #[cfg(test)]
             repo_fixture: None,
+            discovery_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -631,10 +642,9 @@ impl SkillService {
 
     // ========== 路径管理 ==========
 
-    // Keep unsupported targets outside every file/DB mutation and directory
-    // discovery path. Persisted DSH flags remain serialization-only metadata.
+    // Claude Desktop has no Skills directory managed by CC Switch.
     fn ensure_skill_app_supported(app: &AppType) -> Result<()> {
-        if matches!(app, AppType::ClaudeDesktop | AppType::Dsh) {
+        if *app == AppType::ClaudeDesktop {
             return Err(anyhow!("Skills are not supported for {}", app.as_str()));
         }
         Ok(())
@@ -804,7 +814,7 @@ impl SkillService {
 
     fn validate_skill_storage_destination(ssot_dir: &Path) -> Result<()> {
         for app in AppType::all() {
-            if matches!(app, AppType::ClaudeDesktop | AppType::Dsh) {
+            if matches!(app, AppType::ClaudeDesktop) {
                 continue;
             }
             let app_dir = Self::get_app_skills_dir(&app)?;
@@ -1099,7 +1109,7 @@ impl SkillService {
                     let ssot_dir = Self::get_ssot_dir()?;
                     let source = ssot_dir.join(&directory);
                     let mut managed_destinations = Vec::new();
-                    for app in [AppType::Mcode, AppType::Agy, AppType::Kimi] {
+                    for app in [AppType::Mcode, AppType::Agy, AppType::Kimi, AppType::Dsh] {
                         if skill.apps.is_enabled_for(&app) {
                             let destination = Self::get_distinct_app_skills_dir(&ssot_dir, &app)?
                                 .join(&directory);
@@ -1667,6 +1677,7 @@ impl SkillService {
             AppType::Mcode,
             AppType::Agy,
             AppType::Kimi,
+            AppType::Dsh,
             AppType::Omp,
         ] {
             if skill.apps.is_enabled_for(&app) {
@@ -1683,9 +1694,7 @@ impl SkillService {
         // 备份旧文件
         let _ = Self::create_uninstall_backup(&skill);
 
-        // A persisted DSH flag is compatibility metadata, never a native
-        // deployment target or a reason to skip replacing the SSOT copy.
-        if !(skill.apps.mcode || skill.apps.agy || skill.apps.kimi) {
+        if !(skill.apps.mcode || skill.apps.agy || skill.apps.kimi || skill.apps.dsh) {
             if dest.exists() {
                 fs::remove_dir_all(&dest)?;
             }
@@ -1693,11 +1702,12 @@ impl SkillService {
         }
 
         // 计算新哈希 + 解析新元数据
-        let metadata_source = if skill.apps.mcode || skill.apps.agy || skill.apps.kimi {
-            &source
-        } else {
-            &dest
-        };
+        let metadata_source =
+            if skill.apps.mcode || skill.apps.agy || skill.apps.kimi || skill.apps.dsh {
+                &source
+            } else {
+                &dest
+            };
         let new_hash = Self::compute_dir_hash(metadata_source).ok();
         let skill_md = metadata_source.join("SKILL.md");
         let (new_name, new_description) = Self::read_skill_name_desc(&skill_md, &skill.directory);
@@ -1725,35 +1735,38 @@ impl SkillService {
             updated_at: chrono::Utc::now().timestamp(),
         };
 
-        let mut updated_skill = if skill.apps.mcode || skill.apps.agy || skill.apps.kimi {
-            Self::update_managed_skill_files(
-                &source,
-                &dest,
-                &skill.directory,
-                &deployments,
-                &[AppType::Mcode, AppType::Agy, AppType::Kimi]
-                    .iter()
-                    .filter(|app| skill.apps.is_enabled_for(app))
-                    .map(|app| Self::get_app_skills_dir(app).map(|dir| dir.join(&skill.directory)))
-                    .collect::<Result<Vec<_>>>()?,
-                || {
-                    if !db.update_skill_metadata(&updated_metadata)? {
-                        return Err(anyhow!("Skill no longer installed: {}", skill.id));
-                    }
-                    Ok(updated_metadata)
-                },
-            )?
-        } else {
-            for (destination, deployment) in deployments {
-                Self::refresh_pi_skill_destination(
+        let mut updated_skill =
+            if skill.apps.mcode || skill.apps.agy || skill.apps.kimi || skill.apps.dsh {
+                Self::update_managed_skill_files(
+                    &source,
                     &dest,
-                    &destination,
-                    &updated_metadata.directory,
-                    &deployment,
-                )?;
-            }
-            Self::persist_updated_skill_metadata(db, &updated_metadata)?
-        };
+                    &skill.directory,
+                    &deployments,
+                    &[AppType::Mcode, AppType::Agy, AppType::Kimi, AppType::Dsh]
+                        .iter()
+                        .filter(|app| skill.apps.is_enabled_for(app))
+                        .map(|app| {
+                            Self::get_app_skills_dir(app).map(|dir| dir.join(&skill.directory))
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                    || {
+                        if !db.update_skill_metadata(&updated_metadata)? {
+                            return Err(anyhow!("Skill no longer installed: {}", skill.id));
+                        }
+                        Ok(updated_metadata)
+                    },
+                )?
+            } else {
+                for (destination, deployment) in deployments {
+                    Self::refresh_pi_skill_destination(
+                        &dest,
+                        &destination,
+                        &updated_metadata.directory,
+                        &deployment,
+                    )?;
+                }
+                Self::persist_updated_skill_metadata(db, &updated_metadata)?
+            };
         updated_skill.apps.pi = Self::skill_exists_in_app(&updated_skill.directory, &AppType::Pi);
         updated_skill.apps.omp = Self::skill_exists_in_app(&updated_skill.directory, &AppType::Omp);
 
@@ -1997,7 +2010,7 @@ impl SkillService {
                     .ok()
                     .flatten()
             };
-            for app in [AppType::Mcode, AppType::Agy, AppType::Kimi] {
+            for app in [AppType::Mcode, AppType::Agy, AppType::Kimi, AppType::Dsh] {
                 if skill.apps.is_enabled_for(&app) {
                     let destination = Self::get_app_skills_dir(&app)?.join(&directory);
                     if let Some(deployment) =
@@ -2228,7 +2241,7 @@ impl SkillService {
             .get_installed_skill(id)?
             .ok_or_else(|| anyhow!("Skill not found: {id}"))?;
 
-        if matches!(app, AppType::Agy | AppType::Kimi) {
+        if matches!(app, AppType::Agy | AppType::Kimi | AppType::Dsh) {
             if !enabled && !skill.apps.is_enabled_for(app) {
                 return Ok(());
             }
@@ -2441,7 +2454,7 @@ impl SkillService {
 
             // An explicitly imported MCode link must point at the managed copy
             // so subsequent toggles and updates can verify its ownership.
-            for app in [AppType::Mcode, AppType::Agy, AppType::Kimi] {
+            for app in [AppType::Mcode, AppType::Agy, AppType::Kimi, AppType::Dsh] {
                 if apps.is_enabled_for(&app) {
                     let projection = (|| -> Result<()> {
                         let native =
@@ -2963,7 +2976,7 @@ impl SkillService {
         app: &AppType,
         preserved_paths: &[PathBuf],
     ) -> Result<()> {
-        if matches!(app, AppType::ClaudeDesktop | AppType::Dsh) {
+        if matches!(app, AppType::ClaudeDesktop) {
             return Ok(());
         }
 
@@ -3010,19 +3023,19 @@ impl SkillService {
         Self::sync_to_app_unlocked(db, app).map(|_| ())
     }
 
-    /// Skills 不由 `sync_to_app` 投影的应用：Claude Desktop、DSH、OpenClaw 不支持 Skills，
+    /// Skills 不由 `sync_to_app` 投影的应用：Claude Desktop、OpenClaw 不支持 Skills，
     /// Pi 没有数据库列、按目录是否存在现算。这些应用的 skills 目录不归 CC Switch 管，
     /// 同步时一个字节都不能碰——OpenClaw 自己的 `~/.openclaw/skills` 里和受管
     /// Skill 同名的真实目录，否则会被当成「已关掉的投影」删掉。
     fn is_sync_managed_app(app: &AppType) -> bool {
         !matches!(
             app,
-            AppType::ClaudeDesktop | AppType::Dsh | AppType::OpenClaw | AppType::Pi | AppType::Omp
+            AppType::ClaudeDesktop | AppType::OpenClaw | AppType::Pi | AppType::Omp
         )
     }
 
     /// 「立即重新同步」：按数据库里的开关和当前同步方式，把 Skill 重新投影到各应用目录，
-    /// 逐应用报告结果（Claude Desktop、DSH、OpenClaw、Pi、Omp 不由这里同步，不在结果里）。
+    /// 逐应用报告结果（Claude Desktop、OpenClaw、Pi、Omp 不由这里同步，不在结果里）。
     pub fn resync_all_apps(db: &Arc<Database>) -> Vec<SkillAppSyncOutcome> {
         let _state_guard = skill_state_read_guard();
         AppType::all()
@@ -3120,13 +3133,16 @@ impl SkillService {
         &self,
         repos: Vec<SkillRepo>,
     ) -> Result<Vec<DiscoverableSkill>> {
-        Ok(self.discover_available_report(repos).await?.skills)
+        Ok(self.discover_available_report(repos, false).await?.skills)
     }
 
     /// 发现可安装的 Skill，并逐仓库报告没读到的仓库（停用的仓库不读也不报）。
+    ///
+    /// `force_refresh` 为 false 时，有效期内的仓库直接用缓存，不重新下载。
     pub async fn discover_available_report(
         &self,
         repos: Vec<SkillRepo>,
+        force_refresh: bool,
     ) -> Result<SkillDiscoveryResult> {
         let mut skills = Vec::new();
         let mut failures = Vec::new();
@@ -3136,7 +3152,7 @@ impl SkillService {
 
         let fetch_tasks = enabled_repos
             .iter()
-            .map(|repo| self.fetch_repo_skills(repo));
+            .map(|repo| self.fetch_repo_skills_cached(repo, force_refresh));
 
         let results: Vec<Result<Vec<DiscoverableSkill>>> =
             futures::future::join_all(fetch_tasks).await;
@@ -3222,6 +3238,71 @@ impl SkillService {
 
         skills.sort_by_key(|skill| skill.name.to_lowercase());
 
+        Ok(skills)
+    }
+
+    /// 只发现一个仓库（添加、重新启用仓库时用），不碰其它仓库。
+    pub async fn discover_repo(&self, repo: &SkillRepo) -> SkillDiscoveryResult {
+        if !repo.enabled {
+            return SkillDiscoveryResult::default();
+        }
+        match self.fetch_repo_skills_cached(repo, false).await {
+            Ok(mut skills) => {
+                Self::deduplicate_discoverable_skills(&mut skills);
+                skills.sort_by_key(|skill| skill.name.to_lowercase());
+                SkillDiscoveryResult {
+                    skills,
+                    failures: Vec::new(),
+                }
+            }
+            Err(e) => {
+                log::warn!("获取仓库 {}/{} 技能失败: {}", repo.owner, repo.name, e);
+                SkillDiscoveryResult {
+                    skills: Vec::new(),
+                    failures: vec![Self::repo_failure(repo, e.to_string())],
+                }
+            }
+        }
+    }
+
+    fn discovery_cache_key(repo: &SkillRepo) -> RepoCacheKey {
+        (repo.owner.clone(), repo.name.clone(), repo.branch.clone())
+    }
+
+    /// 先查缓存，过期或 `force_refresh` 时再下载；下载成功才写回缓存。
+    ///
+    /// 缓存时间记的是开始下载的时刻：前端取消请求停不掉这里的下载，较早开始、
+    /// 较晚结束的旧下载不能覆盖之后（比如强制刷新）写入的结果。
+    async fn fetch_repo_skills_cached(
+        &self,
+        repo: &SkillRepo,
+        force_refresh: bool,
+    ) -> Result<Vec<DiscoverableSkill>> {
+        let key = Self::discovery_cache_key(repo);
+        if !force_refresh {
+            let cache = self
+                .discovery_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some((fetched_at, skills)) = cache.get(&key) {
+                if fetched_at.elapsed() < DISCOVERY_CACHE_TTL {
+                    return Ok(skills.clone());
+                }
+            }
+        }
+
+        let started_at = Instant::now();
+        let skills = self.fetch_repo_skills(repo).await?;
+        let mut cache = self
+            .discovery_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if cache
+            .get(&key)
+            .is_none_or(|(fetched_at, _)| *fetched_at <= started_at)
+        {
+            cache.insert(key, (started_at, skills.clone()));
+        }
         Ok(skills)
     }
 
@@ -5897,75 +5978,66 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn unsupported_skill_targets_preserve_native_files_and_database_flags() {
-        for app in [AppType::Dsh, AppType::ClaudeDesktop] {
-            let temp = tempdir().unwrap();
-            let home = TestHomeGuard::set(temp.path());
-            let _location = StorageLocationGuard::set(&home, SkillStorageLocation::CcSwitch);
-            let db = Arc::new(Database::memory().unwrap());
-            let mut skill = poisoned_skill("local:test-skill", "test-skill");
-            // Exercise a legacy persisted true flag; the public capability
-            // getter intentionally returns false for this unsupported target.
-            skill.apps.dsh = true;
-            skill.apps.claude = true;
-            db.save_skill(&skill).unwrap();
-            let before = serde_json::to_value(db.get_installed_skill(&skill.id).unwrap()).unwrap();
-            let source = SkillService::get_ssot_dir().unwrap().join(&skill.directory);
-            write_skill(&source, "managed");
-            fs::write(source.join("payload.bin"), [0, 1, 255, 42]).unwrap();
-            let native_root = match app {
-                AppType::Dsh => crate::dsh_config::data_dir().join("skills"),
-                AppType::ClaudeDesktop => temp.path().join(".claude-desktop/skills"),
-                _ => unreachable!(),
-            };
-            let native = native_root.join(&skill.directory);
-            // Identical copies reproduce the old staging bug: ownership
-            // validation succeeds, so only the unsupported-app guard protects it.
-            SkillService::copy_dir_recursive(&source, &native).unwrap();
-            let manifest = fs::read(native.join("SKILL.md")).unwrap();
-            let payload = fs::read(native.join("payload.bin")).unwrap();
-            let mut entries_before: Vec<_> = fs::read_dir(&native_root)
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name())
-                .collect();
-            entries_before.sort();
+    fn unsupported_claude_desktop_skill_target_preserves_files_and_flags() {
+        let app = AppType::ClaudeDesktop;
+        let temp = tempdir().unwrap();
+        let home = TestHomeGuard::set(temp.path());
+        let _location = StorageLocationGuard::set(&home, SkillStorageLocation::CcSwitch);
+        let db = Arc::new(Database::memory().unwrap());
+        let mut skill = poisoned_skill("local:test-skill", "test-skill");
+        skill.apps.claude = true;
+        db.save_skill(&skill).unwrap();
+        let before = serde_json::to_value(db.get_installed_skill(&skill.id).unwrap()).unwrap();
+        let source = SkillService::get_ssot_dir().unwrap().join(&skill.directory);
+        write_skill(&source, "managed");
+        fs::write(source.join("payload.bin"), [0, 1, 255, 42]).unwrap();
+        let native_root = temp.path().join(".claude-desktop/skills");
+        let native = native_root.join(&skill.directory);
+        // Identical copies reproduce the old staging bug: ownership
+        // validation succeeds, so only the unsupported-app guard protects it.
+        SkillService::copy_dir_recursive(&source, &native).unwrap();
+        let manifest = fs::read(native.join("SKILL.md")).unwrap();
+        let payload = fs::read(native.join("payload.bin")).unwrap();
+        let mut entries_before: Vec<_> = fs::read_dir(&native_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        entries_before.sort();
 
-            for enabled in [true, false] {
-                let error = SkillService::toggle_app(&db, &skill.id, &app, enabled).unwrap_err();
-                assert!(error.to_string().contains("not supported"), "{error:#}");
-            }
-            for result in [
-                SkillService::sync_to_app_dir(&skill.directory, &app),
-                SkillService::remove_from_app(&skill.directory, &app),
-                SkillService::sync_to_app(&db, &app),
-                SkillService::restore_from_backup(&db, "missing-backup", &app).map(|_| ()),
-                SkillService::install_from_zip(&db, &temp.path().join("missing.zip"), &app)
-                    .map(|_| ()),
-            ] {
-                let error = result.unwrap_err();
-                assert!(error.to_string().contains("not supported"), "{error:#}");
-            }
-            assert!(SkillService::get_app_skills_dir(&app).is_err());
-            assert!(!SkillService::is_sync_managed_app(&app));
-            assert!(native.is_dir());
-            assert_eq!(fs::read(native.join("SKILL.md")).unwrap(), manifest);
-            assert_eq!(fs::read(native.join("payload.bin")).unwrap(), payload);
-            let mut entries_after: Vec<_> = fs::read_dir(&native_root)
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name())
-                .collect();
-            entries_after.sort();
-            assert_eq!(entries_after, entries_before);
-            assert_eq!(
-                serde_json::to_value(db.get_installed_skill(&skill.id).unwrap()).unwrap(),
-                before,
-            );
+        for enabled in [true, false] {
+            let error = SkillService::toggle_app(&db, &skill.id, &app, enabled).unwrap_err();
+            assert!(error.to_string().contains("not supported"), "{error:#}");
         }
+        for result in [
+            SkillService::sync_to_app_dir(&skill.directory, &app),
+            SkillService::remove_from_app(&skill.directory, &app),
+            SkillService::sync_to_app(&db, &app),
+            SkillService::restore_from_backup(&db, "missing-backup", &app).map(|_| ()),
+            SkillService::install_from_zip(&db, &temp.path().join("missing.zip"), &app).map(|_| ()),
+        ] {
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("not supported"), "{error:#}");
+        }
+        assert!(SkillService::get_app_skills_dir(&app).is_err());
+        assert!(!SkillService::is_sync_managed_app(&app));
+        assert!(native.is_dir());
+        assert_eq!(fs::read(native.join("SKILL.md")).unwrap(), manifest);
+        assert_eq!(fs::read(native.join("payload.bin")).unwrap(), payload);
+        let mut entries_after: Vec<_> = fs::read_dir(&native_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        entries_after.sort();
+        assert_eq!(entries_after, entries_before);
+        assert_eq!(
+            serde_json::to_value(db.get_installed_skill(&skill.id).unwrap()).unwrap(),
+            before,
+        );
     }
 
     #[test]
     #[serial_test::serial]
-    fn startup_migration_skips_dsh_sources_and_preserves_supported_apps() {
+    fn startup_migration_imports_dsh_and_claude_without_changing_native_files() {
         for use_snapshot in [false, true] {
             let temp = tempdir().unwrap();
             let home = TestHomeGuard::set(temp.path());
@@ -5993,15 +6065,25 @@ mod tests {
                 .unwrap();
             }
             let count = migrate_skills_to_ssot(&db).unwrap();
-            assert_eq!(count, 1);
+            assert_eq!(count, 2);
             let installed = db.get_all_installed_skills().unwrap();
-            assert_eq!(installed.len(), 1);
-            let migrated = installed.values().next().unwrap();
-            assert_eq!(migrated.directory, "claude-native");
-            assert!(migrated.apps.claude);
+            assert_eq!(installed.len(), 2);
+            assert!(installed
+                .values()
+                .any(|skill| skill.directory == "claude-native" && skill.apps.claude));
+            assert!(installed
+                .values()
+                .any(|skill| skill.directory == "dsh-native" && skill.apps.dsh));
             let ssot = SkillService::get_ssot_dir().unwrap();
             assert!(ssot.join("claude-native/SKILL.md").is_file());
-            assert!(!ssot.join("dsh-native").exists());
+            assert_eq!(
+                fs::read(ssot.join("dsh-native/SKILL.md")).unwrap(),
+                manifest
+            );
+            assert_eq!(
+                fs::read(ssot.join("dsh-native/payload.bin")).unwrap(),
+                payload
+            );
             assert_eq!(fs::read(native.join("SKILL.md")).unwrap(), manifest);
             assert_eq!(fs::read(native.join("payload.bin")).unwrap(), payload);
         }
@@ -6010,7 +6092,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn agy_and_kimi_skill_toggle_rolls_back_on_database_failure() {
-        for app in [AppType::Agy, AppType::Kimi] {
+        for app in [AppType::Agy, AppType::Kimi, AppType::Dsh] {
             let temp = tempdir().unwrap();
             let _home = TestHomeGuard::set(temp.path());
             let _location = StorageLocationGuard::set(&_home, SkillStorageLocation::CcSwitch);
@@ -6785,7 +6867,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn mcode_and_kimi_uninstall_keep_modified_copy_and_record_until_cleanup_succeeds() {
-        for app in [AppType::Mcode, AppType::Kimi] {
+        for app in [AppType::Mcode, AppType::Kimi, AppType::Dsh] {
             let temp = tempdir().unwrap();
             let _home = TestHomeGuard::set(temp.path());
             let _location = StorageLocationGuard::set(&_home, SkillStorageLocation::CcSwitch);
@@ -7447,7 +7529,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn migrate_storage_retargets_managed_pi_mcode_and_kimi_symlinks() {
-        for app in [AppType::Pi, AppType::Mcode, AppType::Kimi] {
+        for app in [AppType::Pi, AppType::Mcode, AppType::Kimi, AppType::Dsh] {
             let temp = tempdir().expect("tempdir");
             let _home = TestHomeGuard::set(temp.path());
             let _location = StorageLocationGuard::set(&_home, SkillStorageLocation::CcSwitch);
@@ -7809,6 +7891,7 @@ mod tests {
                 let db = Arc::new(Database::memory().expect("memory db"));
                 let service = SkillService {
                     repo_fixture: Some(remote.path().to_path_buf()),
+                    ..SkillService::new()
                 };
                 let mut installed = poisoned_skill("owner/repo:skill", directory);
                 installed.name = directory.to_string();
@@ -8059,16 +8142,20 @@ mod tests {
         write_skill(&remote.path().join("pdf"), "pdf");
         let service = SkillService {
             repo_fixture: Some(remote.path().to_path_buf()),
+            ..SkillService::new()
         };
 
         let report = service
-            .discover_available_report(vec![
-                repo("owner", "repo", true),
-                // 坐标不合法：下载前就失败，不碰网络
-                repo("bad owner!", "broken", true),
-                // 停用的仓库不读，也不该出现在失败里
-                repo("bad owner?", "disabled", false),
-            ])
+            .discover_available_report(
+                vec![
+                    repo("owner", "repo", true),
+                    // 坐标不合法：下载前就失败，不碰网络
+                    repo("bad owner!", "broken", true),
+                    // 停用的仓库不读，也不该出现在失败里
+                    repo("bad owner?", "disabled", false),
+                ],
+                false,
+            )
             .await
             .expect("discover report");
 
@@ -8105,6 +8192,60 @@ mod tests {
             .await
             .expect("discover");
         assert_eq!(skills.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn discover_reuses_cached_repos_unless_forced() {
+        let remote = tempdir().expect("remote repo");
+        write_skill(&remote.path().join("pdf"), "pdf");
+        let service = SkillService {
+            repo_fixture: Some(remote.path().to_path_buf()),
+            ..SkillService::new()
+        };
+        let repos = || vec![repo("owner", "repo", true)];
+
+        let first = service
+            .discover_available_report(repos(), false)
+            .await
+            .expect("first discover");
+        assert_eq!(first.skills.len(), 1);
+
+        // 仓库里多了一个 Skill：缓存期内不重新下载，强制刷新才看得到
+        write_skill(&remote.path().join("docx"), "docx");
+        let cached = service
+            .discover_available_report(repos(), false)
+            .await
+            .expect("cached discover");
+        assert_eq!(cached.skills.len(), 1);
+        let single = service.discover_repo(&repo("owner", "repo", true)).await;
+        assert_eq!(single.skills.len(), 1);
+
+        let forced = service
+            .discover_available_report(repos(), true)
+            .await
+            .expect("forced discover");
+        assert_eq!(forced.skills.len(), 2);
+        // 强制刷新的结果写回缓存
+        let single = service.discover_repo(&repo("owner", "repo", true)).await;
+        assert_eq!(single.skills.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn discover_repo_reports_failure_and_skips_disabled_repo() {
+        let service = SkillService::new();
+
+        let failed = service
+            .discover_repo(&repo("bad owner!", "broken", true))
+            .await;
+        assert!(failed.skills.is_empty());
+        assert_eq!(failed.failures.len(), 1);
+        assert!(failed.failures[0].error.contains("INVALID_REPO_REF"));
+
+        let disabled = service
+            .discover_repo(&repo("bad owner!", "broken", false))
+            .await;
+        assert!(disabled.skills.is_empty());
+        assert!(disabled.failures.is_empty());
     }
 
     #[tokio::test]
@@ -8214,9 +8355,7 @@ mod tests {
         let outcomes = SkillService::resync_all_apps(&db);
 
         let apps: Vec<&str> = outcomes.iter().map(|o| o.app.as_str()).collect();
-        assert!(
-            !apps.contains(&"claude-desktop") && !apps.contains(&"dsh") && !apps.contains(&"pi")
-        );
+        assert!(!apps.contains(&"claude-desktop") && !apps.contains(&"pi"));
         assert!(apps.contains(&"claude") && apps.contains(&"codex"));
 
         let claude = outcomes.iter().find(|o| o.app == "claude").unwrap();

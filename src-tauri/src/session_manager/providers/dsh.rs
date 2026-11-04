@@ -578,9 +578,7 @@ mod legacy {
     static PARSE_CACHE: LazyLock<FileParseCache> = LazyLock::new(FileParseCache::new);
 
     pub fn session_roots() -> Vec<PathBuf> {
-        crate::services::provider::dsh_direct::root()
-            .map(|home| vec![home.join("sessions")])
-            .unwrap_or_default()
+        vec![crate::dsh_config::data_dir().join("sessions")]
     }
 
     pub fn scan_sessions() -> Vec<SessionMeta> {

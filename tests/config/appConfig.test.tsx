@@ -9,6 +9,7 @@ import {
   isModeAppId,
   isStackAppId,
 } from "@/config/appConfig";
+import { PROMPT_APP_IDS } from "@/lib/query/prompts";
 
 describe("appConfig provider lifecycle", () => {
   it.each([
@@ -18,13 +19,14 @@ describe("appConfig provider lifecycle", () => {
     "pi",
     "mcode",
     "kimi",
+    "dsh",
     "zcode",
     "omp",
   ])("classifies %s as additive", (appId) => {
     expect(isAdditiveAppId(appId)).toBe(true);
   });
 
-  it.each(["claude", "claude-desktop", "codex", "gemini", "grokbuild", "dsh"])(
+  it.each(["claude", "claude-desktop", "codex", "gemini", "grokbuild"])(
     "does not classify %s as additive",
     (appId) => {
       expect(isAdditiveAppId(appId)).toBe(false);
@@ -32,13 +34,14 @@ describe("appConfig provider lifecycle", () => {
   );
 });
 
-describe("DSH native capabilities", () => {
-  it("keeps explicit native modes without advertising unsupported shared writes", () => {
-    expect(isModeAppId("dsh")).toBe(true);
-    expect(isStackAppId("dsh")).toBe(true);
-    expect(isAdditiveAppId("dsh")).toBe(false);
-    expect(SKILLS_APP_IDS).not.toContain("dsh");
-    expect(MCP_APP_IDS).not.toContain("dsh");
+describe("DeepSeek Harness capabilities", () => {
+  it("exposes shared configuration and excludes routing and aggregation", () => {
+    expect(isModeAppId("dsh")).toBe(false);
+    expect(isStackAppId("dsh")).toBe(false);
+    expect(isAdditiveAppId("dsh")).toBe(true);
+    expect(SKILLS_APP_IDS).toContain("dsh");
+    expect(MCP_APP_IDS).toContain("dsh");
+    expect(PROMPT_APP_IDS).toContain("dsh");
   });
 });
 
