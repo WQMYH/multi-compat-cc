@@ -22,7 +22,7 @@ use crate::error::AppError;
 use crate::live::floor;
 
 /// 链接到默认目录的子目录。
-const LINKED_DIRS: &[&str] = &[
+pub(crate) const LINKED_DIRS: &[&str] = &[
     "skills",
     "commands",
     "agents",

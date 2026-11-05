@@ -375,17 +375,32 @@ pub async fn check_app_update_available(app: AppHandle) -> Result<Option<String>
 /// 获取 app_config_dir 覆盖配置 (从 Store)
 #[tauri::command]
 pub async fn get_app_config_dir_override(app: AppHandle) -> Result<Option<String>, String> {
-    Ok(crate::app_store::refresh_app_config_dir_override(&app)
+    Ok(crate::app_store::read_app_config_dir_override(&app)
+        .map_err(|e| e.to_string())?
         .map(|p| p.to_string_lossy().to_string()))
 }
 
-/// 设置 app_config_dir 覆盖配置 (到 Store)
+/// 返回 CC Switch 的默认数据目录，供设置页显示和重置。
+#[tauri::command]
+pub async fn get_default_app_config_dir() -> String {
+    crate::data_paths::app_dir().to_string_lossy().into_owned()
+}
+
+/// 保存下次启动使用的 app_config_dir 覆盖配置。
 #[tauri::command]
 pub async fn set_app_config_dir_override(
     app: AppHandle,
     path: Option<String>,
 ) -> Result<bool, String> {
-    crate::app_store::set_app_config_dir_to_store(&app, path.as_deref())?;
+    let path = path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
+    let data_dir = path
+        .map(crate::app_store::resolve_path)
+        .unwrap_or_else(crate::data_paths::app_dir);
+    crate::data_paths::validate_data_dir(&data_dir).map_err(|e| e.to_string())?;
+    crate::app_store::set_app_config_dir_to_store(&app, path)?;
     Ok(true)
 }
 

@@ -43,7 +43,9 @@ pub async fn get_agy_models(
     // Dropped (and removed) after the command finishes.
     let _scratch = match &api_key {
         Some(key) => {
-            let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+            let dir = crate::data_paths::ensure_temp_dir()
+                .and_then(tempfile::tempdir_in)
+                .map_err(|e| e.to_string())?;
             let settings = dir.path().join("antigravity-cli").join("settings.json");
             std::fs::create_dir_all(dir.path().join("antigravity-cli"))
                 .map_err(|e| e.to_string())?;

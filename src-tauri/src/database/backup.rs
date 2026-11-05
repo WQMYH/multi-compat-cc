@@ -183,10 +183,12 @@ impl Database {
         Self::validate_cc_switch_sql_export(sql_content)?;
 
         // 在临时数据库执行导入，确保失败不会污染主库
-        let temp_file = NamedTempFile::new().map_err(|e| AppError::IoContext {
-            context: "创建临时数据库文件失败".to_string(),
-            source: e,
-        })?;
+        let temp_file = crate::data_paths::ensure_temp_dir()
+            .and_then(NamedTempFile::new_in)
+            .map_err(|e| AppError::IoContext {
+                context: "创建临时数据库文件失败".to_string(),
+                source: e,
+            })?;
         let temp_path = temp_file.path().to_path_buf();
         let temp_conn =
             Connection::open(&temp_path).map_err(|e| AppError::Database(e.to_string()))?;
@@ -1045,10 +1047,12 @@ impl Database {
         // Stage and fully validate the selected file before touching the live
         // connection. A corrupt/future-schema backup or failed migration must
         // leave the current database unchanged.
-        let temp_file = NamedTempFile::new().map_err(|e| AppError::IoContext {
-            context: "创建数据库恢复暂存文件失败".to_string(),
-            source: e,
-        })?;
+        let temp_file = crate::data_paths::ensure_temp_dir()
+            .and_then(NamedTempFile::new_in)
+            .map_err(|e| AppError::IoContext {
+                context: "创建数据库恢复暂存文件失败".to_string(),
+                source: e,
+            })?;
         let mut staging_conn =
             Connection::open(temp_file.path()).map_err(|e| AppError::Database(e.to_string()))?;
         {

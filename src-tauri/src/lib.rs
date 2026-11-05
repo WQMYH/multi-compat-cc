@@ -13,6 +13,11 @@ mod codex_rollout_file;
 mod codex_state_db;
 mod commands;
 mod config;
+#[cfg(windows)]
+mod data_migration;
+mod data_paths;
+#[cfg(windows)]
+mod data_permissions;
 mod database;
 mod deeplink;
 mod dsh_config;
@@ -478,6 +483,10 @@ fn handle_second_instance(app: &tauri::AppHandle, args: Vec<String>) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if let Err(error) = data_paths::prepare() {
+        data_paths::report_startup_error(error);
+        std::process::exit(1);
+    }
     // 设置 panic hook，在应用崩溃时记录日志到 <app_config_dir>/crash.log（默认 ~/.cc-switch/crash.log）
     panic_hook::setup_panic_hook();
 
@@ -524,6 +533,18 @@ pub fn run() {
             }
         });
     }
+
+    #[cfg(windows)]
+    let builder = builder.plugin(
+        tauri::plugin::Builder::<_, ()>::new("data-migration")
+            .setup(|_, _| {
+                if !readonly_provider_preview() {
+                    data_migration::migrate()?;
+                }
+                Ok(())
+            })
+            .build(),
+    );
 
     let builder = builder
         // 注册 deep-link 插件（处理 macOS AppleEvent 和其他平台的深链接）
@@ -576,6 +597,7 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(
             tauri_plugin_window_state::Builder::default()
+                .with_state_dir(data_paths::tauri_dir())
                 .with_state_flags(window_state_flags())
                 .with_denylist(&[tray_panel::PANEL_LABEL])
                 .build(),
@@ -584,7 +606,7 @@ pub fn run() {
             let _ = rustls::crypto::ring::default_provider().install_default();
 
             // 预先刷新 Store 覆盖配置，确保后续路径读取正确（日志/数据库等）
-            app_store::refresh_app_config_dir_override(app.handle());
+            app_store::refresh_app_config_dir_override(app.handle())?;
             if readonly_provider_preview() {
                 // Show the real managed catalog without startup migrations, takeover or sync.
                 let state = AppState::new(Arc::new(Database::open_preview()?));
@@ -651,7 +673,7 @@ pub fn run() {
 
             // 首次读取覆盖路径时 logger 尚未可用；此处重放一次，
             // 让 Store 损坏或路径无效等启动警告能够真正落盘。
-            let _ = app_store::refresh_app_config_dir_override(app.handle());
+            app_store::refresh_app_config_dir_override(app.handle())?;
 
             #[cfg(target_os = "windows")]
             set_windows_app_user_model_id(app.handle());
@@ -1326,7 +1348,7 @@ pub fn run() {
             #[cfg(target_os = "linux")]
             {
                 tray_builder =
-                    tray_builder.temp_dir_path(app.path().app_cache_dir()?.join("tray-icon"));
+                    tray_builder.temp_dir_path(data_paths::cache_dir().join("tray-icon"));
             }
 
             let _tray = tray_builder.build(app)?;
@@ -1746,6 +1768,7 @@ pub fn run() {
             commands::update_endpoint_last_used,
             // app_config_dir override via Store
             commands::get_app_config_dir_override,
+            commands::get_default_app_config_dir,
             commands::set_app_config_dir_override,
             // provider sort order management
             commands::update_providers_sort_order,
@@ -2051,9 +2074,18 @@ pub fn run() {
           }
         });
 
-    let app = builder
-        .build(tauri::generate_context!())
-        .expect("error while running tauri application");
+    let mut context = tauri::generate_context!();
+    #[cfg(windows)]
+    for window in &mut context.config_mut().app.windows {
+        window.data_directory = Some(data_paths::webview_dir());
+    }
+    let app = match builder.build(context) {
+        Ok(app) => app,
+        Err(error) => {
+            data_paths::report_startup_error(error);
+            std::process::exit(1);
+        }
+    };
 
     app.run(|app_handle, event| {
         if readonly_provider_preview() {
@@ -2468,6 +2500,7 @@ fn readonly_preview_command(command: &str) -> bool {
             | "get_current_provider"
             | "get_settings"
             | "get_app_config_dir_override"
+            | "get_default_app_config_dir"
             | "get_init_error"
             | "get_custom_icons"
             | "get_proxy_status"

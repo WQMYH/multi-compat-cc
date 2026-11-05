@@ -5579,7 +5579,7 @@ fn codex_terminal_launch(
     let mut overrides = plan.overrides;
     let mut cleanup = Vec::new();
     if let Some(catalog) = plan.catalog {
-        let path = unique_temp_path("codex_catalog", "json");
+        let path = unique_temp_path("codex_catalog", "json")?;
         std::fs::write(&path, catalog).map_err(|e| format!("写入临时模型目录失败: {e}"))?;
         overrides.push(codex_terminal::catalog_override(&path.to_string_lossy()));
         cleanup.push(path);
@@ -5648,7 +5648,7 @@ fn claude_terminal_launch(
     provider_name: &str,
     drops: &crate::services::provider::SwitchDrops,
 ) -> Result<ProviderLaunch, String> {
-    let config_file = unique_temp_path(&format!("claude_{provider_id}"), "json");
+    let config_file = unique_temp_path(&format!("claude_{provider_id}"), "json")?;
     write_claude_config(&config_file, env_vars, provider_name, drops)?;
     let config_name = config_file
         .file_name()
@@ -5823,18 +5823,20 @@ const AGY_MODEL_BATCH_VAR: &str = "CC_SWITCH_AGY_MODEL";
 const LAUNCH_ENV_PREFIX: &str = "CC_SWITCH_LAUNCH_ENV_";
 
 /// 同一进程里连开几个终端也不会撞名。
-fn unique_temp_path(stem: &str, ext: &str) -> PathBuf {
+fn unique_temp_path(stem: &str, ext: &str) -> Result<PathBuf, String> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or_default();
-    std::env::temp_dir().join(format!(
+    let temp_dir = crate::data_paths::ensure_temp_dir()
+        .map_err(|e| format!("创建 CC Switch 临时目录失败: {e}"))?;
+    Ok(temp_dir.join(format!(
         "{stem}_{}_{nanos:x}{}.{ext}",
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
-    ))
+    )))
 }
 
 /// 根据平台打开终端运行 `launch`。
@@ -5999,8 +6001,8 @@ fn write_unix_launcher(
     use std::os::unix::fs::PermissionsExt;
 
     let shell = get_user_shell();
-    let script_file = unique_temp_path("cc_switch_launcher", "sh");
-    let env_file = unique_temp_path("cc_switch_launch_env", "sh");
+    let script_file = unique_temp_path("cc_switch_launcher", "sh")?;
+    let env_file = unique_temp_path("cc_switch_launch_env", "sh")?;
     let env_content = unix_launch_env_file(launch);
     let has_env = !env_content.is_empty();
     if has_env {
@@ -6512,7 +6514,7 @@ fn launch_windows_terminal(launch: &ProviderLaunch, cwd: Option<&Path>) -> Resul
     let preferred = crate::settings::get_preferred_terminal();
     let terminal = preferred.as_deref().unwrap_or("cmd");
 
-    let bat_file = unique_temp_path("cc_switch_launcher", "bat");
+    let bat_file = unique_temp_path("cc_switch_launcher", "bat")?;
     let (cwd_command, cwd_env) = build_windows_cwd_command(cwd);
     let mut launch_env: Vec<(String, String)> = cwd_env
         .map(|value| (WINDOWS_CWD_ENV.to_string(), value))
@@ -6786,7 +6788,8 @@ fn windows_powershell_program(path: &str) -> &'static str {
 /// **Security**：`command_line` 会被原样拼进 shell/batch 脚本，调用方必须
 /// 保证它是可信字符串（当前只由后端硬编码调用）。
 pub(crate) fn launch_terminal_running(command_line: &str, label: &str) -> Result<(), String> {
-    let temp_dir = std::env::temp_dir();
+    let temp_dir = crate::data_paths::ensure_temp_dir()
+        .map_err(|e| format!("创建 CC Switch 临时目录失败: {e}"))?;
     let pid = std::process::id();
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

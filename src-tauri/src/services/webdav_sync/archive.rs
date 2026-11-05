@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use tempfile::{tempdir, TempDir};
+use tempfile::TempDir;
 use zip::write::SimpleFileOptions;
 use zip::DateTime;
 
@@ -70,14 +70,16 @@ pub(crate) fn zip_skills_ssot(dest_path: &Path) -> Result<(), AppError> {
 }
 
 pub(crate) fn restore_skills_zip(raw: &[u8]) -> Result<(), AppError> {
-    let tmp = tempdir().map_err(|e| {
-        io_context_localized(
-            "webdav.sync.skills_extract_tmpdir_failed",
-            "创建 skills 解压临时目录失败",
-            "Failed to create temporary directory for skills extraction",
-            e,
-        )
-    })?;
+    let tmp = crate::data_paths::ensure_temp_dir()
+        .and_then(tempfile::tempdir_in)
+        .map_err(|e| {
+            io_context_localized(
+                "webdav.sync.skills_extract_tmpdir_failed",
+                "创建 skills 解压临时目录失败",
+                "Failed to create temporary directory for skills extraction",
+                e,
+            )
+        })?;
     let zip_path = tmp.path().join(REMOTE_SKILLS_ZIP);
     fs::write(&zip_path, raw).map_err(|e| AppError::io(&zip_path, e))?;
 
@@ -279,14 +281,16 @@ pub(crate) fn backup_current_skills() -> Result<SkillsBackup, AppError> {
             format!("Failed to resolve Skills SSOT directory: {e}"),
         )
     })?;
-    let tmp = tempdir().map_err(|e| {
-        io_context_localized(
-            "webdav.sync.skills_backup_tmpdir_failed",
-            "创建 skills 备份临时目录失败",
-            "Failed to create temporary directory for skills backup",
-            e,
-        )
-    })?;
+    let tmp = crate::data_paths::ensure_temp_dir()
+        .and_then(tempfile::tempdir_in)
+        .map_err(|e| {
+            io_context_localized(
+                "webdav.sync.skills_backup_tmpdir_failed",
+                "创建 skills 备份临时目录失败",
+                "Failed to create temporary directory for skills backup",
+                e,
+            )
+        })?;
     let backup_dir = tmp.path().join("skills-backup");
 
     let existed = ssot.exists();

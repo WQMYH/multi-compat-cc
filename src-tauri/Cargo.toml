@@ -35,7 +35,7 @@ tauri-plugin-updater = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-store = "2"
 tauri-plugin-deep-link = "2"
-tauri-plugin-window-state = "2"
+tauri-plugin-window-state = { version = "2", path = "vendor/tauri-plugin-window-state" }
 dirs = "5.0"
 toml = "0.8"
 toml_edit = "0.22"
@@ -106,6 +106,8 @@ webview2-com = "0.38"
 windows = "0.61"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Globalization",
     "Win32_Storage_FileSystem",
     "Win32_Graphics_Gdi",

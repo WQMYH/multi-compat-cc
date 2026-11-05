@@ -125,6 +125,10 @@ export const settingsApi = {
     return await invoke("get_app_config_dir_override");
   },
 
+  async getDefaultAppConfigDir(): Promise<string> {
+    return await invoke("get_default_app_config_dir");
+  },
+
   async setAppConfigDirOverride(path: string | null): Promise<boolean> {
     return await invoke("set_app_config_dir_override", { path });
   },

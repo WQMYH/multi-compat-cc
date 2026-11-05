@@ -3827,7 +3827,7 @@ impl SkillService {
         // 守卫全程持有，成功后连同目录一起交给调用方（见 `extract_local_zip` 的说明）。
         // 原来这里立刻 keep()，任何一步失败——下载超时、ARCHIVE_TOO_LARGE、解压出错
         // ——都会把半个解压目录永久留在磁盘上，反复触发即可持续填盘。
-        let temp_dir = tempfile::tempdir()?;
+        let temp_dir = tempfile::tempdir_in(crate::data_paths::ensure_temp_dir()?)?;
         let temp_path = temp_dir.path();
 
         // Exercise the real install/update flow without network access in unit tests.
@@ -3952,7 +3952,8 @@ impl SkillService {
         // 不能只信 Content-Length（可以撒谎或缺失），必须按实际收到的字节数算。
         // 归档写进匿名临时文件（关闭即删，失败路径也不留残留），内存只占一个块。
         let mut response = response;
-        let mut body = std::io::BufWriter::new(tempfile::tempfile()?);
+        let mut body =
+            std::io::BufWriter::new(tempfile::tempfile_in(crate::data_paths::ensure_temp_dir()?)?);
         let mut received: u64 = 0;
         while let Some(chunk) = response.chunk().await? {
             received = received.saturating_add(chunk.len() as u64);
@@ -4632,7 +4633,7 @@ impl SkillService {
     /// 磁盘上。守卫交给调用方持有，清理就变成作用域结束时自动发生，不再依赖每条
     /// 出口都记得手写 `remove_dir_all`（实测漏了不止一条）。
     fn extract_local_zip(zip_path: &Path) -> Result<tempfile::TempDir> {
-        Self::extract_local_zip_in(zip_path, &std::env::temp_dir())
+        Self::extract_local_zip_in(zip_path, &crate::data_paths::ensure_temp_dir()?)
     }
 
     /// 与 [`Self::extract_local_zip`] 相同，但临时目录的落点由调用方指定。

@@ -4,6 +4,7 @@ import { useDirectorySettings } from "@/hooks/useDirectorySettings";
 import type { SettingsFormState } from "@/hooks/useSettingsForm";
 
 const getAppConfigDirOverrideMock = vi.hoisted(() => vi.fn());
+const getDefaultAppConfigDirMock = vi.hoisted(() => vi.fn());
 const getConfigDirMock = vi.hoisted(() => vi.fn());
 const selectConfigDirectoryMock = vi.hoisted(() => vi.fn());
 const setAppConfigDirOverrideMock = vi.hoisted(() => vi.fn());
@@ -16,6 +17,7 @@ const toastErrorMock = vi.hoisted(() => vi.fn());
 vi.mock("@/lib/api", () => ({
   settingsApi: {
     getAppConfigDirOverride: getAppConfigDirOverrideMock,
+    getDefaultAppConfigDir: getDefaultAppConfigDirMock,
     getConfigDir: getConfigDirMock,
     selectConfigDirectory: selectConfigDirectoryMock,
     setAppConfigDirOverride: setAppConfigDirOverrideMock,
@@ -65,6 +67,7 @@ describe("useDirectorySettings", () => {
     );
 
     getAppConfigDirOverrideMock.mockResolvedValue(null);
+    getDefaultAppConfigDirMock.mockResolvedValue("D:/CCSwitch/data");
     getConfigDirMock.mockImplementation(async (app: string) => {
       if (app === "claude") return "/remote/claude";
       if (app === "codex") return "/remote/codex";
@@ -345,9 +348,7 @@ describe("useDirectorySettings", () => {
     });
 
     expect(result.current.appConfigDir).toBe("/new/app");
-    expect(selectConfigDirectoryMock).toHaveBeenCalledWith(
-      "/home/mock/.cc-switch",
-    );
+    expect(selectConfigDirectoryMock).toHaveBeenCalledWith("D:/CCSwitch/data");
   });
 
   it("resets directories to computed defaults", async () => {
@@ -376,7 +377,7 @@ describe("useDirectorySettings", () => {
     });
     expect(result.current.resolvedDirs.claude).toBe("/home/mock/.claude");
     expect(result.current.resolvedDirs.codex).toBe("/home/mock/.codex");
-    expect(result.current.resolvedDirs.appConfig).toBe("/home/mock/.cc-switch");
+    expect(result.current.resolvedDirs.appConfig).toBe("D:/CCSwitch/data");
   });
 
   it("updates openclaw directory when browsing succeeds", async () => {

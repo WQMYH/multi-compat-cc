@@ -362,23 +362,26 @@ fn ensure_window(app: &AppHandle) -> Option<WebviewWindow> {
 fn create_window(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     // 新窗口还没套过深浅色（轻量模式下面板收起即销毁，会反复新建）。
     *lock(&APPLIED_DARK) = None;
-    let window =
-        WebviewWindowBuilder::new(app, PANEL_LABEL, WebviewUrl::App("tray-panel.html".into()))
-            .title("CC Switch")
-            .inner_size(MAIN_WIDTH, 420.0)
-            .resizable(false)
-            .maximizable(false)
-            .minimizable(false)
-            .decorations(false)
-            .transparent(true)
-            // Windows 使用固定透明画布，整窗系统阴影会暴露画布的外框。
-            .shadow(!cfg!(target_os = "windows"))
-            .always_on_top(true)
-            .skip_taskbar(true)
-            .visible_on_all_workspaces(true)
-            .visible(false)
-            .focused(false)
-            .build()?;
+    let builder =
+        WebviewWindowBuilder::new(app, PANEL_LABEL, WebviewUrl::App("tray-panel.html".into()));
+    #[cfg(windows)]
+    let builder = builder.data_directory(crate::data_paths::webview_dir());
+    let window = builder
+        .title("CC Switch")
+        .inner_size(MAIN_WIDTH, 420.0)
+        .resizable(false)
+        .maximizable(false)
+        .minimizable(false)
+        .decorations(false)
+        .transparent(true)
+        // Windows 使用固定透明画布，整窗系统阴影会暴露画布的外框。
+        .shadow(!cfg!(target_os = "windows"))
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .visible_on_all_workspaces(true)
+        .visible(false)
+        .focused(false)
+        .build()?;
     platform::init(&window);
 
     let handle = window.clone();

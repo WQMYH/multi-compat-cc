@@ -1888,8 +1888,8 @@ fn resync_targets_default_to_managed_apps_and_reject_unsupported() {
             "hermes",
             "pi",
             "mcode",
-            "kimi",
             "dsh",
+            "kimi",
             "agy",
             "zcode",
             "omp"
