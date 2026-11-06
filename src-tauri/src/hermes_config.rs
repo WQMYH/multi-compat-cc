@@ -69,7 +69,7 @@ pub fn get_hermes_dir() -> PathBuf {
 /// 平台默认 Hermes 目录(Windows):对齐 Hermes `_get_platform_default_hermes_home()`——
 /// 读 `LOCALAPPDATA` 环境变量,缺失/空时回退 `~\AppData\Local`,再拼 `hermes`。
 #[cfg(target_os = "windows")]
-fn default_hermes_dir() -> PathBuf {
+pub(crate) fn default_hermes_dir() -> PathBuf {
     windows_local_hermes_dir(
         std::env::var_os("LOCALAPPDATA").as_deref(),
         &crate::config::get_home_dir(),
@@ -78,7 +78,7 @@ fn default_hermes_dir() -> PathBuf {
 
 /// 平台默认 Hermes 目录(Mac/Linux):`~/.hermes`。
 #[cfg(not(target_os = "windows"))]
-fn default_hermes_dir() -> PathBuf {
+pub(crate) fn default_hermes_dir() -> PathBuf {
     crate::config::get_home_dir().join(".hermes")
 }
 

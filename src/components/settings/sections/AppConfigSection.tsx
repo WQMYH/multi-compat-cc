@@ -5,12 +5,14 @@ import type {
   SettingsFormState,
 } from "@/hooks/useSettings";
 import type { Settings } from "@/types";
+import type { AppId } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import {
   DirectoryInput,
   type DirectoryAppId,
 } from "@/components/settings/DirectorySettings";
 import { CodexAuthSettings } from "@/components/settings/CodexAuthSettings";
+import { ConfigDirectoryDetection } from "@/components/settings/ConfigDirectoryDetection";
 import { APP_DISPLAY_NAME, AppGlyph } from "@/components/shell/AppGlyph";
 import {
   SettingsBlock,
@@ -61,6 +63,14 @@ const DIRECTORY_APPS: DirectoryAppId[] = [
 const normalizeDir = (value: unknown) =>
   typeof value === "string" && value.trim() ? value.trim() : undefined;
 
+const READ_ONLY_DIRECTORY_APPS = [
+  "claude-desktop",
+  "mcode",
+  "agy",
+  "kimi",
+  "dsh",
+] as const;
+
 interface AppConfigSectionProps {
   settings: SettingsFormState;
   savedSettings?: Settings;
@@ -106,19 +116,26 @@ export function AppConfigSection({
         body: t("settings.configDirectoryDescription"),
       }}
     >
-      <DirectoryInput
-        label=""
-        value={
-          settings[DIRECTORY_FIELD[app] as keyof SettingsFormState] as
-            | string
-            | undefined
-        }
-        resolvedValue={resolvedDirs[app]}
-        placeholder={t(DIRECTORY_PLACEHOLDER[app])}
-        onChange={(value) => onDirectoryChange(app, value)}
-        onBrowse={() => onBrowseDirectory(app)}
-        onReset={() => onResetDirectory(app)}
-      />
+      <div className="min-w-0 space-y-2">
+        <DirectoryInput
+          label=""
+          value={
+            settings[DIRECTORY_FIELD[app] as keyof SettingsFormState] as
+              | string
+              | undefined
+          }
+          resolvedValue={resolvedDirs[app]}
+          placeholder={t(DIRECTORY_PLACEHOLDER[app])}
+          onChange={(value) => onDirectoryChange(app, value)}
+          onBrowse={() => onBrowseDirectory(app)}
+          onReset={() => onResetDirectory(app)}
+        />
+        <ConfigDirectoryDetection
+          app={app}
+          savedDirectory={normalizeDir(savedSettings?.[DIRECTORY_FIELD[app]])}
+          onAdopt={(path) => onDirectoryChange(app, path)}
+        />
+      </div>
     </SettingsRow>
   );
 
@@ -135,7 +152,7 @@ export function AppConfigSection({
       </Button>
     ) : null;
 
-  const blockTitle = (app: DirectoryAppId) => (
+  const blockTitle = (app: AppId) => (
     <span className="flex items-center gap-2">
       <AppGlyph app={app} size={16} badgeClassName="bg-app" />
       {APP_DISPLAY_NAME[app]}
@@ -189,6 +206,20 @@ export function AppConfigSection({
               />
             )}
             {directoryRow(app)}
+          </SettingsCard>
+        </SettingsBlock>
+      ))}
+      {READ_ONLY_DIRECTORY_APPS.map((app) => (
+        <SettingsBlock
+          key={app}
+          id={`app-config-${app}`}
+          className="rounded-panel"
+          title={blockTitle(app)}
+        >
+          <SettingsCard>
+            <SettingsRow label={t("settings.appConfig.configDir")}>
+              <ConfigDirectoryDetection app={app} />
+            </SettingsRow>
           </SettingsCard>
         </SettingsBlock>
       ))}

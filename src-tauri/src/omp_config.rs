@@ -52,7 +52,7 @@ pub(crate) fn get_omp_active_profile() -> Result<Option<String>, AppError> {
     )
 }
 
-fn normalize_profile(raw: Option<&str>) -> Result<Option<String>, AppError> {
+pub(crate) fn normalize_profile(raw: Option<&str>) -> Result<Option<String>, AppError> {
     let name = raw.unwrap_or_default().trim();
     if name.is_empty() || name == "default" {
         return Ok(None);

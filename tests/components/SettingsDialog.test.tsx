@@ -119,6 +119,11 @@ const restartMock = vi.fn().mockResolvedValue(true);
 vi.mock("@/lib/api", () => ({
   settingsApi: {
     restart: (...args: unknown[]) => restartMock(...args),
+    detectConfigDirectories: async (app: string) => ({
+      currentDir: `/resolved/${app}`,
+      defaultDir: `/default/${app}`,
+      candidates: [],
+    }),
   },
 }));
 

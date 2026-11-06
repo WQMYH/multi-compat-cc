@@ -1,9 +1,16 @@
 import React, { Suspense } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import {
+  render,
+  screen,
+  waitFor,
+  fireEvent,
+  within,
+} from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { http, HttpResponse } from "msw";
 import type { Settings } from "@/types";
+import { settingsApi } from "@/lib/api";
 import { SettingsPage } from "@/components/settings/SettingsPage";
 import {
   resetProviderState,
@@ -377,6 +384,153 @@ describe("SettingsPage integration", () => {
       await waitFor(() => expect(directory).toHaveValue(backendDefault));
     },
   );
+
+  it.each([
+    [
+      "codex",
+      "codexConfigDir",
+      "C:/manual/codex",
+      "/home/mock/.codex",
+      "D:/detected/codex",
+      "CODEX_HOME",
+      "settings.browsePlaceholderCodex",
+    ],
+    [
+      "hermes",
+      "hermesConfigDir",
+      undefined,
+      "D:/env/hermes",
+      "D:/env/hermes",
+      "HERMES_HOME",
+      "settings.browsePlaceholderHermes",
+    ],
+  ] as const)(
+    "adopts and saves a detected %s path explicitly, then resets through the backend default",
+    async (
+      app,
+      field,
+      savedDirectory,
+      defaultDir,
+      candidate,
+      source,
+      placeholder,
+    ) => {
+      setSettings({ [field]: savedDirectory });
+      server.use(
+        http.post("http://tauri.local/get_config_dir", async ({ request }) => {
+          const { app: requestedApp } = (await request.json()) as {
+            app: string;
+          };
+          return HttpResponse.json(
+            requestedApp === app
+              ? (getSettings()[field] ?? defaultDir)
+              : `/default/${requestedApp}`,
+          );
+        }),
+        http.post(
+          "http://tauri.local/get_default_config_dir",
+          async ({ request }) => {
+            const { app: requestedApp } = (await request.json()) as {
+              app: string;
+            };
+            return HttpResponse.json(
+              requestedApp === app ? defaultDir : `/default/${requestedApp}`,
+            );
+          },
+        ),
+        http.post(
+          "http://tauri.local/detect_config_directories",
+          async ({ request }) => {
+            const { app: requestedApp } = (await request.json()) as {
+              app: string;
+            };
+            return HttpResponse.json({
+              currentDir:
+                requestedApp === app
+                  ? (getSettings()[field] ?? defaultDir)
+                  : `/default/${requestedApp}`,
+              defaultDir:
+                requestedApp === app ? defaultDir : `/default/${requestedApp}`,
+              candidates:
+                requestedApp === app
+                  ? [{ path: candidate, sources: [source], exists: true }]
+                  : [],
+            });
+          },
+        ),
+        http.post("http://tauri.local/save_settings", async ({ request }) => {
+          const { settings } = (await request.json()) as { settings: Settings };
+          setSettings({ ...settings, [field]: settings[field] });
+          return HttpResponse.json(true);
+        }),
+      );
+      renderDialog({ section: "appConfig" });
+      const input = await screen.findByPlaceholderText(placeholder);
+      await screen.findByText(source);
+      expect(input).toHaveValue(savedDirectory ?? defaultDir);
+      expect(getSettings()[field]).toBe(savedDirectory);
+      expect(screen.queryByRole("button", { name: "common.save" })).toBeNull();
+
+      fireEvent.click(
+        screen.getByRole("button", {
+          name: `settings.adoptConfigDirectory ${candidate}`,
+        }),
+      );
+      expect(input).toHaveValue(candidate);
+      expect(getSettings()[field]).toBe(savedDirectory);
+      fireEvent.click(screen.getByRole("button", { name: "common.save" }));
+      await waitFor(() => expect(getSettings()[field]).toBe(candidate));
+      await waitFor(() =>
+        expect(
+          screen.queryByRole("button", { name: "common.save" }),
+        ).toBeNull(),
+      );
+      expect(await settingsApi.getConfigDir(app)).toBe(candidate);
+
+      const block = document.getElementById(`app-config-${app}`)!;
+      fireEvent.click(
+        within(block).getByRole("button", { name: "settings.resetDefault" }),
+      );
+      expect(input).toHaveValue(defaultDir);
+      expect(getSettings()[field]).toBe(candidate);
+      fireEvent.click(screen.getByRole("button", { name: "common.save" }));
+      await waitFor(() => expect(getSettings()[field]).toBeUndefined());
+      expect(await settingsApi.getConfigDir(app)).toBe(defaultDir);
+    },
+  );
+
+  it("shows the resolved DSH directory and source in a read-only app section", async () => {
+    server.use(
+      http.post(
+        "http://tauri.local/detect_config_directories",
+        async ({ request }) => {
+          const { app } = (await request.json()) as { app: string };
+          const path = app === "dsh" ? "D:/agents/dsh" : `/default/${app}`;
+          return HttpResponse.json({
+            currentDir: path,
+            defaultDir: path,
+            candidates:
+              app === "dsh"
+                ? [{ path, sources: ["DSH_HOME"], exists: true }]
+                : [],
+          });
+        },
+      ),
+    );
+    renderDialog({ section: "appConfig" });
+    await screen.findByText("DSH_HOME");
+    const block = document.getElementById("app-config-dsh")!;
+    expect(within(block).getAllByText("D:/agents/dsh")[0]).toBeInTheDocument();
+    expect(within(block).queryByRole("textbox")).toBeNull();
+    expect(
+      within(block).queryByRole("button", {
+        name: /settings.adoptConfigDirectory/,
+      }),
+    ).toBeNull();
+    for (const app of ["dsh", "kimi", "mcode", "agy", "claude-desktop"]) {
+      expect(document.getElementById(`app-config-${app}`)).toBeInTheDocument();
+    }
+  });
 
   it("notifies when export fails", async () => {
     renderDialog();

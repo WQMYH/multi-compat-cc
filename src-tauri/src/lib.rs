@@ -13,6 +13,7 @@ mod codex_rollout_file;
 mod codex_state_db;
 mod commands;
 mod config;
+mod config_directory;
 #[cfg(windows)]
 mod data_migration;
 mod data_paths;
@@ -1653,6 +1654,8 @@ pub fn run() {
             commands::get_config_status,
             commands::get_claude_code_config_path,
             commands::get_config_dir,
+            commands::get_default_config_dir,
+            commands::detect_config_directories,
             commands::open_config_folder,
             commands::pick_directory,
             commands::open_external,

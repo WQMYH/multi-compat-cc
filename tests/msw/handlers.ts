@@ -333,6 +333,35 @@ export const handlers = [
     return success(app === "claude" ? "/default/claude" : "/default/codex");
   }),
 
+  http.post(`${TAURI_ENDPOINT}/get_default_config_dir`, async ({ request }) => {
+    const { app } = await withJson<{ app: AppId }>(request);
+    const folders: Partial<Record<AppId, string>> = {
+      claude: ".claude",
+      codex: ".codex",
+      gemini: ".gemini",
+      grokbuild: ".grok",
+      opencode: ".config/opencode",
+      openclaw: ".openclaw",
+      hermes: ".hermes",
+      pi: ".pi/agent",
+      zcode: ".zcode",
+      omp: ".omp/agent",
+    };
+    return success(`/home/mock/${folders[app] ?? app}`);
+  }),
+
+  http.post(
+    `${TAURI_ENDPOINT}/detect_config_directories`,
+    async ({ request }) => {
+      const { app } = await withJson<{ app: AppId }>(request);
+      return success({
+        currentDir: `/default/${app}`,
+        defaultDir: `/default/${app}`,
+        candidates: [],
+      });
+    },
+  ),
+
   http.post(`${TAURI_ENDPOINT}/is_portable_mode`, () => success(false)),
 
   http.post(

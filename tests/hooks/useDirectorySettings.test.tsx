@@ -6,12 +6,9 @@ import type { SettingsFormState } from "@/hooks/useSettingsForm";
 const getAppConfigDirOverrideMock = vi.hoisted(() => vi.fn());
 const getDefaultAppConfigDirMock = vi.hoisted(() => vi.fn());
 const getConfigDirMock = vi.hoisted(() => vi.fn());
+const getDefaultConfigDirMock = vi.hoisted(() => vi.fn());
 const selectConfigDirectoryMock = vi.hoisted(() => vi.fn());
 const setAppConfigDirOverrideMock = vi.hoisted(() => vi.fn());
-const homeDirMock = vi.hoisted(() => vi.fn<() => Promise<string>>());
-const joinMock = vi.hoisted(() =>
-  vi.fn(async (...segments: string[]) => segments.join("/")),
-);
 const toastErrorMock = vi.hoisted(() => vi.fn());
 
 vi.mock("@/lib/api", () => ({
@@ -19,14 +16,10 @@ vi.mock("@/lib/api", () => ({
     getAppConfigDirOverride: getAppConfigDirOverrideMock,
     getDefaultAppConfigDir: getDefaultAppConfigDirMock,
     getConfigDir: getConfigDirMock,
+    getDefaultConfigDir: getDefaultConfigDirMock,
     selectConfigDirectory: selectConfigDirectoryMock,
     setAppConfigDirOverride: setAppConfigDirOverrideMock,
   },
-}));
-
-vi.mock("@tauri-apps/api/path", () => ({
-  homeDir: homeDirMock,
-  join: joinMock,
 }));
 
 vi.mock("sonner", () => ({
@@ -61,13 +54,11 @@ describe("useDirectorySettings", () => {
   beforeEach(() => {
     vi.clearAllMocks();
 
-    homeDirMock.mockResolvedValue("/home/mock");
-    joinMock.mockImplementation(async (...segments: string[]) =>
-      segments.join("/"),
-    );
-
     getAppConfigDirOverrideMock.mockResolvedValue(null);
     getDefaultAppConfigDirMock.mockResolvedValue("D:/CCSwitch/data");
+    getDefaultConfigDirMock.mockImplementation(
+      async (app: string) => `D:/automatic/${app}`,
+    );
     getConfigDirMock.mockImplementation(async (app: string) => {
       if (app === "claude") return "/remote/claude";
       if (app === "codex") return "/remote/codex";
@@ -190,7 +181,7 @@ describe("useDirectorySettings", () => {
         action === "edit"
           ? "/newer/draft"
           : action === "reset"
-            ? "/home/mock/.claude"
+            ? "D:/automatic/claude"
             : "/reset/claude",
       );
     },
@@ -238,9 +229,32 @@ describe("useDirectorySettings", () => {
     getConfigDirMock.mockClear();
     await act(() => result.current.resetDirectory("claude"));
     rerender({ settings: { ...initialSettings, claudeConfigDir: undefined } });
-    expect(result.current.resolvedDirs.claude).toBe("/home/mock/.claude");
+    expect(result.current.resolvedDirs.claude).toBe("D:/automatic/claude");
     expect(getConfigDirMock).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ["hermes", "hermesConfigDir"],
+    ["pi", "piConfigDir"],
+    ["omp", "ompConfigDir"],
+  ] as const)(
+    "keeps an explicit %s choice distinct from resetting to its backend default",
+    async (app, field) => {
+      const { result } = renderHook(() =>
+        useDirectorySettings({ settings: createSettings(), onUpdateSettings }),
+      );
+      await waitFor(() => expect(result.current.isLoading).toBe(false));
+      const automaticDirectory = `D:/automatic/${app}`;
+
+      act(() => result.current.updateDirectory(app, automaticDirectory));
+      expect(onUpdateSettings).toHaveBeenLastCalledWith({
+        [field]: automaticDirectory,
+      });
+      await act(() => result.current.resetDirectory(app));
+      expect(onUpdateSettings).toHaveBeenLastCalledWith({ [field]: undefined });
+      expect(result.current.resolvedDirs[app]).toBe(automaticDirectory);
+    },
+  );
 
   it("updates claude directory when browsing succeeds", async () => {
     selectConfigDirectoryMock.mockResolvedValue("/picked/claude");
@@ -375,8 +389,8 @@ describe("useDirectorySettings", () => {
     expect(onUpdateSettings).toHaveBeenCalledWith({
       codexConfigDir: undefined,
     });
-    expect(result.current.resolvedDirs.claude).toBe("/home/mock/.claude");
-    expect(result.current.resolvedDirs.codex).toBe("/home/mock/.codex");
+    expect(result.current.resolvedDirs.claude).toBe("D:/automatic/claude");
+    expect(result.current.resolvedDirs.codex).toBe("D:/automatic/codex");
     expect(result.current.resolvedDirs.appConfig).toBe("D:/CCSwitch/data");
   });
 

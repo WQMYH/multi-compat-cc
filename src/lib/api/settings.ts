@@ -30,6 +30,16 @@ export interface WebDavSyncResult {
   status: string;
 }
 
+export interface ConfigDirectoryDetection {
+  currentDir: string;
+  defaultDir: string;
+  candidates: Array<{
+    path: string;
+    sources: string[];
+    exists: boolean;
+  }>;
+}
+
 export const settingsApi = {
   async get(): Promise<Settings> {
     return await invoke("get_settings");
@@ -91,6 +101,16 @@ export const settingsApi = {
 
   async getConfigDir(appId: AppId): Promise<string> {
     return await invoke("get_config_dir", { app: appId });
+  },
+
+  async getDefaultConfigDir(appId: AppId): Promise<string> {
+    return await invoke("get_default_config_dir", { app: appId });
+  },
+
+  async detectConfigDirectories(
+    appId: AppId,
+  ): Promise<ConfigDirectoryDetection> {
+    return await invoke("detect_config_directories", { app: appId });
   },
 
   async openConfigFolder(appId: AppId): Promise<void> {

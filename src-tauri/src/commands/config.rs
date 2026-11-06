@@ -234,6 +234,24 @@ pub async fn get_config_dir(app: String) -> Result<String, String> {
     Ok(dir.to_string_lossy().to_string())
 }
 
+/// The existing default without a saved directory override. This does not save
+/// settings, create directories, or add a new environment fallback.
+#[tauri::command]
+pub async fn get_default_config_dir(app: String) -> Result<String, String> {
+    let app = AppType::from_str(&app).map_err(|e| e.to_string())?;
+    crate::config_directory::default_dir(&app)
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn detect_config_directories(
+    app: String,
+) -> Result<crate::config_directory::ConfigDirectoryDetection, String> {
+    let app = AppType::from_str(&app).map_err(|e| e.to_string())?;
+    crate::config_directory::detect(&app).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn open_config_folder(handle: AppHandle, app: String) -> Result<bool, String> {
     let config_dir = match AppType::from_str(&app).map_err(|e| e.to_string())? {

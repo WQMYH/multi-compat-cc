@@ -48,7 +48,7 @@ pub(crate) fn get_pi_agent_dir() -> Result<PathBuf, AppError> {
     )
 }
 
-fn resolve_pi_agent_dir(
+pub(crate) fn resolve_pi_agent_dir(
     settings_override: Option<PathBuf>,
     env_override: Option<std::ffi::OsString>,
     default_path: PathBuf,

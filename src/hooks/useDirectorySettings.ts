@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "@/lib/toast";
-import { homeDir, join } from "@tauri-apps/api/path";
 import { settingsApi, type AppId } from "@/lib/api";
 import type { SettingsFormState } from "./useSettingsForm";
 
@@ -37,20 +36,17 @@ export interface ResolvedDirectories {
 }
 
 // Single source of truth for per-app directory metadata.
-const APP_DIRECTORY_META: Record<
-  DirectoryAppId,
-  { key: AppDirectoryKey; defaultFolder: string }
-> = {
-  claude: { key: "claude", defaultFolder: ".claude" },
-  codex: { key: "codex", defaultFolder: ".codex" },
-  gemini: { key: "gemini", defaultFolder: ".gemini" },
-  grokbuild: { key: "grokbuild", defaultFolder: ".grok" },
-  opencode: { key: "opencode", defaultFolder: ".config/opencode" },
-  openclaw: { key: "openclaw", defaultFolder: ".openclaw" },
-  hermes: { key: "hermes", defaultFolder: ".hermes" },
-  pi: { key: "pi", defaultFolder: ".pi/agent" },
-  zcode: { key: "zcode", defaultFolder: ".zcode" },
-  omp: { key: "omp", defaultFolder: ".omp/agent" },
+const APP_DIRECTORY_META: Record<DirectoryAppId, { key: AppDirectoryKey }> = {
+  claude: { key: "claude" },
+  codex: { key: "codex" },
+  gemini: { key: "gemini" },
+  grokbuild: { key: "grokbuild" },
+  opencode: { key: "opencode" },
+  openclaw: { key: "openclaw" },
+  hermes: { key: "hermes" },
+  pi: { key: "pi" },
+  zcode: { key: "zcode" },
+  omp: { key: "omp" },
 };
 
 const DIRECTORY_KEY_TO_SETTINGS_FIELD: Record<
@@ -91,8 +87,7 @@ const computeDefaultConfigDir = async (
   app: DirectoryAppId,
 ): Promise<string | undefined> => {
   try {
-    const home = await homeDir();
-    return await join(home, APP_DIRECTORY_META[app].defaultFolder);
+    return await settingsApi.getDefaultConfigDir(app);
   } catch (error) {
     console.error(
       "[useDirectorySettings] Failed to resolve default config dir",
