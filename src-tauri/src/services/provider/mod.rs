@@ -13,6 +13,9 @@ mod codex_login;
 pub(crate) mod codex_official_models;
 pub(crate) mod codex_terminal;
 pub(crate) mod copilot_direct;
+pub(crate) mod dsh_oauth;
+#[cfg(test)]
+mod dsh_oauth_workflow_tests;
 mod editor_toml;
 mod endpoints;
 mod gemini_auth;
@@ -5608,12 +5611,22 @@ impl ProviderService {
             }
             for (id, provider) in &mut saved {
                 if let Some(config) = native.get(id) {
-                    if let Some(name) = config.get("name").and_then(Value::as_str) {
-                        provider.name = name.into();
+                    // The native OAuth projection contains a per-listener secret.
+                    // Keep the account-bound draft in CC's database and out of
+                    // frontend responses; ordinary native providers still refresh.
+                    if app_type != AppType::Dsh || !dsh_oauth::is_managed(provider) {
+                        if let Some(name) = config.get("name").and_then(Value::as_str) {
+                            provider.name = name.into();
+                        }
+                        provider.settings_config = config.clone();
                     }
-                    provider.settings_config = config.clone();
                 }
-                Self::set_provider_live_config_managed(provider, native.contains_key(id));
+                let in_live = native.get(id).is_some_and(|config| {
+                    app_type != AppType::Dsh
+                        || !dsh_oauth::is_managed(provider)
+                        || dsh_oauth::is_own_projection(id, config)
+                });
+                Self::set_provider_live_config_managed(provider, in_live);
                 if app_type == AppType::Kimi {
                     crate::kimi_config::normalize_provider_identity(
                         provider,
@@ -5797,6 +5810,50 @@ impl ProviderService {
         Ok(true)
     }
 
+    /// Publish an explicitly activated OAuth card through the official DSH
+    /// transaction while keeping its database row free of the local Bearer.
+    pub(crate) fn publish_dsh_oauth(
+        state: &AppState,
+        expected: &Provider,
+        projected: Value,
+    ) -> Result<(), AppError> {
+        let _native_guard = lock_native_provider_operations(state, &AppType::Dsh);
+        let mut current = state
+            .db
+            .get_provider_by_id(&expected.id, "dsh")?
+            .ok_or_else(|| AppError::InvalidInput("DSH_OAUTH_PROVIDER_NOT_FOUND".into()))?;
+        dsh_oauth::validate_draft(&current)?;
+        if current.name != expected.name
+            || current.settings_config != expected.settings_config
+            || dsh_oauth::account_id(&current)? != dsh_oauth::account_id(expected)?
+        {
+            return Err(AppError::Conflict("DSH_OAUTH_CONFIG_CHANGED".into()));
+        }
+        crate::dsh_config::validate_provider(&current.id, &projected)?;
+        let exists = crate::dsh_config::provider_key_exists(&current.id)?;
+        if exists {
+            let native = crate::dsh_config::get_providers()?;
+            let ours = Self::provider_live_config_managed(&current) == Some(true)
+                && native
+                    .get(&current.id)
+                    .is_some_and(|config| dsh_oauth::is_own_projection(&current.id, config));
+            if !ours {
+                return Err(AppError::Conflict("DSH_OAUTH_CONFIG_CONFLICT".into()));
+            }
+        }
+        Self::set_provider_live_config_managed(&mut current, true);
+        crate::dsh_config::save_and_commit(&current.id, Some(projected), !exists, || {
+            state.db.save_provider("dsh", &current)
+        })
+    }
+
+    fn dsh_oauth_owns_live(provider: &Provider) -> Result<bool, AppError> {
+        let native = crate::dsh_config::get_providers()?;
+        Ok(native
+            .get(&provider.id)
+            .is_some_and(|config| dsh_oauth::is_own_projection(&provider.id, config)))
+    }
+
     /// 新增供应商之前的规范化和校验，`add` 和 `add_without_switching` 共用。
     fn prepare_new_provider(app_type: &AppType, provider: &mut Provider) -> Result<(), AppError> {
         // Normalize Claude model keys
@@ -5857,6 +5914,9 @@ impl ProviderService {
         // Copilot 官方卡只存行、不写文件：前端新增默认带 addToLive=true，不当错误。
         let add_to_live = add_to_live
             && !(app_type == AppType::Copilot && copilot_direct::is_official(&provider))
+            // An account-bound DSH card is a draft until the user explicitly
+            // starts its per-card local route; never write the draft as native.
+            && !(app_type == AppType::Dsh && dsh_oauth::is_managed(&provider))
             && !(app_type == AppType::ZCode && zcode_direct::needs_routing(&provider));
         if app_type.is_additive_mode() {
             Self::set_provider_live_config_managed(&mut provider, add_to_live);
@@ -6475,6 +6535,15 @@ impl ProviderService {
         let existing_provider = state
             .db
             .get_provider_by_id(&original_id, app_type.as_str())?;
+        if app_type == AppType::Dsh
+            && existing_provider.as_ref().is_some_and(|existing| {
+                dsh_oauth::is_managed(existing) != dsh_oauth::is_managed(&provider)
+            })
+        {
+            return Err(AppError::InvalidInput(
+                "Create a separate DSH provider to change between API key and ChatGPT account authentication".into(),
+            ));
+        }
         // Normalize Claude model keys
         Self::normalize_provider_if_claude(&app_type, &mut provider);
         Self::validate_provider_settings(&app_type, &provider)?;
@@ -6555,6 +6624,16 @@ impl ProviderService {
                 crate::settings::set_current_provider(&app_type, Some(provider.id.as_str()))?;
             }
 
+            return Ok(true);
+        }
+
+        if app_type == AppType::Dsh && dsh_oauth::is_managed(&provider) {
+            // Editing changes the clean draft only. An active listener checks the
+            // current draft before each request, so re-activation is required to
+            // publish any changed account or models to DSH.
+            let in_live = Self::dsh_oauth_owns_live(&provider)?;
+            Self::set_provider_live_config_managed(&mut provider, in_live);
+            state.db.save_provider("dsh", &provider)?;
             return Ok(true);
         }
 
@@ -6810,6 +6889,13 @@ impl ProviderService {
             return pi::delete(state, id);
         }
         if app_type == AppType::Dsh {
+            if let Some(provider) = state.db.get_provider_by_id(id, "dsh")? {
+                if dsh_oauth::is_managed(&provider) && !Self::dsh_oauth_owns_live(&provider)? {
+                    // A draft or an independently replaced native provider is
+                    // not ours to remove from the user's DSH configuration.
+                    return state.db.delete_provider("dsh", id);
+                }
+            }
             return crate::dsh_config::save_and_commit(id, None, false, || {
                 state.db.delete_provider(app_type.as_str(), id)
             });
@@ -6985,6 +7071,13 @@ impl ProviderService {
             return pi::remove(state, id);
         }
         if app_type == AppType::Dsh {
+            if let Some(mut provider) = state.db.get_provider_by_id(id, "dsh")? {
+                if dsh_oauth::is_managed(&provider) && !Self::dsh_oauth_owns_live(&provider)? {
+                    // Leave any independently modified native provider intact.
+                    Self::set_provider_live_config_managed(&mut provider, false);
+                    return state.db.save_provider("dsh", &provider);
+                }
+            }
             return crate::dsh_config::save_and_commit(id, None, false, || {
                 if let Some(mut provider) = state.db.get_provider_by_id(id, app_type.as_str())? {
                     Self::set_provider_live_config_managed(&mut provider, false);
@@ -7185,6 +7278,11 @@ impl ProviderService {
             .ok_or_else(|| AppError::Message(format!("供应商 {id} 不存在")))?;
 
         if app_type == AppType::Dsh {
+            if dsh_oauth::is_managed(_provider) {
+                return Err(AppError::InvalidInput(
+                    "Enable this ChatGPT account card to connect it to DSH".into(),
+                ));
+            }
             let mut provider = _provider.clone();
             Self::set_provider_live_config_managed(&mut provider, true);
             crate::dsh_config::save_and_commit(
@@ -8325,7 +8423,11 @@ impl ProviderService {
         icon::validate_icon(provider.icon.as_deref())?;
         match app_type {
             AppType::Dsh => {
-                crate::dsh_config::validate_provider(&provider.id, &provider.settings_config)?;
+                if dsh_oauth::is_managed(provider) {
+                    dsh_oauth::validate_draft(provider)?;
+                } else {
+                    crate::dsh_config::validate_provider(&provider.id, &provider.settings_config)?;
+                }
             }
             AppType::Claude => {
                 if !provider.settings_config.is_object() {

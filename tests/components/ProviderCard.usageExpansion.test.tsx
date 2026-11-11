@@ -1,12 +1,14 @@
 import { QueryClientProvider } from "@tanstack/react-query";
-import { render, screen } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
+import { http, HttpResponse } from "msw";
 import { ProviderCard } from "@/components/providers/ProviderCard";
 import type { TemplateType } from "@/config/constants";
 import { usageKeys } from "@/lib/query/usage";
 import type { Provider } from "@/types";
 import { createTestQueryClient } from "../utils/testQueryClient";
+import { server } from "../msw/server";
 
 vi.mock("@/components/providers/ProviderActions", () => ({
   ProviderActions: () => null,
@@ -18,6 +20,9 @@ vi.mock("@/components/UsageFooter", () => ({
 }));
 vi.mock("@/components/SubscriptionQuotaFooter", () => ({
   default: () => <div>official-subscription-quota</div>,
+}));
+vi.mock("@/components/CodexOauthQuotaFooter", () => ({
+  default: () => <div>codex-oauth-quota</div>,
 }));
 vi.mock("@/lib/query/failover", () => ({
   useProviderHealth: () => ({ data: undefined }),
@@ -71,6 +76,78 @@ function renderCard({
 }
 
 describe("ProviderCard cached usage expansion", () => {
+  it("offers retry when a DSH ChatGPT provider is configured and its route is inactive", async () => {
+    let active = false;
+    server.use(
+      http.post("http://tauri.local/auth_get_status", () =>
+        HttpResponse.json({
+          provider: "codex_oauth",
+          authenticated: true,
+          default_account_id: "fixture-account",
+          accounts: [
+            {
+              id: "fixture-account",
+              login: "Fixture account",
+              reauth_required: false,
+            },
+          ],
+        }),
+      ),
+      http.post("http://tauri.local/get_dsh_oauth_route_status", () =>
+        HttpResponse.json({ active }),
+      ),
+    );
+    const onActivate = vi.fn();
+    const queryClient = createTestQueryClient();
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ProviderCard
+          provider={{
+            id: "chatgpt",
+            name: "ChatGPT fixture",
+            settingsConfig: { api: "openai-responses", models: {} },
+            meta: {
+              liveConfigManaged: true,
+              providerType: "codex_oauth",
+              authBinding: {
+                source: "managed_account",
+                authProvider: "codex_oauth",
+                accountId: "fixture-account",
+              },
+            },
+          }}
+          appId="dsh"
+          isCurrent={false}
+          presentation={{ chips: [], buttons: [] }}
+          dshOAuthRoute={{ activating: false, onActivate }}
+          onEdit={vi.fn()}
+          onDelete={vi.fn()}
+          onConfigureUsage={vi.fn()}
+          onOpenWebsite={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+    await screen.findByText("dsh.codexOAuth.routeInactive");
+    expect(screen.queryByText("dsh.codexOAuth.routeActive")).toBeNull();
+    expect(screen.queryByText("codex-oauth-quota")).toBeNull();
+    const retry = screen.getByRole("button", {
+      name: "dsh.codexOAuth.retryActivation",
+    });
+    await waitFor(() => expect(retry).toBeEnabled());
+    await userEvent.click(retry);
+    expect(onActivate).toHaveBeenCalledOnce();
+    active = true;
+    await act(async () => {
+      await queryClient.invalidateQueries({
+        queryKey: ["dsh-oauth-route-status", "chatgpt"],
+      });
+    });
+    await screen.findByText("dsh.codexOAuth.routeActive");
+    expect(
+      screen.queryByRole("button", { name: "dsh.codexOAuth.retryActivation" }),
+    ).toBeNull();
+  });
+
   it("keeps official subscription quota inline despite cached script tiers", () => {
     renderCard({ official: true, templateType: "official_subscription" });
 

@@ -10,9 +10,10 @@ use crate::proxy::server::ProxyServer;
 use crate::proxy::switch_lock::SwitchLockManager;
 use crate::proxy::types::*;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::Emitter;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::live::project::claude::PROXY_TOKEN_PLACEHOLDER;
 
@@ -20,6 +21,10 @@ use crate::live::project::claude::PROXY_TOKEN_PLACEHOLDER;
 pub struct ProxyService {
     db: Arc<Database>,
     server: Arc<RwLock<Option<ProxyServer>>>,
+    /// Serialize listener replacement with DSH account route activation.
+    lifecycle_lock: Arc<Mutex<()>>,
+    /// A listener created solely for an explicitly enabled DSH account.
+    dsh_owned_listener: Arc<AtomicBool>,
     /// AppHandle，用于传递给 ProxyServer 以支持故障转移时的 UI 更新
     app_handle: Arc<RwLock<Option<tauri::AppHandle>>>,
     switch_locks: SwitchLockManager,
@@ -61,6 +66,8 @@ impl ProxyService {
         Self {
             db,
             server: Arc::new(RwLock::new(None)),
+            lifecycle_lock: Arc::new(Mutex::new(())),
+            dsh_owned_listener: Arc::new(AtomicBool::new(false)),
             app_handle: Arc::new(RwLock::new(None)),
             switch_locks: SwitchLockManager::new(),
         }
@@ -82,16 +89,169 @@ impl ProxyService {
 
     /// 启动代理服务器。成功、失败都让托盘比对一次（图标圆点、问题区、「退出」的后果跟着变）。
     pub async fn start(&self) -> Result<ProxyServerInfo, String> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
         let result = self.start_server().await;
+        if result.is_ok() {
+            self.dsh_owned_listener.store(false, Ordering::Release);
+        }
         self.notify_tray().await;
         result
     }
 
     /// 停止代理服务器。同 [`Self::start`]，结束后让托盘比对一次。
     pub async fn stop(&self) -> Result<(), String> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
         let result = self.stop_server().await;
+        if result.is_ok() {
+            self.dsh_owned_listener.store(false, Ordering::Release);
+        }
         self.notify_tray().await;
         result
+    }
+
+    /// A route used by DSH keeps the shared listener alive when another app
+    /// returns to direct mode. An explicit stop still closes the listener.
+    pub(crate) async fn stop_if_unused(&self) -> Result<(), String> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        if crate::mode::current::proxy_flags(crate::mode::controller::PROXY_APPS).contains(&true) {
+            return Ok(());
+        }
+        let (running, dsh_in_use) = {
+            let server = self.server.read().await;
+            (
+                server.is_some(),
+                server
+                    .as_ref()
+                    .is_some_and(ProxyServer::has_active_dsh_oauth_routes),
+            )
+        };
+        if !running || dsh_in_use {
+            return Ok(());
+        }
+        let result = self.stop_server().await;
+        if result.is_ok() {
+            self.dsh_owned_listener.store(false, Ordering::Release);
+        }
+        self.notify_tray().await;
+        result
+    }
+
+    pub(crate) async fn dsh_oauth_route_active(&self, provider_id: &str) -> bool {
+        self.server
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|server| server.is_dsh_oauth_route_active(provider_id))
+    }
+
+    pub(crate) async fn deactivate_dsh_oauth_route(&self, provider_id: &str) {
+        {
+            let _lifecycle = self.lifecycle_lock.lock().await;
+            if let Some(server) = self.server.read().await.as_ref() {
+                server.deactivate_dsh_oauth_route(provider_id);
+            }
+        }
+        if self.dsh_owned_listener.load(Ordering::Acquire) {
+            if let Err(error) = self.stop_if_unused().await {
+                log::warn!("停止不再使用的 DSH 代理失败: {error}");
+            }
+        }
+    }
+
+    /// Explicitly activate one saved DSH account card without taking over any
+    /// other application or changing the global proxy switch.
+    pub(crate) async fn activate_dsh_oauth_provider(
+        &self,
+        state: &crate::store::AppState,
+        provider_id: &str,
+    ) -> Result<(), String> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        let database = state.db.clone();
+        let id = provider_id.to_owned();
+        let draft = tokio::task::spawn_blocking(move || database.get_provider_by_id(&id, "dsh"))
+            .await
+            .map_err(|_| "DSH_OAUTH_PROVIDER_UNAVAILABLE".to_string())?
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "DSH_OAUTH_PROVIDER_NOT_FOUND".to_string())?;
+        crate::services::provider::dsh_oauth::validate_draft(&draft)
+            .map_err(|error| error.to_string())?;
+        let account_id = crate::services::provider::dsh_oauth::account_id(&draft)
+            .map_err(|error| error.to_string())?;
+        state
+            .codex_oauth_manager
+            .ensure_account_exists(account_id)
+            .await
+            .map_err(|_| "DSH_OAUTH_ACCOUNT_UNAVAILABLE".to_string())?;
+
+        let server_guard = self.server.read().await;
+        if let Some(server) = server_guard.as_ref() {
+            return self
+                .publish_dsh_oauth_on_server(state, &draft, server)
+                .await;
+        }
+        drop(server_guard);
+
+        let config = self
+            .db
+            .get_proxy_config()
+            .await
+            .map_err(|error| format!("Could not read proxy settings: {error}"))?;
+        if !config
+            .listen_address
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+        {
+            return Err("DSH_OAUTH_NON_LOOPBACK".into());
+        }
+        let app_handle = self.app_handle.read().await.clone();
+        let server = ProxyServer::new(config, self.db.clone(), app_handle);
+        server
+            .start()
+            .await
+            .map_err(|error| format!("DSH_OAUTH_PROXY_UNAVAILABLE: {error}"))?;
+        if let Err(error) = self
+            .publish_dsh_oauth_on_server(state, &draft, &server)
+            .await
+        {
+            let _ = server.stop().await;
+            return Err(error);
+        }
+        *self.server.write().await = Some(server);
+        self.dsh_owned_listener.store(true, Ordering::Release);
+        self.notify_tray().await;
+        Ok(())
+    }
+
+    async fn publish_dsh_oauth_on_server(
+        &self,
+        state: &crate::store::AppState,
+        draft: &Provider,
+        server: &ProxyServer,
+    ) -> Result<(), String> {
+        let base = server.dsh_oauth_base_url(&draft.id)?;
+        let bearer = crate::proxy::new_dsh_oauth_route_key();
+        let projected = crate::services::provider::dsh_oauth::project(draft, &base, &bearer)
+            .map_err(|error| error.to_string())?;
+        let binding = server.prepare_dsh_oauth_route(draft, &projected)?;
+        let commit_state = state.clone();
+        let commit_draft = draft.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::services::provider::ProviderService::publish_dsh_oauth(
+                &commit_state,
+                &commit_draft,
+                projected,
+            )
+        })
+        .await
+        .map_err(|_| "Could not save the DSH account configuration".to_string())?
+        .map_err(|error| error.to_string())?;
+        if server.activate_dsh_oauth_route(binding).is_err() {
+            server.deactivate_dsh_oauth_route(&draft.id);
+            return Err(
+                "The card was saved to DSH but the local route is inactive; enable it again".into(),
+            );
+        }
+        Ok(())
     }
 
     /// 托盘在后台线程比对、变了才重建，这里不等它。
@@ -475,6 +635,7 @@ impl ProxyService {
     /// 更新代理配置（旧接口：七个字段整份写进四行）。返回代理是否因地址或端口变了而重启：
     /// 重启后调用方要按新地址重写接上代理的客户端（`mode::controller::resync_route`）。
     pub async fn update_config(&self, config: &ProxyConfig) -> Result<bool, String> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
         // 记录旧配置用于判定是否需要重启
         let previous = self
             .db
@@ -502,6 +663,7 @@ impl ProxyService {
     /// [`Self::update_config`] 走的旧 DAO 读的是 claude 行、写的是四行，会把 claude 的
     /// 应用级字段广播给其他三家。返回值同 [`Self::update_config`]。
     pub async fn update_global_config(&self, config: &GlobalProxyConfig) -> Result<bool, String> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
         let previous = self
             .db
             .get_global_proxy_config()

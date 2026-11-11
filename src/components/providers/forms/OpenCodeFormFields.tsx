@@ -273,6 +273,9 @@ function ReasoningEffortsField({
 }
 
 interface OpenCodeFormFieldsProps {
+  modelsOnly?: boolean;
+  emptyModelsMessage?: string;
+  fetchAccountModels?: () => Promise<FetchedModel[]>;
   allowBuiltinDefaults?: boolean;
   /** 模型字段方言：DeepSeek Harness 多出思考档位和接口兼容性。 */
   modelDialect?: OpenCodeModelDialect;
@@ -310,6 +313,9 @@ interface OpenCodeFormFieldsProps {
 }
 
 export function OpenCodeFormFields({
+  modelsOnly = false,
+  emptyModelsMessage,
+  fetchAccountModels,
   allowBuiltinDefaults = false,
   modelDialect = "opencode",
   presetModelSources = opencodePresetModelSources,
@@ -344,16 +350,16 @@ export function OpenCodeFormFields({
     setFetchedModels((prev) => (prev.length === 0 ? prev : []));
     setIsFetchingModels(false);
     return () => {
-      // Ignore responses for a previous endpoint/key or an unmounted form.
+      // Ignore responses for previous credentials or an unmounted form.
       modelFetchGeneration.current += 1;
     };
-  }, [baseUrl, apiKey, headersKey]);
+  }, [baseUrl, apiKey, headersKey, fetchAccountModels]);
 
   const handleFetchModels = useCallback(() => {
     const requestHeaders = normalizeRequestHeaders(headers);
     const hasCredentials =
       Boolean(apiKey) || Object.keys(requestHeaders).length > 0;
-    if (!baseUrl || !hasCredentials) {
+    if (!fetchAccountModels && (!baseUrl || !hasCredentials)) {
       showFetchModelsError(null, t, {
         hasApiKey: hasCredentials,
         hasBaseUrl: Boolean(baseUrl),
@@ -369,14 +375,17 @@ export function OpenCodeFormFields({
     const generation = ++modelFetchGeneration.current;
     setFetchedModels([]);
     setIsFetchingModels(true);
-    fetchModelsForConfig(
-      baseUrl,
-      apiKey,
-      undefined,
-      undefined,
-      customUserAgent,
-      { requestHeaders },
-    )
+    const request = fetchAccountModels
+      ? fetchAccountModels()
+      : fetchModelsForConfig(
+          baseUrl,
+          apiKey,
+          undefined,
+          undefined,
+          customUserAgent,
+          { requestHeaders },
+        );
+    request
       .then((result) => {
         if (generation !== modelFetchGeneration.current) return;
         const models = [
@@ -398,7 +407,7 @@ export function OpenCodeFormFields({
           setIsFetchingModels(false);
         }
       });
-  }, [baseUrl, apiKey, headers, t]);
+  }, [baseUrl, apiKey, headers, fetchAccountModels, t]);
 
   // Track which models have expanded options panel
   const [expandedModels, setExpandedModels] = useState<Set<string>>(new Set());
@@ -712,7 +721,7 @@ export function OpenCodeFormFields({
     });
   };
 
-  return (
+  const connectionFields = modelsOnly ? null : (
     <>
       {/* NPM Package Selector */}
       <div className="space-y-2">
@@ -857,7 +866,12 @@ export function OpenCodeFormFields({
           )}
         </div>
       </div>
+    </>
+  );
 
+  return (
+    <>
+      {connectionFields}
       {/* Models Editor */}
       <div className="space-y-3 border-l border-border pl-3">
         <div className="flex items-center justify-between">
@@ -865,14 +879,16 @@ export function OpenCodeFormFields({
             {t("opencode.models", { defaultValue: "Models" })}
           </FormLabel>
           <div className="flex gap-1">
-            <FetchedModelPicker
-              models={fetchedModels}
-              configuredModelIds={Object.keys(models)}
-              onApply={handleApplyFetchedModels}
-              onFetch={handleFetchModels}
-              isFetching={isFetchingModels}
-              metadataSource={{ baseUrl, presets: presetModelSources }}
-            />
+            {(!modelsOnly || fetchAccountModels) && (
+              <FetchedModelPicker
+                models={fetchedModels}
+                configuredModelIds={Object.keys(models)}
+                onApply={handleApplyFetchedModels}
+                onFetch={handleFetchModels}
+                isFetching={isFetchingModels}
+                metadataSource={{ baseUrl, presets: presetModelSources }}
+              />
+            )}
             <Button
               type="button"
               variant="outline"
@@ -888,9 +904,10 @@ export function OpenCodeFormFields({
 
         {Object.keys(models).length === 0 ? (
           <p className="text-sm text-fg-2 py-2">
-            {t("opencode.noModels", {
-              defaultValue: "No models configured. Click Add to add a model.",
-            })}
+            {emptyModelsMessage ??
+              t("opencode.noModels", {
+                defaultValue: "No models configured. Click Add to add a model.",
+              })}
           </p>
         ) : (
           <div className="space-y-2">
@@ -1054,34 +1071,39 @@ export function OpenCodeFormFields({
                         />
                       )}
 
-                    {modelDialect === "dsh" && isPlainObject(model.compat) && (
-                      <StructuredOptionsEditor
-                        id={`opencode-${key}-compat`}
-                        title={t("pi.form.compatibility")}
-                        hint={t("pi.form.compatibilityHint")}
-                        addLabel={t("pi.form.addCompatibilityOption")}
-                        emptyLabel={t("pi.form.noCompatibilityOptions")}
-                        keyLabel={t("pi.form.optionKey")}
-                        valueLabel={t("pi.form.optionValue")}
-                        keyPlaceholder="supportsDeveloperRole"
-                        valuePlaceholder="false"
-                        removeLabel={t("pi.form.removeCompatibilityOption")}
-                        options={model.compat}
-                        onOptionsChange={(compat) => {
-                          const { compat: _previous, ...rest } = model;
-                          updateModel(
-                            key,
-                            Object.keys(compat).length > 0
-                              ? { ...rest, compat }
-                              : (rest as OpenCodeModel),
-                          );
-                        }}
-                        className="sm:col-span-2"
-                      />
-                    )}
+                    {!modelsOnly &&
+                      modelDialect === "dsh" &&
+                      isPlainObject(model.compat) && (
+                        <StructuredOptionsEditor
+                          id={`opencode-${key}-compat`}
+                          title={t("pi.form.compatibility")}
+                          hint={t("pi.form.compatibilityHint")}
+                          addLabel={t("pi.form.addCompatibilityOption")}
+                          emptyLabel={t("pi.form.noCompatibilityOptions")}
+                          keyLabel={t("pi.form.optionKey")}
+                          valueLabel={t("pi.form.optionValue")}
+                          keyPlaceholder="supportsDeveloperRole"
+                          valuePlaceholder="false"
+                          removeLabel={t("pi.form.removeCompatibilityOption")}
+                          options={model.compat}
+                          onOptionsChange={(compat) => {
+                            const { compat: _previous, ...rest } = model;
+                            updateModel(
+                              key,
+                              Object.keys(compat).length > 0
+                                ? { ...rest, compat }
+                                : (rest as OpenCodeModel),
+                            );
+                          }}
+                          className="sm:col-span-2"
+                        />
+                      )}
 
                     {/* Model Properties (extra fields like variants, cost) */}
-                    <div className="space-y-2 sm:col-span-2">
+                    <div
+                      hidden={modelsOnly}
+                      className="space-y-2 sm:col-span-2"
+                    >
                       <div className="flex items-center justify-between">
                         <span className="text-xs font-medium text-fg-2">
                           {t("opencode.modelExtraFields", {
@@ -1164,7 +1186,10 @@ export function OpenCodeFormFields({
                     </div>
 
                     {/* SDK Options (model.options) */}
-                    <div className="space-y-2 sm:col-span-2">
+                    <div
+                      hidden={modelsOnly}
+                      className="space-y-2 sm:col-span-2"
+                    >
                       <div className="flex items-center justify-between">
                         <span className="text-xs font-medium text-fg-2">
                           {t("opencode.sdkOptions", {

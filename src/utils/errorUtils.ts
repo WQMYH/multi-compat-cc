@@ -62,6 +62,28 @@ export const translatePiProviderMutationError = (
   return "";
 };
 
+export const translateDshOAuthProviderError = (
+  error: unknown,
+  t: (key: string) => string,
+): string | undefined => {
+  const code = extractErrorMessage(error).match(/\bDSH_OAUTH_[A-Z_]+\b/)?.[0];
+  switch (code) {
+    case "DSH_OAUTH_EXPLICIT_ACCOUNT_REQUIRED":
+    case "DSH_OAUTH_ACCOUNT_UNAVAILABLE":
+      return t("codexOauth.selectedAccountNeedsReauth");
+    case "DSH_OAUTH_MODEL_REQUIRED":
+      return t("dsh.codexOAuth.modelRequired");
+    case "DSH_OAUTH_MODEL_INVALID":
+      return t("dsh.codexOAuth.modelInvalid");
+    case "DSH_OAUTH_NON_LOOPBACK":
+      return t("dsh.codexOAuth.nonLoopback");
+    case "DSH_OAUTH_CONFIG_CONFLICT":
+      return t("dsh.codexOAuth.configConflict");
+    case "DSH_OAUTH_PROXY_UNAVAILABLE":
+      return t("dsh.codexOAuth.proxyUnavailable");
+  }
+};
+
 /**
  * Kimi 的默认模型可能在 Kimi Code 里被改过、页面上还是旧的，
  * 后端按 config.toml 现读拒绝后，把这两条英文原因换成说明。

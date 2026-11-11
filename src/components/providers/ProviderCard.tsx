@@ -14,6 +14,7 @@ import type {
 import type { Provider } from "@/types";
 import type { AppId } from "@/lib/api";
 import { authApi } from "@/lib/api";
+import { providersApi } from "@/lib/api/providers";
 import { cn } from "@/lib/utils";
 import { ProviderIconBox } from "@/components/ProviderIconBox";
 import { HoverTip } from "@/components/ui/hover-tip";
@@ -78,6 +79,10 @@ interface ProviderCardProps {
   presentation: CardPresentation;
   /** 用来决定官方订阅 / OAuth 额度是否自动查询 */
   isCurrent: boolean;
+  dshOAuthRoute?: {
+    activating: boolean;
+    onActivate: () => void;
+  };
   onEdit: (provider: Provider) => void;
   onDelete: (provider: Provider) => void;
   onConfigureUsage: (provider: Provider) => void;
@@ -217,8 +222,9 @@ const extractApiUrl = (provider: Provider, fallbackText: string) => {
 export function ProviderCard({
   provider,
   appId,
-  presentation,
+  presentation: defaultPresentation,
   isCurrent,
+  dshOAuthRoute,
   onEdit,
   onDelete,
   onConfigureUsage,
@@ -230,7 +236,9 @@ export function ProviderCard({
   dragHandleProps,
 }: ProviderCardProps) {
   const { t } = useTranslation();
-  const codexOfficialIdentity = resolveCodexOfficialIdentity(appId, provider);
+  const codexOfficialIdentity = dshOAuthRoute
+    ? "managed_account"
+    : resolveCodexOfficialIdentity(appId, provider);
   const managedCodexAccountId = resolveManagedAccountId(
     provider.meta,
     "codex_oauth",
@@ -250,6 +258,60 @@ export function ProviderCard({
   const managedCodexAccount = codexAuthStatus?.accounts.find(
     (account) => account.id === managedCodexAccountId,
   );
+  const dshConfigured =
+    Boolean(dshOAuthRoute) && provider.meta?.liveConfigManaged === true;
+  const dshRouteStatus = useQuery({
+    queryKey: ["dsh-oauth-route-status", provider.id, managedCodexAccountId],
+    queryFn: () => providersApi.getDshOAuthRouteStatus(provider.id),
+    enabled: dshConfigured,
+    refetchInterval: 5_000,
+    retry: false,
+  });
+  const dshAccountReady =
+    provider.meta?.providerType === PROVIDER_TYPES.CODEX_OAUTH &&
+    isCodexAuthStatusSuccess &&
+    codexAuthStatus.authenticated &&
+    Boolean(managedCodexAccount && !managedCodexAccount.reauth_required);
+  const dshRouteActive =
+    dshConfigured &&
+    dshAccountReady &&
+    dshRouteStatus.isSuccess &&
+    dshRouteStatus.data.active;
+  const presentation: CardPresentation = dshOAuthRoute
+    ? {
+        ...defaultPresentation,
+        status: {
+          label: !dshConfigured
+            ? t("dsh.codexOAuth.notEnabled")
+            : dshRouteActive
+              ? t("dsh.codexOAuth.routeActive")
+              : dshRouteStatus.isSuccess
+                ? t("dsh.codexOAuth.routeInactive")
+                : dshRouteStatus.isPending
+                  ? t("common.loading")
+                  : t("dsh.codexOAuth.routeStatusUnavailable"),
+          dot: dshRouteActive ? "route" : "muted",
+        },
+        buttons: dshRouteActive
+          ? defaultPresentation.buttons
+          : [
+              {
+                key: "activate-dsh-oauth",
+                label: t(
+                  dshConfigured
+                    ? "dsh.codexOAuth.retryActivation"
+                    : "dsh.codexOAuth.activate",
+                ),
+                onClick: dshOAuthRoute.onActivate,
+                disabledReason: dshOAuthRoute.activating
+                  ? t("common.loading")
+                  : !dshAccountReady
+                    ? t("dsh.codexOAuth.accountRequired")
+                    : undefined,
+              },
+            ],
+      }
+    : defaultPresentation;
   const manualNote = provider.notes?.trim() || undefined;
   const providerNameIncludesAccountLogin = Boolean(
     managedCodexAccount?.login &&
@@ -340,8 +402,9 @@ export function ProviderCard({
     appId !== "copilot" &&
     (provider.meta?.providerType === PROVIDER_TYPES.GITHUB_COPILOT ||
       provider.meta?.usage_script?.templateType === "github_copilot");
-  const isCodexOauth =
-    appId === "codex"
+  const isCodexOauth = dshOAuthRoute
+    ? dshRouteActive
+    : appId === "codex"
       ? isBoundCodexOfficial
       : provider.meta?.providerType === PROVIDER_TYPES.CODEX_OAUTH;
   // xAI OAuth (SuperGrok 反代)：额度经自管 OAuth token 自动显示，与 codex_oauth 同构
@@ -538,7 +601,8 @@ export function ProviderCard({
                     })}
                   </span>
                 </span>
-              ) : isCodexAuthStatusSuccess ? (
+              ) : isCodexAuthStatusSuccess ||
+                (dshOAuthRoute && !managedCodexAccountId) ? (
                 <>
                   <span className="inline-flex min-w-0 items-center gap-1 text-sm text-warning-text">
                     <AlertTriangle className="h-3.5 w-3.5 shrink-0" />

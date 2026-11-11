@@ -608,6 +608,32 @@ pub(crate) async fn remove_codex_oauth_account_with_switch_lock(
         .remove_account(account_id)
         .await
         .map_err(|error| error.to_string())?;
+    // DSH cards retain their selected-account draft for repair, but their
+    // listener grants must not remain active after that account is removed.
+    let db = app_state.db.clone();
+    let removed_account = account_id.to_owned();
+    let dsh_cards = tauri::async_runtime::spawn_blocking(move || {
+        db.get_all_providers("dsh").map(|providers| {
+            providers
+                .into_iter()
+                .filter_map(|(id, provider)| {
+                    crate::services::provider::dsh_oauth::account_id(&provider)
+                        .ok()
+                        .filter(|bound| *bound == removed_account)
+                        .map(|_| id)
+                })
+                .collect::<Vec<_>>()
+        })
+    })
+    .await
+    .map_err(|_| "账号已删除，但 DSH 路由清理失败".to_string())?
+    .map_err(|error| format!("账号已删除，但 DSH 路由清理失败: {error}"))?;
+    for id in dsh_cards {
+        app_state
+            .proxy_service
+            .deactivate_dsh_oauth_route(&id)
+            .await;
+    }
     app_state
         .db
         .unbind_codex_managed_accounts(&[account_id.to_string()])

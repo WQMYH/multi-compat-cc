@@ -6,8 +6,10 @@ import type { DeleteSessionOptions } from "@/lib/api/sessions";
 import type { ProviderEditorSave, SwitchResult } from "@/lib/api/providers";
 import { parseLiveEditConflict } from "@/lib/errors/liveEditConflict";
 import type { Provider, SessionMeta, Settings } from "@/types";
+import { isDshCodexOAuthProvider } from "@/lib/authBinding";
 import {
   extractErrorMessage,
+  translateDshOAuthProviderError,
   translateKimiProviderMutationError,
   translatePiProviderMutationError,
 } from "@/utils/errorUtils";
@@ -66,7 +68,9 @@ export const useAddProviderMutation = (appId: AppId) => {
       }
 
       let id: string;
-      let liveTarget = addToLive;
+      let liveTarget = isDshCodexOAuthProvider(appId, providerInput.meta)
+        ? false
+        : addToLive;
 
       if (appId === "copilot") {
         // Copilot CLI：自带模型卡的 id 就是 providers.json 里的供应商名（表单填的）；官方卡
@@ -167,9 +171,16 @@ export const useAddProviderMutation = (appId: AppId) => {
         },
       );
     },
-    onError: (error: Error) => {
+    onError: (error, provider) => {
       // 编辑冲突由对话框让用户选保留哪一边，不弹失败提示。
       if (parseLiveEditConflict(error)) return;
+      if (isDshCodexOAuthProvider(appId, provider.meta)) {
+        toast.error(
+          translateDshOAuthProviderError(error, t) ??
+            t("dsh.codexOAuth.saveFailed"),
+        );
+        return;
+      }
       const rawDetail = extractErrorMessage(error);
       const detail =
         (isPiFamilyApp(appId)
@@ -241,8 +252,15 @@ export const useUpdateProviderMutation = (appId: AppId) => {
         },
       );
     },
-    onError: (error: Error) => {
+    onError: (error, { provider }) => {
       if (parseLiveEditConflict(error)) return;
+      if (isDshCodexOAuthProvider(appId, provider.meta)) {
+        toast.error(
+          translateDshOAuthProviderError(error, t) ??
+            t("dsh.codexOAuth.saveFailed"),
+        );
+        return;
+      }
       const rawDetail = extractErrorMessage(error);
       const detail =
         (isPiFamilyApp(appId)
@@ -259,7 +277,12 @@ export const useUpdateProviderMutation = (appId: AppId) => {
         }),
       );
     },
-    onSettled: async () => {
+    onSettled: async (_data, _error, { provider }) => {
+      if (isDshCodexOAuthProvider(appId, provider.meta)) {
+        await queryClient.invalidateQueries({
+          queryKey: ["dsh-oauth-route-status", provider.id],
+        });
+      }
       if (isPiFamilyApp(appId)) {
         await invalidatePiProviderCaches(queryClient, appId);
       } else if (appId === "kimi") {

@@ -165,6 +165,16 @@ export const providersApi = {
     return await invoke("remove_provider_from_live_config", { id, app: appId });
   },
 
+  async activateDshOAuthProvider(providerId: string): Promise<void> {
+    await invoke("activate_dsh_oauth_provider", { providerId });
+  },
+
+  async getDshOAuthRouteStatus(
+    providerId: string,
+  ): Promise<{ active: boolean }> {
+    return await invoke("get_dsh_oauth_route_status", { providerId });
+  },
+
   async switch(id: string, appId: AppId): Promise<SwitchResult> {
     return await invoke("switch_provider", { id, app: appId });
   },

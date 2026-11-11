@@ -11,6 +11,8 @@ import { McodeProviderForm } from "@/components/providers/forms/McodeProviderFor
 import { mcodeProviderPresets } from "@/config/mcodeProviderPresets";
 import { piProviderPresets } from "@/config/piProviderPresets";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import { http, HttpResponse } from "msw";
+import { server } from "../msw/server";
 import { setProviders } from "../msw/state";
 import { createTestQueryClient } from "../utils/testQueryClient";
 
@@ -396,6 +398,96 @@ describe("McodeProviderForm", () => {
           .value,
       ),
     ).toEqual(original);
+  });
+
+  it("offers the existing account manager when creating a DSH ChatGPT provider without an account", async () => {
+    const onManageAuthAccounts = vi.fn();
+    const submit = vi.fn();
+    render(
+      <McodeProviderForm
+        appId="dsh"
+        submitLabel="Save"
+        onSubmit={submit}
+        onCancel={() => {}}
+        onManageAuthAccounts={onManageAuthAccounts}
+      />,
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: /ChatGPT|dsh\.codexOAuth\.presetName/,
+      }),
+    );
+    const manage = await screen.findByRole("button", {
+      name: "codexOauth.addOrManageAccounts",
+    });
+    fireEvent.click(manage);
+    expect(onManageAuthAccounts).toHaveBeenCalledWith("codex_oauth");
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    expect(screen.queryByLabelText("API Key")).toBeNull();
+    expect(screen.queryByLabelText("provider.configJson")).toBeNull();
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  it("resaves a legacy DSH account binding as a credential-free Responses draft", async () => {
+    server.use(
+      http.post("http://tauri.local/auth_get_status", () =>
+        HttpResponse.json({
+          provider: "codex_oauth",
+          authenticated: true,
+          default_account_id: "other-account",
+          accounts: [
+            {
+              id: "fixture-account",
+              provider: "codex_oauth",
+              login: "Fixture account",
+              avatar_url: null,
+              authenticated_at: 0,
+              is_default: false,
+              github_domain: "",
+              reauth_required: false,
+              requires_reauth: false,
+            },
+          ],
+        }),
+      ),
+    );
+    const submit = vi.fn();
+    const authBinding = {
+      source: "managed_account" as const,
+      authProvider: "codex_oauth",
+      accountId: "fixture-account",
+    };
+    render(
+      <McodeProviderForm
+        appId="dsh"
+        providerId="chatgpt"
+        initialData={{
+          name: "ChatGPT fixture",
+          meta: { providerType: "codex_oauth", authBinding },
+          settingsConfig: {
+            config: 'model = "fixture-model"',
+            auth: { OPENAI_API_KEY: "old-fixture" },
+          },
+        }}
+        submitLabel="Save"
+        onSubmit={submit}
+        onCancel={() => {}}
+      />,
+    );
+
+    const save = screen.getByRole("button", { name: "Save" });
+    await waitFor(() => expect(save).toBeEnabled());
+    fireEvent.click(save);
+    await waitFor(() => expect(submit).toHaveBeenCalledOnce());
+    const draft = submit.mock.calls[0][0];
+    expect(draft.meta).toEqual({ providerType: "codex_oauth", authBinding });
+    expect(JSON.parse(draft.settingsConfig)).toEqual({
+      name: "ChatGPT fixture",
+      api: "openai-responses",
+      options: {},
+      models: { "fixture-model": { name: "fixture-model" } },
+    });
   });
 
   it("borrows the MiniMax preset without changing Pi or copying Pi compatibility fields", () => {

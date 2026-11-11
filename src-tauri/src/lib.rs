@@ -2029,6 +2029,8 @@ pub fn run() {
             commands::get_claude_login_switch,
             commands::kimi_oauth_status,
             commands::dsh_account_status,
+            commands::activate_dsh_oauth_provider,
+            commands::get_dsh_oauth_route_status,
             commands::dsh_account_sign_out,
             commands::dsh_account_login_start,
             commands::dsh_account_login_poll,

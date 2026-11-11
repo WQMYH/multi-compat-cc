@@ -1135,7 +1135,7 @@ pub(super) async fn handle_responses_for_app(
     let method = parts.method.clone();
     let uri = parts.uri;
     let mut headers = parts.headers;
-    let extensions = parts.extensions;
+    let mut extensions = parts.extensions;
     let body_bytes = req_body
         .collect()
         .await
@@ -1145,21 +1145,27 @@ pub(super) async fn handle_responses_for_app(
     let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
     drop(body_bytes);
-    let stack = match resolve_stack_target(&state, &app_type, &mut body) {
-        Ok(stack) => stack,
-        Err(rejected) => return Ok(*rejected),
+    let mut ctx = if app_type == AppType::Dsh {
+        let super::dsh::AuthorizedDshProvider(provider) = extensions
+            .remove::<super::dsh::AuthorizedDshProvider>()
+            .ok_or_else(super::dsh::auth_error)?;
+        RequestContext::new_dsh_oauth(&state, &body, &headers, provider)?
+    } else {
+        let stack = match resolve_stack_target(&state, &app_type, &mut body) {
+            Ok(stack) => stack,
+            Err(rejected) => return Ok(*rejected),
+        };
+        RequestContext::new(
+            &state,
+            &body,
+            &headers,
+            app_type.clone(),
+            tag,
+            app_type_str,
+            stack,
+        )
+        .await?
     };
-
-    let mut ctx = RequestContext::new(
-        &state,
-        &body,
-        &headers,
-        app_type.clone(),
-        tag,
-        app_type_str,
-        stack,
-    )
-    .await?;
     ctx.apply_privacy_filter(&mut body);
     let endpoint = endpoint_with_query(&uri, "/responses");
 
@@ -1204,6 +1210,34 @@ pub(super) async fn handle_responses_for_app(
     ctx.outbound_model = result.outbound_model.take();
     ctx.provider = result.provider;
     let response = result.response;
+
+    // The account backend always sends SSE. Preserve a DSH client's requested
+    // JSON response shape using the existing bounded Responses collector.
+    let response = if app_type == AppType::Dsh
+        && !is_stream
+        && response.status().is_success()
+        && response.is_sse()
+    {
+        let timeout = std::time::Duration::from_secs(ctx.app_config.non_streaming_timeout.into());
+        let (mut headers, status, bytes) = read_decoded_body(response, ctx.tag, timeout).await?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| {
+            ProxyError::TransformError("Invalid UTF-8 in DSH Responses stream".into())
+        })?;
+        let value = responses_sse_to_response_value(text)?;
+        strip_entity_headers_for_rebuilt_body(&mut headers);
+        strip_hop_by_hop_response_headers(&mut headers);
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
+        super::hyper_client::ProxyResponse::buffered(
+            status,
+            headers,
+            Bytes::from(value.to_string()),
+        )
+    } else {
+        response
+    };
 
     if codex_upstream_format == Some(CodexUpstreamFormat::Anthropic) {
         return handle_codex_anthropic_to_responses_transform(

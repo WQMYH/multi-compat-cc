@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { z } from "zod";
 import { useForm } from "react-hook-form";
 import { useTranslation } from "react-i18next";
@@ -9,16 +10,25 @@ import { Label } from "@/components/ui/label";
 import JsonEditor from "@/components/JsonEditor";
 import { useDarkMode } from "@/hooks/useDarkMode";
 import { useProvidersQuery } from "@/lib/query/queries";
+import { authApi } from "@/lib/api";
+import { fetchCodexOauthModels } from "@/lib/api/model-fetch";
+import {
+  isDshCodexOAuthProvider,
+  resolveManagedAccountId,
+} from "@/lib/authBinding";
 import type { ProviderFormData } from "@/lib/schemas/provider";
 import type { OpenCodeModel, OpenCodeProviderOptions } from "@/types";
 import { mcodeProviderPresets } from "@/config/mcodeProviderPresets";
 import {
   DSH_ACCOUNT_PRESET_ID,
+  DSH_CODEX_OAUTH_PRESET_ID,
   dshAccountPreset,
+  dshCodexOAuthPreset,
   dshProviderPresets,
 } from "@/config/dshProviderPresets";
 import { mcodePresetModelSources } from "@/config/presetModelMetadata";
 import { BasicFormFields } from "./BasicFormFields";
+import { CodexOAuthSection } from "./CodexOAuthSection";
 import { OpenCodeFormFields } from "./OpenCodeFormFields";
 import { ProviderPresetSelector } from "./ProviderPresetSelector";
 import { usePresetStep } from "./presetStep";
@@ -34,6 +44,8 @@ import {
   toOpencodeExtraOptions,
 } from "./helpers/opencodeFormUtils";
 import type { ProviderFormProps } from "./ProviderForm";
+import { extractCodexModelName } from "@/utils/providerConfigUtils";
+import { translateDshOAuthProviderError } from "@/utils/errorUtils";
 
 const API_FORMATS = [
   { value: "anthropic-messages", label: "Anthropic Messages" },
@@ -98,7 +110,10 @@ export function McodeProviderForm({
   const presetEntries = [
     // DeepSeek 账号和 Kimi 一样放在「账号登录」组：选中后去授权中心登录，不新建供应商
     ...(appId === "dsh"
-      ? [{ id: DSH_ACCOUNT_PRESET_ID, preset: dshAccountPreset }]
+      ? [
+          { id: DSH_ACCOUNT_PRESET_ID, preset: dshAccountPreset },
+          { id: DSH_CODEX_OAUTH_PRESET_ID, preset: dshCodexOAuthPreset },
+        ]
       : []),
     ...presets.map((preset, index) => ({
       id: String(index),
@@ -106,15 +121,31 @@ export function McodeProviderForm({
     })),
   ];
   const isDarkMode = useDarkMode();
-  const [config, setConfig] = useState<McodeConfig>(
-    initialData?.settingsConfig ?? {
-      kind: "custom",
-      enabled: true,
-      api: "anthropic-messages",
-      options: {},
-      models: {},
-    },
-  );
+  const isExistingDshOAuth = isDshCodexOAuthProvider(appId, initialData?.meta);
+  const [config, setConfig] = useState<McodeConfig>(() => {
+    const saved = initialData?.settingsConfig;
+    if (isExistingDshOAuth && saved) {
+      const legacyModel =
+        typeof saved.config === "string"
+          ? extractCodexModelName(saved.config)?.trim()
+          : undefined;
+      return {
+        api: "openai-responses",
+        models:
+          saved.models ??
+          (legacyModel ? { [legacyModel]: { name: legacyModel } } : {}),
+      };
+    }
+    return (
+      saved ?? {
+        kind: "custom",
+        enabled: true,
+        api: "anthropic-messages",
+        options: {},
+        models: {},
+      }
+    );
+  });
   const isNative = appId === "mcode";
   const renderText = (next: McodeConfig, key: string) =>
     isNative
@@ -129,6 +160,31 @@ export function McodeProviderForm({
   >(null);
   const [presetId, setPresetId] = useState("custom");
   const step = usePresetStep();
+  const isDshOAuth =
+    appId === "dsh" &&
+    (isExistingDshOAuth || presetId === DSH_CODEX_OAUTH_PRESET_ID);
+  const [codexAccountId, setCodexAccountId] = useState(() =>
+    resolveManagedAccountId(initialData?.meta, "codex_oauth"),
+  );
+  const { data: codexStatus, isSuccess: codexStatusLoaded } = useQuery({
+    queryKey: ["managed-auth-status", "codex_oauth"],
+    queryFn: () => authApi.authGetStatus("codex_oauth"),
+    enabled: isDshOAuth,
+    staleTime: 30_000,
+  });
+  const codexAccountReady =
+    codexStatusLoaded &&
+    codexStatus?.authenticated &&
+    codexStatus?.accounts.some(
+      (account) => account.id === codexAccountId && !account.reauth_required,
+    );
+  const fetchAccountModels = useCallback(
+    () =>
+      codexAccountId
+        ? fetchCodexOauthModels(codexAccountId)
+        : Promise.resolve([]),
+    [codexAccountId],
+  );
   const isAccountLogin = !initialData && presetId === DSH_ACCOUNT_PRESET_ID;
   const showAccountLogin = isAccountLogin && (!step || step.step === "form");
   useEffect(() => {
@@ -138,7 +194,9 @@ export function McodeProviderForm({
   const preset =
     presetId === "custom" || isAccountLogin
       ? undefined
-      : presets[Number(presetId)];
+      : presetId === DSH_CODEX_OAUTH_PRESET_ID
+        ? dshCodexOAuthPreset
+        : presets[Number(presetId)];
   const category = initialData?.category ?? preset?.category ?? "custom";
   const [extraOptions, setExtraOptions] = useState(
     toOpencodeExtraOptions(config.options ?? {}),
@@ -169,15 +227,18 @@ export function McodeProviderForm({
     },
   });
   const name = form.watch("name");
+  const hasModels = Object.keys(config.models ?? {}).length > 0;
   const ready = Boolean(
     !isAccountLogin &&
       jsonValid &&
       name.trim() &&
       (isEdit || (providerKey && !keyInvalid && !keyTaken)) &&
-      config.options?.baseURL?.trim() &&
-      (config.options?.apiKey?.trim() ||
-        (appId === "dsh" && config.apiKeyEnv)) &&
-      Object.keys(config.models ?? {}).length,
+      (isDshOAuth
+        ? codexAccountReady
+        : config.options?.baseURL?.trim() &&
+          (config.options?.apiKey?.trim() ||
+            (appId === "dsh" && config.apiKeyEnv))) &&
+      hasModels,
   );
   useEffect(() => {
     onSubmitReadyChange?.(ready);
@@ -192,8 +253,14 @@ export function McodeProviderForm({
     update({ ...config, options: { ...config.options, ...next } });
   const choosePreset = (id: string) => {
     setPresetId(id);
+    setCodexAccountId(null);
     if (id === DSH_ACCOUNT_PRESET_ID) return;
-    const selected = id === "custom" ? undefined : presets[Number(id)];
+    const selected =
+      id === DSH_CODEX_OAUTH_PRESET_ID
+        ? dshCodexOAuthPreset
+        : id === "custom"
+          ? undefined
+          : presets[Number(id)];
     const next = selected?.settingsConfig ?? {
       kind: "custom",
       enabled: true,
@@ -265,6 +332,58 @@ export function McodeProviderForm({
           onSubmittingChange?.(true);
           setError("");
           try {
+            if (isDshOAuth && codexAccountId) {
+              const models = Object.fromEntries(
+                Object.entries(config.models ?? {}).map(([id, model]) => {
+                  const {
+                    name,
+                    limit,
+                    input,
+                    modalities,
+                    reasoning,
+                    defaultReasoningEffort,
+                    reasoningEfforts,
+                  } = model;
+                  return [
+                    id,
+                    {
+                      name,
+                      limit: limit && {
+                        context: limit.context,
+                        output: limit.output,
+                      },
+                      input,
+                      modalities,
+                      reasoning,
+                      defaultReasoningEffort,
+                      reasoningEfforts,
+                    },
+                  ];
+                }),
+              );
+              await onSubmit({
+                ...identity,
+                name: identity.name.trim(),
+                meta: {
+                  ...initialData?.meta,
+                  providerType: "codex_oauth",
+                  authBinding: {
+                    source: "managed_account",
+                    authProvider: "codex_oauth",
+                    accountId: codexAccountId,
+                  },
+                },
+                providerKey: isEdit ? providerId : providerKey,
+                presetCategory: category,
+                settingsConfig: JSON.stringify({
+                  name: identity.name.trim(),
+                  api: "openai-responses",
+                  models,
+                  options: {},
+                }),
+              });
+              return;
+            }
             const headers = normalizeRequestHeaders(
               config.options?.headers ?? {},
             );
@@ -285,7 +404,12 @@ export function McodeProviderForm({
               }),
             });
           } catch (error) {
-            setError(String(error));
+            setError(
+              isDshOAuth
+                ? (translateDshOAuthProviderError(error, t) ??
+                    t("dsh.codexOAuth.saveFailed"))
+                : String(error),
+            );
           } finally {
             setBusy(false);
             onSubmittingChange?.(false);
@@ -344,7 +468,45 @@ export function McodeProviderForm({
               </div>
             }
           />
+          {isDshOAuth && (
+            <div className="space-y-2">
+              <p className="text-sm text-fg-2">
+                {t("dsh.codexOAuth.description")}
+              </p>
+              <CodexOAuthSection
+                mode="select"
+                showAccountQuota={false}
+                selectedAccountId={codexAccountId}
+                onAccountSelect={setCodexAccountId}
+                allowUnboundSelection={false}
+                requireExplicitSelection={!isEdit}
+                onManageAccounts={
+                  onManageAuthAccounts
+                    ? () => onManageAuthAccounts("codex_oauth")
+                    : undefined
+                }
+              />
+              {codexStatusLoaded &&
+                !codexStatus?.accounts.length &&
+                onManageAuthAccounts && (
+                  <Button
+                    type="button"
+                    variant="neutral"
+                    onClick={() => onManageAuthAccounts("codex_oauth")}
+                  >
+                    {t("codexOauth.addOrManageAccounts")}
+                  </Button>
+                )}
+            </div>
+          )}
           <OpenCodeFormFields
+            modelsOnly={isDshOAuth}
+            emptyModelsMessage={
+              isDshOAuth ? t("dsh.codexOAuth.modelRequired") : undefined
+            }
+            fetchAccountModels={
+              isDshOAuth && codexAccountReady ? fetchAccountModels : undefined
+            }
             modelDialect={appId === "dsh" ? "dsh" : "opencode"}
             apiFormats={API_FORMATS}
             presetModelSources={mcodePresetModelSources}
@@ -374,76 +536,77 @@ export function McodeProviderForm({
             }}
           />
         </fieldset>
-        {isNative ? (
-          <NativeConfigEditor
-            appId="mcode"
-            file="config.yaml"
-            id="mcode-settings-config"
-            value={jsonText}
-            onChange={(text) => {
-              setJsonText(text);
-              const parsed = yamlNodeFromText(
-                text,
-                MCODE_SECTION,
-                placeholderKey(providerKey),
-              );
-              const result = parsed.ok
-                ? configSchema.safeParse(parsed.value)
-                : undefined;
-              if (!result?.success) {
-                setJsonValid(false);
-                setNativeError(parsed.ok ? { kind: "schema" } : parsed.error);
-                return;
-              }
-              setConfig(result.data);
-              setExtraOptions(
-                toOpencodeExtraOptions(result.data.options ?? {}),
-              );
-              setJsonValid(true);
-              setNativeError(null);
-            }}
-            error={
-              !nativeError
-                ? null
-                : nativeError.kind === "syntax"
-                  ? t("providerForm.nativeConfig.invalid", {
-                      format: "YAML",
-                      error: nativeError.detail,
-                    })
-                  : nativeError.kind === "scope"
-                    ? t("providerForm.nativeConfig.scope", {
-                        section: `${MCODE_SECTION}.${placeholderKey(providerKey)}`,
-                      })
-                    : t("providerForm.nativeConfig.schema")
-            }
-          />
-        ) : (
-          <div className="space-y-2">
-            <Label htmlFor="mcode-settings-config">
-              {t("provider.configJson")}
-            </Label>
-            <JsonEditor
+        {!isDshOAuth &&
+          (isNative ? (
+            <NativeConfigEditor
+              appId="mcode"
+              file="config.yaml"
               id="mcode-settings-config"
-              ariaLabel={t("provider.configJson")}
               value={jsonText}
-              darkMode={isDarkMode}
-              language="json"
-              showValidation
-              height={Math.max(1, jsonText.split("\n").length) * 20 + 20}
               onChange={(text) => {
                 setJsonText(text);
-                try {
-                  const next = configSchema.parse(JSON.parse(text));
-                  setConfig(next);
-                  setExtraOptions(toOpencodeExtraOptions(next.options ?? {}));
-                  setJsonValid(true);
-                } catch {
+                const parsed = yamlNodeFromText(
+                  text,
+                  MCODE_SECTION,
+                  placeholderKey(providerKey),
+                );
+                const result = parsed.ok
+                  ? configSchema.safeParse(parsed.value)
+                  : undefined;
+                if (!result?.success) {
                   setJsonValid(false);
+                  setNativeError(parsed.ok ? { kind: "schema" } : parsed.error);
+                  return;
                 }
+                setConfig(result.data);
+                setExtraOptions(
+                  toOpencodeExtraOptions(result.data.options ?? {}),
+                );
+                setJsonValid(true);
+                setNativeError(null);
               }}
+              error={
+                !nativeError
+                  ? null
+                  : nativeError.kind === "syntax"
+                    ? t("providerForm.nativeConfig.invalid", {
+                        format: "YAML",
+                        error: nativeError.detail,
+                      })
+                    : nativeError.kind === "scope"
+                      ? t("providerForm.nativeConfig.scope", {
+                          section: `${MCODE_SECTION}.${placeholderKey(providerKey)}`,
+                        })
+                      : t("providerForm.nativeConfig.schema")
+              }
             />
-          </div>
-        )}
+          ) : (
+            <div className="space-y-2">
+              <Label htmlFor="mcode-settings-config">
+                {t("provider.configJson")}
+              </Label>
+              <JsonEditor
+                id="mcode-settings-config"
+                ariaLabel={t("provider.configJson")}
+                value={jsonText}
+                darkMode={isDarkMode}
+                language="json"
+                showValidation
+                height={Math.max(1, jsonText.split("\n").length) * 20 + 20}
+                onChange={(text) => {
+                  setJsonText(text);
+                  try {
+                    const next = configSchema.parse(JSON.parse(text));
+                    setConfig(next);
+                    setExtraOptions(toOpencodeExtraOptions(next.options ?? {}));
+                    setJsonValid(true);
+                  } catch {
+                    setJsonValid(false);
+                  }
+                }}
+              />
+            </div>
+          ))}
         {showButtons && (
           <div className="flex justify-end gap-2">
             <Button

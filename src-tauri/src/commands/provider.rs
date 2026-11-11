@@ -101,7 +101,21 @@ pub async fn update_provider(
     #[allow(non_snake_case)] editorSave: Option<EditorSave>,
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    tauri::async_runtime::spawn_blocking(move || {
+    let dsh_oauth =
+        app_type == AppType::Dsh && crate::services::provider::dsh_oauth::is_managed(&provider);
+    let route_id = originalId.clone().unwrap_or_else(|| provider.id.clone());
+    let proxy = if dsh_oauth {
+        Some(
+            app_handle
+                .try_state::<AppState>()
+                .ok_or_else(|| "应用状态不可用".to_string())?
+                .proxy_service
+                .clone(),
+        )
+    } else {
+        None
+    };
+    let updated = tauri::async_runtime::spawn_blocking(move || {
         let state = app_handle
             .try_state::<AppState>()
             .ok_or_else(|| "应用状态不可用".to_string())?;
@@ -115,7 +129,11 @@ pub async fn update_provider(
         .map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("供应商更新任务执行失败: {e}"))?
+    .map_err(|e| format!("供应商更新任务执行失败: {e}"))??;
+    if let Some(proxy) = proxy {
+        proxy.deactivate_dsh_oauth_route(&route_id).await;
+    }
+    Ok(updated)
 }
 
 /// 供应商编辑器底部 JSON 的显示内容：切到这个供应商之后配置文件会是什么样。
@@ -164,13 +182,20 @@ pub async fn delete_provider(
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
     let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        ProviderService::delete(&state, app_type, &id)
+    let is_dsh = app_type == AppType::Dsh;
+    let worker_state = state.clone();
+    let worker_id = id.clone();
+    let deleted = tauri::async_runtime::spawn_blocking(move || {
+        ProviderService::delete(&worker_state, app_type, &worker_id)
             .map(|_| true)
             .map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("供应商删除任务失败: {e}"))?
+    .map_err(|e| format!("供应商删除任务失败: {e}"))??;
+    if is_dsh {
+        state.proxy_service.deactivate_dsh_oauth_route(&id).await;
+    }
+    Ok(deleted)
 }
 
 #[tauri::command]
@@ -181,6 +206,25 @@ pub async fn add_provider_to_live_config(
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
     let state = state.inner().clone();
+    if app_type == AppType::Dsh {
+        let db = state.db.clone();
+        let lookup_id = id.clone();
+        let provider =
+            tauri::async_runtime::spawn_blocking(move || db.get_provider_by_id(&lookup_id, "dsh"))
+                .await
+                .map_err(|_| "读取 DSH 供应商失败".to_string())?
+                .map_err(|error| error.to_string())?;
+        if provider
+            .as_ref()
+            .is_some_and(crate::services::provider::dsh_oauth::is_managed)
+        {
+            state
+                .proxy_service
+                .activate_dsh_oauth_provider(&state, &id)
+                .await?;
+            return Ok(true);
+        }
+    }
     tauri::async_runtime::spawn_blocking(move || {
         ProviderService::add_to_live_config(&state, app_type, &id)
             .map(|_| true)
@@ -198,13 +242,20 @@ pub async fn remove_provider_from_live_config(
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
     let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        ProviderService::remove_from_live_config(&state, app_type, &id)
+    let is_dsh = app_type == AppType::Dsh;
+    let worker_state = state.clone();
+    let worker_id = id.clone();
+    let removed = tauri::async_runtime::spawn_blocking(move || {
+        ProviderService::remove_from_live_config(&worker_state, app_type, &worker_id)
             .map(|_| true)
             .map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("供应商从应用移除任务失败: {e}"))?
+    .map_err(|e| format!("供应商从应用移除任务失败: {e}"))??;
+    if is_dsh {
+        state.proxy_service.deactivate_dsh_oauth_route(&id).await;
+    }
+    Ok(removed)
 }
 
 fn switch_provider_internal(

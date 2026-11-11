@@ -1,8 +1,15 @@
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import {
+  act,
+  render,
+  screen,
+  fireEvent,
+  waitFor,
+} from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { useState, type ReactElement } from "react";
 import { http, HttpResponse } from "msw";
+import { toast } from "sonner";
 import type { Provider } from "@/types";
 import {
   ProviderList,
@@ -411,6 +418,72 @@ describe("ProviderList Component", () => {
       expect(onSwitch).toHaveBeenCalledWith(saved);
     },
   );
+
+  it("keeps a saved DSH ChatGPT card available to retry when activation fails", async () => {
+    const provider = createProvider({
+      id: "chatgpt",
+      name: "ChatGPT fixture",
+      meta: {
+        providerType: "codex_oauth",
+        authBinding: {
+          source: "managed_account",
+          authProvider: "codex_oauth",
+          accountId: "fixture-account",
+        },
+      },
+    });
+    const activate = vi.fn();
+    server.use(
+      http.post(
+        `${TAURI_ENDPOINT}/activate_dsh_oauth_provider`,
+        async ({ request }) => {
+          const { providerId } = (await request.json()) as {
+            providerId: string;
+          };
+          activate(providerId);
+          return HttpResponse.json(
+            "DSH_OAUTH_CONFIG_CONFLICT: fixture details",
+            {
+              status: 500,
+            },
+          );
+        },
+      ),
+    );
+    useDragSortMock.mockReturnValue({
+      sortedProviders: [provider],
+      sensors: [],
+      handleDragEnd: vi.fn(),
+    });
+    const onSwitch = vi.fn();
+    renderWithQueryClient(
+      <ProviderList
+        {...baseProps}
+        providers={{ [provider.id]: provider }}
+        appId="dsh"
+        onSwitch={onSwitch}
+      />,
+    );
+    await screen.findByTestId("provider-card-chatgpt");
+    expect(activate).not.toHaveBeenCalled();
+    await act(async () => lastProps("chatgpt").dshOAuthRoute.onActivate());
+    await waitFor(() => expect(activate).toHaveBeenCalledWith("chatgpt"));
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith(
+        "dsh.codexOAuth.activationFailed",
+        expect.objectContaining({
+          description: "dsh.codexOAuth.configConflict",
+        }),
+      ),
+    );
+    await waitFor(() =>
+      expect(lastProps("chatgpt").dshOAuthRoute.activating).toBe(false),
+    );
+    await act(async () => lastProps("chatgpt").dshOAuthRoute.onActivate());
+    await waitFor(() => expect(activate).toHaveBeenCalledTimes(2));
+    expect(onSwitch).not.toHaveBeenCalled();
+    expect(screen.getByTestId("provider-card-chatgpt")).toBeInTheDocument();
+  });
 
   it("adds, switches and removes Kimi providers and marks only the native default-model owner as in use", () => {
     const current = createProvider({

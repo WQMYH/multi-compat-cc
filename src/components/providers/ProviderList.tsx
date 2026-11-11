@@ -23,8 +23,10 @@ import type { OpenClawProviderConfig, Provider } from "@/types";
 import { getOpencodeDeclaredModels } from "@/components/providers/forms/helpers/opencodeFormUtils";
 import type { AppId } from "@/lib/api";
 import { providersApi } from "@/lib/api/providers";
+import { isDshCodexOAuthProvider } from "@/lib/authBinding";
 import {
   extractErrorMessage,
+  translateDshOAuthProviderError,
   translatePiProviderMutationError,
 } from "@/utils/errorUtils";
 import { useDragSort } from "@/hooks/useDragSort";
@@ -235,6 +237,23 @@ export function ProviderList({
   );
 
   const queryClient = useQueryClient();
+  const dshOAuthActivation = useMutation({
+    mutationFn: (providerId: string) =>
+      providersApi.activateDshOAuthProvider(providerId),
+    onError: (error) => {
+      toast.error(t("dsh.codexOAuth.activationFailed"), {
+        description:
+          translateDshOAuthProviderError(error, t) ??
+          t("dsh.codexOAuth.activationHint"),
+      });
+    },
+    onSettled: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["providers", "dsh"] }),
+        queryClient.invalidateQueries({ queryKey: ["dsh-oauth-route-status"] }),
+      ]);
+    },
+  });
   const importMutation = useMutation({
     mutationFn: async (): Promise<boolean> => {
       if (appId === "opencode") {
@@ -566,6 +585,14 @@ export function ProviderList({
       appId={appId}
       presentation={presentation}
       isCurrent={isCurrentFor(provider)}
+      dshOAuthRoute={
+        isDshCodexOAuthProvider(appId, provider.meta)
+          ? {
+              activating: dshOAuthActivation.isPending,
+              onActivate: () => dshOAuthActivation.mutate(provider.id),
+            }
+          : undefined
+      }
       onEdit={onEdit}
       onDelete={onDelete}
       onDuplicate={
@@ -743,6 +770,10 @@ interface SortableProviderCardProps {
   appId: AppId;
   presentation: CardPresentation;
   isCurrent: boolean;
+  dshOAuthRoute?: {
+    activating: boolean;
+    onActivate: () => void;
+  };
   onEdit: (provider: Provider) => void;
   onDelete: (provider: Provider) => void;
   onDuplicate?: (provider: Provider) => void;

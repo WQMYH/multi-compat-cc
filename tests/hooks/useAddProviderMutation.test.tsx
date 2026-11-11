@@ -73,7 +73,9 @@ beforeEach(() => {
 describe("useAddProviderMutation", () => {
   it("adds a ZCode API provider from the shared editor with a generated id", async () => {
     const { wrapper } = createWrapper();
-    const { result } = renderHook(() => useAddProviderMutation("zcode"), { wrapper });
+    const { result } = renderHook(() => useAddProviderMutation("zcode"), {
+      wrapper,
+    });
     const settingsConfig = {
       auth: { OPENAI_API_KEY: "fixture-key" },
       config: 'model = "fixture-model"',
@@ -94,14 +96,19 @@ describe("useAddProviderMutation", () => {
 
   it("preserves a native ZCode provider key and still rejects a missing native key", async () => {
     const { wrapper } = createWrapper();
-    const { result } = renderHook(() => useAddProviderMutation("zcode"), { wrapper });
+    const { result } = renderHook(() => useAddProviderMutation("zcode"), {
+      wrapper,
+    });
     const nativeProvider = {
       name: "Native fixture",
       settingsConfig: { kind: "openai-responses", options: {}, models: {} },
     };
 
     const provider = await act(async () =>
-      result.current.mutateAsync({ ...nativeProvider, providerKey: "personal:fixture" }),
+      result.current.mutateAsync({
+        ...nativeProvider,
+        providerKey: "personal:fixture",
+      }),
     );
     expect(provider.id).toBe("personal:fixture");
     await act(async () => {
@@ -128,6 +135,38 @@ describe("useAddProviderMutation", () => {
     expect(apiMocks.add).toHaveBeenCalledWith(
       expect.objectContaining({ name: "Relay" }),
       "agy",
+      false,
+      undefined,
+    );
+  });
+
+  it("saves a DSH ChatGPT binding as a draft even when the caller requests live config", async () => {
+    const { wrapper } = createWrapper();
+    const { result } = renderHook(() => useAddProviderMutation("dsh"), {
+      wrapper,
+    });
+    await act(async () =>
+      result.current.mutateAsync({
+        name: "ChatGPT fixture",
+        providerKey: "chatgpt",
+        settingsConfig: {
+          api: "openai-responses",
+          models: { "fixture-model": { name: "Fixture model" } },
+        },
+        meta: {
+          providerType: "codex_oauth",
+          authBinding: {
+            source: "managed_account",
+            authProvider: "codex_oauth",
+            accountId: "fixture-account",
+          },
+        },
+        addToLive: true,
+      }),
+    );
+    expect(apiMocks.add).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "chatgpt" }),
+      "dsh",
       false,
       undefined,
     );

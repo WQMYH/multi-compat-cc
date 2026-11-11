@@ -924,9 +924,10 @@ pub(crate) fn initialize_dsh_profiles(state: &AppState) -> Result<(), AppError> 
         .get_all_providers("dsh")?
         .into_iter()
         .filter(|(_, provider)| {
-            // Rows from the previous direct-mode projection are kept in the
-            // database, but must not be replayed as official DSH profile nodes.
+            // Old direct-mode rows are retained as data. OAuth routes bind to a
+            // listener instance and are published only after explicit activation.
             if super::is_legacy_dsh_observation(provider)
+                || super::dsh_oauth::is_managed(provider)
                 || (provider.settings_config["config"].is_string()
                     && provider.settings_config["api"].is_null())
             {

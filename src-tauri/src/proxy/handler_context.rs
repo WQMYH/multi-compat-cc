@@ -297,9 +297,65 @@ impl RequestContext {
     /// 配置生效规则：
     /// - 故障转移开启：超时配置正常生效（0 表示禁用超时）
     /// - 故障转移关闭：超时配置不生效（全部传入 0）
+    pub(super) fn new_dsh_oauth(
+        state: &ProxyState,
+        body: &serde_json::Value,
+        headers: &HeaderMap,
+        provider: Provider,
+    ) -> Result<Self, ProxyError> {
+        let request_model = body
+            .get("model")
+            .and_then(|model| model.as_str())
+            .filter(|model| {
+                provider.settings_config["models"]
+                    .as_object()
+                    .is_some_and(|models| models.contains_key(*model))
+            })
+            .ok_or_else(|| {
+                ProxyError::InvalidRequest("Model is not configured on this DSH OAuth card".into())
+            })?
+            .to_owned();
+        let session = extract_session_id(headers, body, "dsh");
+        // DSH cards are explicit targets. Do not query or initialize proxy-mode rows.
+        let app_config = AppProxyConfig {
+            app_type: "dsh".into(),
+            enabled: true,
+            auto_failover_enabled: false,
+            max_retries: 0,
+            streaming_first_byte_timeout: 60,
+            streaming_idle_timeout: 120,
+            non_streaming_timeout: 600,
+            circuit_failure_threshold: 0,
+            circuit_success_threshold: 0,
+            circuit_timeout_seconds: 0,
+            circuit_error_rate_threshold: 0.0,
+            circuit_min_requests: 0,
+        };
+        Ok(Self {
+            start_time: Instant::now(),
+            app_config,
+            current_provider_id: provider.id.clone(),
+            providers: vec![provider.clone()],
+            provider,
+            request_model,
+            outbound_model: None,
+            tag: "DSH",
+            app_type_str: "dsh",
+            app_type: AppType::Dsh,
+            session_id: session.session_id,
+            session_client_provided: session.client_provided,
+            rectifier_config: state.db.get_rectifier_config().unwrap_or_default(),
+            optimizer_config: state.db.get_optimizer_config().unwrap_or_default(),
+            copilot_optimizer_config: state.db.get_copilot_optimizer_config().unwrap_or_default(),
+            privacy_filter_config: state.db.get_privacy_filter_config().unwrap_or_default(),
+            is_stack: false,
+        })
+    }
+
     pub fn create_forwarder(&self, state: &ProxyState) -> RequestForwarder {
+        let pinned_dsh = self.app_type == AppType::Dsh;
         let (non_streaming_timeout, first_byte_timeout, idle_timeout) =
-            if self.app_config.auto_failover_enabled {
+            if self.app_config.auto_failover_enabled || pinned_dsh {
                 // 故障转移开启：使用配置的值（0 = 禁用超时）
                 (
                     self.app_config.non_streaming_timeout as u64,
@@ -341,7 +397,7 @@ impl RequestContext {
             self.copilot_optimizer_config.clone(),
             max_retries,
         )
-        .stack_request(self.is_stack)
+        .stack_request(self.is_stack || pinned_dsh)
         .failover_chain(self.app_config.auto_failover_enabled)
     }
 
@@ -365,7 +421,7 @@ impl RequestContext {
     /// - 故障转移关闭：返回 0（禁用超时检查）
     #[inline]
     pub fn streaming_timeout_config(&self) -> StreamingTimeoutConfig {
-        if self.app_config.auto_failover_enabled {
+        if self.app_config.auto_failover_enabled || self.app_type == AppType::Dsh {
             // 故障转移开启：使用配置的值（0 = 禁用超时）
             StreamingTimeoutConfig {
                 first_byte_timeout: self.app_config.streaming_first_byte_timeout as u64,

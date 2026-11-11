@@ -10,15 +10,17 @@
 
 use super::{
     browser_guard,
+    dsh::{self, DshOAuthRoutes, DshPeer},
     failover_switch::FailoverSwitchManager,
     handlers,
     log_codes::srv as log_srv,
     provider_router::ProviderRouter,
     providers::{codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore},
     types::*,
-    ProxyError,
+    DshOAuthRouteBinding, ProxyError,
 };
 use crate::database::Database;
+use crate::provider::Provider;
 use axum::{
     extract::DefaultBodyLimit,
     middleware,
@@ -26,7 +28,7 @@ use axum::{
     Router,
 };
 use hyper_util::rt::TokioIo;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
 use tokio::task::JoinHandle;
@@ -56,6 +58,7 @@ pub struct ProxyState {
 pub struct ProxyServer {
     config: ProxyConfig,
     state: ProxyState,
+    dsh_oauth_routes: Arc<DshOAuthRoutes>,
     shutdown_tx: Arc<RwLock<Option<oneshot::Sender<()>>>>,
     /// 服务器任务句柄，用于等待服务器实际关闭
     server_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
@@ -96,6 +99,7 @@ impl ProxyServer {
         Self {
             config,
             state,
+            dsh_oauth_routes: Arc::new(DshOAuthRoutes::default()),
             shutdown_tx: Arc::new(RwLock::new(None)),
             server_handle: Arc::new(RwLock::new(None)),
         }
@@ -107,10 +111,12 @@ impl ProxyServer {
             return Err(ProxyError::AlreadyRunning);
         }
 
-        let addr: SocketAddr =
-            format!("{}:{}", self.config.listen_address, self.config.listen_port)
+        let addr = match self.config.listen_address.parse::<IpAddr>() {
+            Ok(ip) => SocketAddr::new(ip, self.config.listen_port),
+            Err(_) => format!("{}:{}", self.config.listen_address, self.config.listen_port)
                 .parse()
-                .map_err(|e| ProxyError::BindFailed(format!("无效的地址: {e}")))?;
+                .map_err(|e| ProxyError::BindFailed(format!("无效的地址: {e}")))?,
+        };
 
         // 创建关闭通道
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -126,6 +132,7 @@ impl ProxyServer {
             .local_addr()
             .map_err(|e| ProxyError::BindFailed(e.to_string()))?;
         let actual_port = local_addr.port();
+        let dsh_generation = self.dsh_oauth_routes.bind(local_addr);
 
         log::info!("[{}] 代理服务器启动于 {local_addr}", log_srv::STARTED);
 
@@ -148,12 +155,13 @@ impl ProxyServer {
         // 启动服务器 — 使用手动 hyper HTTP/1.1 accept loop
         // 开启 preserve_header_case 以捕获客户端请求头的原始大小写
         let state = self.state.clone();
+        let dsh_oauth_routes = self.dsh_oauth_routes.clone();
         let handle = tokio::spawn(async move {
             let mut shutdown_rx = shutdown_rx;
             loop {
                 tokio::select! {
                     result = listener.accept() => {
-                        let (stream, _remote_addr) = match result {
+                        let (stream, remote_addr) = match result {
                             Ok(v) => v,
                             Err(e) => {
                                 log::error!("[{SRV}] accept 失败: {e}", SRV = log_srv::ACCEPT_ERR);
@@ -194,6 +202,10 @@ impl ProxyServer {
 
                                     // Insert our own header case map alongside hyper's internal one
                                     parts.extensions.insert(cases);
+                                    parts.extensions.insert(DshPeer {
+                                        address: remote_addr,
+                                        generation: dsh_generation,
+                                    });
 
                                     let body = axum::body::Body::new(body);
                                     let axum_req = http::Request::from_parts(parts, body);
@@ -218,6 +230,7 @@ impl ProxyServer {
             }
 
             // 服务器停止后更新状态
+            dsh_oauth_routes.close(Some(dsh_generation));
             state.status.write().await.running = false;
             *state.start_time.write().await = None;
         });
@@ -235,6 +248,7 @@ impl ProxyServer {
     pub async fn stop(&self) -> Result<(), ProxyError> {
         // 1. 发送关闭信号
         if let Some(tx) = self.shutdown_tx.write().await.take() {
+            self.dsh_oauth_routes.close(None);
             let _ = tx.send(());
         } else {
             return Err(ProxyError::NotRunning);
@@ -262,6 +276,37 @@ impl ProxyServer {
         } else {
             Ok(())
         }
+    }
+
+    pub(crate) fn dsh_oauth_base_url(&self, provider_id: &str) -> Result<String, String> {
+        self.dsh_oauth_routes.base_url(provider_id)
+    }
+
+    pub(crate) fn prepare_dsh_oauth_route(
+        &self,
+        draft: &Provider,
+        projected: &serde_json::Value,
+    ) -> Result<DshOAuthRouteBinding, String> {
+        self.dsh_oauth_routes.prepare(draft, projected)
+    }
+
+    pub(crate) fn activate_dsh_oauth_route(
+        &self,
+        binding: DshOAuthRouteBinding,
+    ) -> Result<(), String> {
+        self.dsh_oauth_routes.activate(&self.state.db, binding)
+    }
+
+    pub(crate) fn deactivate_dsh_oauth_route(&self, provider_id: &str) {
+        self.dsh_oauth_routes.deactivate(provider_id);
+    }
+
+    pub(crate) fn has_active_dsh_oauth_routes(&self) -> bool {
+        self.dsh_oauth_routes.has_active(&self.state.db)
+    }
+
+    pub(crate) fn is_dsh_oauth_route_active(&self, provider_id: &str) -> bool {
+        self.dsh_oauth_routes.is_active(&self.state.db, provider_id)
     }
 
     pub async fn get_status(&self) -> ProxyStatus {
@@ -422,6 +467,7 @@ impl ProxyServer {
             .route("/gemini/v1beta/*path", any(handlers::handle_gemini))
             // Gemini 的 GA 版本也叫 /v1，给原 SDK 留一条出口
             .route("/gemini/v1/*path", any(handlers::handle_gemini))
+            .merge(dsh::routes(self.dsh_oauth_routes.clone()))
             // 提高默认请求体大小限制（避免 413 Payload Too Large）
             .layer(DefaultBodyLimit::max(200 * 1024 * 1024))
             // 拒绝网页发来的请求（最外层，读请求体之前）：见 browser_guard

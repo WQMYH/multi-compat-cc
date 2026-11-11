@@ -11,6 +11,7 @@ mod codex_models_passthrough;
 pub(crate) mod codex_quota_protection;
 pub(crate) mod content_encoding;
 pub mod copilot_optimizer;
+mod dsh;
 pub mod error;
 pub mod error_mapper;
 pub(crate) mod failover_switch;
@@ -52,6 +53,7 @@ mod tests_issue_7271;
 pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerStats, CircuitState,
 };
+pub(crate) use dsh::{new_dsh_oauth_route_key, DshOAuthRouteBinding};
 #[allow(unused_imports)]
 pub use error::ProxyError;
 #[allow(unused_imports)]

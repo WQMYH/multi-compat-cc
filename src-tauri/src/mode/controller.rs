@@ -1035,13 +1035,8 @@ fn write_direct_for_exit(
 
 /// 没有应用在代理模式（含 Claude Desktop 的路由模式）时，停掉代理服务。
 async fn stop_server_if_unused(state: &AppState) {
-    if current::proxy_flags(PROXY_APPS).contains(&true) {
-        return;
-    }
-    if state.proxy_service.is_running().await {
-        if let Err(error) = state.proxy_service.stop().await {
-            log::warn!("停止代理服务失败: {error}");
-        }
+    if let Err(error) = state.proxy_service.stop_if_unused().await {
+        log::warn!("停止代理服务失败: {error}");
     }
 }
 

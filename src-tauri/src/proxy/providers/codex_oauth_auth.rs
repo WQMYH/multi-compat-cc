@@ -794,7 +794,24 @@ impl CodexOAuthManager {
     ) -> Result<String, CodexOAuthError> {
         let _lifecycle = self.lifecycle_lock.read().await;
         self.ensure_account_ready_for_use(account_id).await?;
-        Ok(self.resolve_valid_cached_token(account_id).await?.token)
+        Ok(self
+            .resolve_valid_cached_token(account_id, true)
+            .await?
+            .token)
+    }
+
+    /// An independently bound client may refresh only the selected managed account.
+    /// It must not inspect or adopt credentials from Codex's native auth.json.
+    pub(crate) async fn get_valid_token_for_managed_account(
+        &self,
+        account_id: &str,
+    ) -> Result<String, CodexOAuthError> {
+        let _lifecycle = self.lifecycle_lock.read().await;
+        self.ensure_account_ready_for_use(account_id).await?;
+        Ok(self
+            .resolve_valid_cached_token(account_id, false)
+            .await?
+            .token)
     }
 
     async fn ensure_account_ready_for_use(&self, account_id: &str) -> Result<(), CodexOAuthError> {
@@ -866,6 +883,7 @@ impl CodexOAuthManager {
     async fn resolve_valid_cached_token(
         &self,
         account_id: &str,
+        allow_native_refresh: bool,
     ) -> Result<CachedAccessToken, CodexOAuthError> {
         // 快路径：确认账号存在后读缓存
         {
@@ -885,7 +903,8 @@ impl CodexOAuthManager {
 
         let refresh_lock = self.get_refresh_lock(account_id).await;
         let _guard = refresh_lock.lock().await;
-        self.resolve_valid_cached_token_under_lock(account_id).await
+        self.resolve_valid_cached_token_under_lock(account_id, allow_native_refresh)
+            .await
     }
 
     /// Resolve a token while the caller owns this account's refresh mutex.
@@ -894,22 +913,25 @@ impl CodexOAuthManager {
     async fn resolve_valid_cached_token_under_lock(
         &self,
         account_id: &str,
+        allow_native_refresh: bool,
     ) -> Result<CachedAccessToken, CodexOAuthError> {
         // Codex CLI may have advanced the shared refresh-token generation since
         // this manager last used the account. Reload it under the same per-account
         // lock before deciding whether a network refresh is necessary.
-        if let Some((live_refresh, live_id_token, live_last_refresh_ms)) = self
-            .read_managed_live_auth_refresh_for_account(account_id)
-            .await?
-        {
-            self.adopt_account_refresh_token_under_lock(
-                account_id,
-                live_refresh,
-                live_id_token,
-                live_last_refresh_ms,
-                RefreshTokenAdoptionMode::TimestampChecked,
-            )
-            .await?;
+        if allow_native_refresh {
+            if let Some((live_refresh, live_id_token, live_last_refresh_ms)) = self
+                .read_managed_live_auth_refresh_for_account(account_id)
+                .await?
+            {
+                self.adopt_account_refresh_token_under_lock(
+                    account_id,
+                    live_refresh,
+                    live_id_token,
+                    live_last_refresh_ms,
+                    RefreshTokenAdoptionMode::TimestampChecked,
+                )
+                .await?;
+            }
         }
 
         // double-check（同样在 accounts 读锁下）
@@ -933,9 +955,15 @@ impl CodexOAuthManager {
                 .map(|a| a.refresh_token.clone())
                 .ok_or_else(|| CodexOAuthError::AccountNotFound(account_id.to_string()))?
         };
+        if !allow_native_refresh && refresh_token.trim().is_empty() {
+            return Err(CodexOAuthError::RefreshTokenInvalid);
+        }
 
         let new_tokens = match self.refresh_with_token(&refresh_token).await {
             Err(CodexOAuthError::RefreshTokenInvalid) => {
+                if !allow_native_refresh {
+                    return Err(CodexOAuthError::RefreshTokenInvalid);
+                }
                 // If Codex CLI refreshed between our pre-read and request, reload
                 // its newer generation and retry exactly once. Error-code handling
                 // includes OpenAI's `refresh_token_reused` response.
@@ -1089,7 +1117,7 @@ impl CodexOAuthManager {
         // account generation lock. Otherwise an adoption between these reads
         // can create an invalid A0 + R1/ID1 mixed bundle.
         let cached = self
-            .resolve_valid_cached_token_under_lock(account_id)
+            .resolve_valid_cached_token_under_lock(account_id, true)
             .await?;
 
         // A managed bundle is about to overwrite auth.json. Re-read under the
@@ -2263,6 +2291,73 @@ mod tests {
                 .await
                 .is_err(),
             "an account still on disk cannot be treated as deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_only_lookup_never_uses_another_account() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodexOAuthManager::new(temp.path().to_path_buf());
+        manager
+            .add_test_account_with_user_identity("default-id", "fixture-access-a", "fixture-user-a")
+            .await
+            .unwrap();
+        manager
+            .add_test_account_with_user_identity(
+                "selected-id",
+                "fixture-access-b",
+                "fixture-user-b",
+            )
+            .await
+            .unwrap();
+        {
+            let mut accounts = manager.accounts.write().await;
+            for account in accounts.values_mut() {
+                account.email = Some("same@example.test".into());
+            }
+        }
+        manager.set_default_account("default-id").await.unwrap();
+        assert_eq!(
+            manager
+                .get_valid_token_for_managed_account("selected-id")
+                .await
+                .unwrap(),
+            "fixture-access-b"
+        );
+        assert!(matches!(
+            manager.get_valid_token_for_managed_account("missing-id").await,
+            Err(CodexOAuthError::AccountNotFound(id)) if id == "missing-id"
+        ));
+
+        // An expired cache without a managed refresh credential fails before network
+        // work and without borrowing the otherwise usable default account.
+        manager
+            .access_tokens
+            .write()
+            .await
+            .get_mut("selected-id")
+            .unwrap()
+            .expires_at_ms = 0;
+        manager
+            .accounts
+            .write()
+            .await
+            .get_mut("selected-id")
+            .unwrap()
+            .refresh_token
+            .clear();
+        assert!(matches!(
+            manager
+                .get_valid_token_for_managed_account("selected-id")
+                .await,
+            Err(CodexOAuthError::RefreshTokenInvalid)
+        ));
+        assert_eq!(
+            manager
+                .get_valid_token_for_managed_account("default-id")
+                .await
+                .unwrap(),
+            "fixture-access-a"
         );
     }
 

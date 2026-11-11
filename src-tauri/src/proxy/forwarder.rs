@@ -852,7 +852,19 @@ impl RequestForwarder {
             });
         }
         // 获取适配器
-        let adapter = get_adapter(app_type).ok_or_else(|| ForwardError {
+        if *app_type == AppType::Dsh && (providers.len() != 1 || self.routing_state_enabled()) {
+            return Err(ForwardError {
+                error: super::dsh::auth_error(),
+                provider: None,
+                outbound_model: None,
+            });
+        }
+        let adapter_app = if *app_type == AppType::Dsh {
+            &AppType::Codex
+        } else {
+            app_type
+        };
+        let adapter = get_adapter(adapter_app).ok_or_else(|| ForwardError {
             error: ProxyError::ConfigError(format!(
                 "{} does not support proxy routing",
                 app_type.as_str()
@@ -1463,8 +1475,23 @@ impl RequestForwarder {
     ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
         *codex_upstream_format_out = None;
         self.set_last_outbound_model(None);
+
+        #[cfg(test)]
+        let dsh_test = extensions.get::<super::dsh::DshForwardTestFixture>();
+        #[cfg(test)]
+        if dsh_test.is_some() && *app_type != AppType::Dsh {
+            return Err(ProxyError::ConfigError(
+                "Unexpected app in DSH forwarding fixture".into(),
+            ));
+        }
         // 使用适配器提取 base_url
-        let managed_native_account = if *app_type == AppType::ZCode {
+        let managed_native_account = if *app_type == AppType::Dsh {
+            Some(
+                super::dsh::bound_account(provider)
+                    .ok_or_else(super::dsh::auth_error)?
+                    .to_owned(),
+            )
+        } else if *app_type == AppType::ZCode {
             crate::services::provider::zcode_direct::validate(provider)
                 .map_err(|e| ProxyError::ConfigError(e.to_string()))?;
             provider
@@ -1937,7 +1964,16 @@ impl RequestForwarder {
             let status = self.status.read().await;
             (status.address.clone(), status.port)
         };
-        super::upstream_guard::reject_self_forwarding(&url, &listen_address, listen_port).await?;
+        #[cfg(test)]
+        let dsh_test_url = dsh_test
+            .map(|fixture| fixture.loopback_url(&url))
+            .transpose()?;
+        #[cfg(test)]
+        let request_url = dsh_test_url.as_deref().unwrap_or(&url);
+        #[cfg(not(test))]
+        let request_url = url.as_str();
+        super::upstream_guard::reject_self_forwarding(request_url, &listen_address, listen_port)
+            .await?;
 
         // 记录映射后的出站模型名（此时 mapped_body 已完成接管映射 / [1m] 剥离 /
         // Copilot 归一化）。格式转换后若 body 仍带 model 字段会在下方刷新覆盖；
@@ -2213,7 +2249,7 @@ impl RequestForwarder {
         }
         super::providers::transform_responses::normalize_codex_oauth_responses_request(
             &mut filtered_body,
-            *app_type == AppType::ZCode && managed_native_account.is_some(),
+            matches!(app_type, AppType::Dsh | AppType::ZCode) && managed_native_account.is_some(),
         )?;
         // 出站 body 定稿后刷新真值（覆盖 Codex chat 上游模型覆写、转换层模型改写）
         if let Some(m) = filtered_body
@@ -2305,10 +2341,19 @@ impl RequestForwarder {
 
             // Codex OAuth 特殊处理：从 CodexOAuthManager 获取真实 access_token
             if auth.strategy == AuthStrategy::CodexOAuth {
-                if let Some(app_handle) = &self.app_handle {
-                    let codex_state = app_handle.state::<CodexOAuthState>();
-                    let codex_auth = &codex_state.0;
-
+                let codex_state = self
+                    .app_handle
+                    .as_ref()
+                    .map(|app_handle| {
+                        app_handle.try_state::<CodexOAuthState>().ok_or_else(|| {
+                            ProxyError::AuthError("Codex OAuth manager is unavailable".into())
+                        })
+                    })
+                    .transpose()?;
+                let codex_auth = codex_state.as_ref().map(|state| &state.0);
+                #[cfg(test)]
+                let codex_auth = dsh_test.map(|fixture| &fixture.manager).or(codex_auth);
+                if let Some(codex_auth) = codex_auth {
                     // 从 provider.meta 获取关联的 ChatGPT 账号 ID
                     let account_id = provider
                         .meta
@@ -2317,13 +2362,18 @@ impl RequestForwarder {
 
                     let resolved_account_id = match account_id {
                         Some(id) => Some(id),
+                        None if *app_type == AppType::Dsh => return Err(super::dsh::auth_error()),
                         None => codex_auth.default_account_id().await,
                     };
 
                     let token_result = match &resolved_account_id {
                         Some(id) => {
-                            log::debug!("[CodexOAuth] 使用指定账号 {id} 获取 token");
-                            codex_auth.get_valid_token_for_account(id).await
+                            if *app_type == AppType::Dsh {
+                                codex_auth.get_valid_token_for_managed_account(id).await
+                            } else {
+                                log::debug!("[CodexOAuth] 使用指定账号 {id} 获取 token");
+                                codex_auth.get_valid_token_for_account(id).await
+                            }
                         }
                         None => {
                             return Err(ProxyError::AuthError(
@@ -2343,9 +2393,13 @@ impl RequestForwarder {
                                         .chatgpt_account_id_for_account(id)
                                         .await
                                         .map_err(|e| {
-                                            ProxyError::AuthError(format!(
-                                                "Codex OAuth 账号解析失败: {e}"
-                                            ))
+                                            if *app_type == AppType::Dsh {
+                                                super::dsh::auth_error()
+                                            } else {
+                                                ProxyError::AuthError(format!(
+                                                    "Codex OAuth 账号解析失败: {e}"
+                                                ))
+                                            }
                                         })?,
                                 ),
                                 None => None,
@@ -2354,6 +2408,9 @@ impl RequestForwarder {
                                 "[CodexOAuth] 成功获取 access_token (account={})",
                                 codex_oauth_account_id.as_deref().unwrap_or("default")
                             );
+                        }
+                        Err(_) if *app_type == AppType::Dsh => {
+                            return Err(super::dsh::auth_error());
                         }
                         Err(e) => {
                             log::error!("[CodexOAuth] 获取 access_token 失败: {e}");
@@ -2891,7 +2948,14 @@ impl RequestForwarder {
         };
 
         // 获取全局代理 URL（上游是本机地址时直连，不送进代理）
-        let upstream_proxy_url: Option<String> = super::http_client::proxy_url_for(&url);
+        #[cfg(test)]
+        let upstream_proxy_url = if dsh_test.is_some() {
+            None
+        } else {
+            super::http_client::proxy_url_for(&url)
+        };
+        #[cfg(not(test))]
+        let upstream_proxy_url = super::http_client::proxy_url_for(&url);
 
         // SOCKS5 代理不支持 CONNECT 隧道，需要用 reqwest
         let is_socks_proxy = upstream_proxy_url
@@ -2905,6 +2969,8 @@ impl RequestForwarder {
             resolved_claude_api_format.as_deref(),
             is_copilot,
         );
+        #[cfg(test)]
+        let preserve_exact_header_case = preserve_exact_header_case && dsh_test.is_none();
 
         // 发送请求
         let response = if is_socks_proxy || !preserve_exact_header_case {
@@ -2913,8 +2979,14 @@ impl RequestForwarder {
             log::debug!(
                 "[Forwarder] Using pooled reqwest client (preserve_exact_header_case={preserve_exact_header_case}, socks_proxy={is_socks_proxy})"
             );
+            #[cfg(test)]
+            let client = match dsh_test {
+                Some(fixture) => fixture.client.clone(),
+                None => super::http_client::get_for_url(&url),
+            };
+            #[cfg(not(test))]
             let client = super::http_client::get_for_url(&url);
-            let mut request = client.request(method.clone(), &url);
+            let mut request = client.request(method.clone(), request_url);
             if request_is_streaming {
                 // reqwest 的 timeout 是整请求超时；流式请求交给 response_processor
                 // 的首包/静默期超时控制，避免长流被总时长误杀。
