@@ -32,6 +32,7 @@ const DIRECTORY_FIELD: Record<DirectoryAppId, keyof Settings> = {
   pi: "piConfigDir",
   zcode: "zcodeConfigDir",
   omp: "ompConfigDir",
+  dsh: "dshConfigDir",
 };
 
 const DIRECTORY_PLACEHOLDER: Record<DirectoryAppId, string> = {
@@ -45,6 +46,7 @@ const DIRECTORY_PLACEHOLDER: Record<DirectoryAppId, string> = {
   pi: "settings.browsePlaceholderPi",
   zcode: "settings.browsePlaceholderZcode",
   omp: "settings.browsePlaceholderOmp",
+  dsh: "settings.browsePlaceholderDsh",
 };
 
 const DIRECTORY_APPS: DirectoryAppId[] = [
@@ -58,6 +60,7 @@ const DIRECTORY_APPS: DirectoryAppId[] = [
   "pi",
   "zcode",
   "omp",
+  "dsh",
 ];
 
 const normalizeDir = (value: unknown) =>
@@ -68,7 +71,7 @@ const READ_ONLY_DIRECTORY_APPS = [
   "mcode",
   "agy",
   "kimi",
-  "dsh",
+  "copilot",
 ] as const;
 
 interface AppConfigSectionProps {

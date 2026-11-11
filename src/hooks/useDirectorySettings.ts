@@ -6,7 +6,7 @@ import type { SettingsFormState } from "./useSettingsForm";
 
 export type DirectoryAppId = Exclude<
   AppId,
-  "claude-desktop" | "mcode" | "agy" | "kimi" | "dsh"
+  "claude-desktop" | "mcode" | "agy" | "kimi" | "copilot"
 >;
 type AppDirectoryKey =
   | "claude"
@@ -18,7 +18,8 @@ type AppDirectoryKey =
   | "hermes"
   | "pi"
   | "zcode"
-  | "omp";
+  | "omp"
+  | "dsh";
 type DirectoryKey = "appConfig" | AppDirectoryKey;
 
 export interface ResolvedDirectories {
@@ -33,6 +34,7 @@ export interface ResolvedDirectories {
   pi: string;
   zcode: string;
   omp: string;
+  dsh: string;
 }
 
 // Single source of truth for per-app directory metadata.
@@ -47,6 +49,7 @@ const APP_DIRECTORY_META: Record<DirectoryAppId, { key: AppDirectoryKey }> = {
   pi: { key: "pi" },
   zcode: { key: "zcode" },
   omp: { key: "omp" },
+  dsh: { key: "dsh" },
 };
 
 const DIRECTORY_KEY_TO_SETTINGS_FIELD: Record<
@@ -63,6 +66,7 @@ const DIRECTORY_KEY_TO_SETTINGS_FIELD: Record<
   pi: "piConfigDir",
   zcode: "zcodeConfigDir",
   omp: "ompConfigDir",
+  dsh: "dshConfigDir",
 };
 
 const sanitizeDir = (value?: string | null): string | undefined => {
@@ -152,6 +156,7 @@ export function useDirectorySettings({
     pi: "",
     zcode: "",
     omp: "",
+    dsh: "",
   });
   const [isLoading, setIsLoading] = useState(true);
 
@@ -167,6 +172,7 @@ export function useDirectorySettings({
     pi: "",
     zcode: "",
     omp: "",
+    dsh: "",
   });
   // 已保存的数据目录（保存按钮和「需要重启」都和它比）。ref 给回调用，state 让比较它的
   // 组件在保存后重渲染：保存成功要把它更新成刚存的值，否则保存按钮一直在、改回去存不了
@@ -198,6 +204,7 @@ export function useDirectorySettings({
           piDir,
           zcodeDir,
           ompDir,
+          dshDir,
           defaultAppConfig,
           defaultClaudeDir,
           defaultCodexDir,
@@ -209,6 +216,7 @@ export function useDirectorySettings({
           defaultPiDir,
           defaultZcodeDir,
           defaultOmpDir,
+          defaultDshDir,
         ] = await Promise.all([
           settingsApi.getAppConfigDirOverride(),
           settingsApi.getConfigDir("claude"),
@@ -221,6 +229,7 @@ export function useDirectorySettings({
           settingsApi.getConfigDir("pi"),
           settingsApi.getConfigDir("zcode"),
           settingsApi.getConfigDir("omp"),
+          settingsApi.getConfigDir("dsh"),
           computeDefaultAppConfigDir(),
           computeDefaultConfigDir("claude"),
           computeDefaultConfigDir("codex"),
@@ -232,6 +241,7 @@ export function useDirectorySettings({
           computeDefaultConfigDir("pi"),
           computeDefaultConfigDir("zcode"),
           computeDefaultConfigDir("omp"),
+          computeDefaultConfigDir("dsh"),
         ]);
 
         if (!active) return;
@@ -250,6 +260,7 @@ export function useDirectorySettings({
           pi: defaultPiDir ?? "",
           zcode: defaultZcodeDir ?? "",
           omp: defaultOmpDir ?? "",
+          dsh: defaultDshDir ?? "",
         };
 
         setAppConfigDir(normalizedOverride);
@@ -267,6 +278,7 @@ export function useDirectorySettings({
           pi: piDir || defaultsRef.current.pi,
           zcode: zcodeDir || defaultsRef.current.zcode,
           omp: ompDir || defaultsRef.current.omp,
+          dsh: dshDir || defaultsRef.current.dsh,
         });
       } catch (error) {
         console.error(
@@ -481,6 +493,7 @@ export function useDirectorySettings({
         pi: overrides?.pi ?? defaultsRef.current.pi,
         zcode: overrides?.zcode ?? defaultsRef.current.zcode,
         omp: overrides?.omp ?? defaultsRef.current.omp,
+        dsh: overrides?.dsh ?? defaultsRef.current.dsh,
       });
     },
     [],

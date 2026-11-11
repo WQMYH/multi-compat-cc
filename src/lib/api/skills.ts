@@ -17,7 +17,8 @@ export type AppType =
   | "dsh"
   | "zcode"
   | "agy"
-  | "omp";
+  | "omp"
+  | "copilot";
 
 /** Skill 应用启用状态 */
 export interface SkillApps {
@@ -36,6 +37,7 @@ export interface SkillApps {
   agy?: boolean;
   zcode?: boolean;
   omp?: boolean;
+  copilot?: boolean;
 }
 
 /** 已安装的 Skill（v3.10.0+ 统一结构） */

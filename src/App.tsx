@@ -50,6 +50,11 @@ import {
   useTrayNavigation,
 } from "@/hooks/useTrayNavigation";
 import { useTauriEvent } from "@/hooks/useTauriEvent";
+import {
+  CODEX_UNIFY_MIGRATION_FINISHED_EVENT,
+  showCodexUnifyMigrationFinished,
+  type CodexUnifyMigrationFinished,
+} from "@/utils/codexHistorySplitHint";
 import { useLastValidValue } from "@/hooks/useLastValidValue";
 import {
   extractErrorMessage,
@@ -57,7 +62,13 @@ import {
   translatePiProviderMutationError,
 } from "@/utils/errorUtils";
 import { isTextEditableTarget } from "@/utils/domUtils";
+import { setZoom, stepZoom } from "@/lib/interfacePrefs";
 import { deepClone } from "@/utils/deepClone";
+import { isOfficialAccount } from "@/utils/providerCapabilities";
+import {
+  COPILOT_PROVIDER_ID_MAX,
+  normalizeCopilotProviderId,
+} from "@/config/copilotConfig";
 import { isLinux, isMac, isWindows } from "@/lib/platform";
 import {
   APP_STORAGE_KEY,
@@ -443,10 +454,14 @@ function App() {
     }
   };
 
-  // Kimi「添加」只写进 config.toml、不改默认模型；「切换」走 switchProvider
-  const handleAddKimiProvider = async (provider: Provider) => {
+  // Kimi「添加」只写进 config.toml、不改默认模型；「切换」走 switchProvider。
+  // Copilot CLI 的自带模型卡同理：「添加」只写进 providers.json，默认模型在 copilot 里用 /model 选
+  const handleAddNativeProvider = async (
+    provider: Provider,
+    app: "kimi" | "copilot",
+  ) => {
     try {
-      await providersApi.addToLiveConfig(provider.id, "kimi");
+      await providersApi.addToLiveConfig(provider.id, app);
     } catch (error) {
       toast.error(
         t("notifications.addFailed", {
@@ -456,7 +471,7 @@ function App() {
       );
       return;
     } finally {
-      await queryClient.invalidateQueries({ queryKey: ["providers", "kimi"] });
+      await queryClient.invalidateQueries({ queryKey: ["providers", app] });
     }
     toast.success(
       t("notifications.addToConfigSuccess", { defaultValue: "已添加到配置" }),
@@ -558,6 +573,12 @@ function App() {
     }
   });
 
+  // 开启统一会话历史后的后台迁入跑完了：提示用户现在可以重启 Codex
+  useTauriEvent<CodexUnifyMigrationFinished>(
+    CODEX_UNIFY_MIGRATION_FINISHED_EVENT,
+    (payload) => showCodexUnifyMigrationFinished(payload, t),
+  );
+
   // 应用项目后刷新相关缓存（providers 由既有 provider-switched 监听承接；
   // proxy 状态由后端直接改 DB，不走 mutation，必须显式刷新）
   useTauriEvent("profile-applied", async () => {
@@ -614,6 +635,22 @@ function App() {
           defaultValue: `当前供应商 ${payload.providerName} 是官方供应商，建议切换到第三方供应商后再使用代理接管`,
         }),
         { duration: 8000 },
+      );
+    },
+  );
+
+  // Codex / Grok Build 跟随系统代理发请求：发往本地路由的请求被系统代理接走时客户端只看到
+  // 空正文 502，CC Switch 这边没有日志（#9221），进入路由时后端自检一次，没回来就提示。
+  useTauriEvent<{ appType: AppId; origin: string }>(
+    "proxy-loopback-hijacked",
+    (payload) => {
+      const app = APP_DISPLAY_NAME[payload.appType] ?? payload.appType;
+      toast.warning(
+        t("notifications.proxyLoopbackHijacked", {
+          app,
+          origin: payload.origin,
+        }),
+        { duration: 15000 },
       );
     },
   );
@@ -848,7 +885,8 @@ function App() {
           activeApp === "mcode" ||
           activeApp === "dsh" ||
           activeApp === "kimi" ||
-          activeApp === "agy"
+          activeApp === "agy" ||
+          activeApp === "copilot"
         )
           return;
         const conflicts = await checkEnvConflicts(activeApp);
@@ -1000,6 +1038,24 @@ function App() {
         openSettingsRef.current("general");
         return;
       }
+      // 界面缩放：= / +（含小键盘）放大、- 缩小、0 复原，档位见 ZOOM_LEVELS
+      if (mod && !event.altKey) {
+        if (event.key === "=" || event.key === "+") {
+          event.preventDefault();
+          stepZoom(1);
+          return;
+        }
+        if (event.key === "-") {
+          event.preventDefault();
+          stepZoom(-1);
+          return;
+        }
+        if (event.key === "0") {
+          event.preventDefault();
+          setZoom(1);
+          return;
+        }
+      }
 
       if (event.key !== "Escape" || event.defaultPrevented) return;
       if (document.body.style.overflow === "hidden") return;
@@ -1077,7 +1133,12 @@ function App() {
         queryClient.invalidateQueries({ queryKey: hermesKeys.liveProviderIds }),
         queryClient.invalidateQueries({ queryKey: hermesKeys.modelConfig }),
       ]);
-    } else if (app === "mcode" || app === "dsh" || app === "kimi") {
+    } else if (
+      app === "mcode" ||
+      app === "dsh" ||
+      app === "kimi" ||
+      app === "copilot"
+    ) {
       await queryClient.invalidateQueries({ queryKey: ["providers", app] });
     } else if (app === "zcode") {
       await invalidateZcodeProviderCaches(queryClient);
@@ -1278,6 +1339,22 @@ function App() {
         );
         duplicatedProvider.addToLive = false;
       }
+    } else if (activeApp === "copilot") {
+      // 自带模型卡的 id 就是 providers.json 里的供应商名，副本另起一个；官方卡仍用随机 id。
+      // 副本都先不写进 providers.json（官方卡本来就不写）
+      if (!isOfficialAccount(activeApp, provider)) {
+        // 后端要求供应商名不超过 64 个字符：给「-copy-N」留出位置再截断
+        const base =
+          normalizeCopilotProviderId(provider.id).slice(
+            0,
+            COPILOT_PROVIDER_ID_MAX - "-copy-999".length,
+          ) || "copilot";
+        duplicatedProvider.providerKey = generateUniqueProviderCopyKey(
+          base,
+          Object.keys(providers),
+        );
+      }
+      duplicatedProvider.addToLive = false;
     }
 
     if (provider.sortIndex !== undefined) {
@@ -1568,7 +1645,11 @@ function App() {
     onConfigureUsage: setUsageProvider,
     onOpenWebsite: handleOpenWebsite,
     onOpenTerminal:
-      activeApp === "claude" || activeApp === "codex" || activeApp === "agy"
+      activeApp === "claude" ||
+      activeApp === "codex" ||
+      activeApp === "agy" ||
+      activeApp === "grokbuild" ||
+      activeApp === "copilot"
         ? setTerminalProvider
         : undefined,
     onCreate: () => openAddProvider(currentModeView),
@@ -1624,8 +1705,8 @@ function App() {
             onSwitch={(provider) =>
               void (isPiFamilyApp(activeApp)
                 ? handleEnablePiProvider(provider, activeApp)
-                : activeApp === "kimi"
-                  ? handleAddKimiProvider(provider)
+                : activeApp === "kimi" || activeApp === "copilot"
+                  ? handleAddNativeProvider(provider, activeApp)
                   : switchProvider(provider))
             }
             onRemoveFromConfig={
@@ -1636,7 +1717,8 @@ function App() {
               activeApp === "mcode" ||
               activeApp === "kimi" ||
               activeApp === "dsh" ||
-              activeApp === "omp"
+              activeApp === "omp" ||
+              activeApp === "copilot"
                 ? (provider) => setConfirmAction({ provider, action: "remove" })
                 : undefined
             }

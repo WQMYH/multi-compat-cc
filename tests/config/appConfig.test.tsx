@@ -22,6 +22,7 @@ describe("appConfig provider lifecycle", () => {
     "dsh",
     "zcode",
     "omp",
+    "copilot",
   ])("classifies %s as additive", (appId) => {
     expect(isAdditiveAppId(appId)).toBe(true);
   });

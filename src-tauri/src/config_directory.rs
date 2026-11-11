@@ -153,6 +153,7 @@ fn current_dir(app: &AppType) -> Result<PathBuf, AppError> {
         AppType::Kimi => crate::kimi_config::data_dir(),
         AppType::Agy => crate::agy_config::agy_dir(),
         AppType::ZCode => crate::zcode_config::get_zcode_dir(),
+        AppType::Copilot => crate::copilot_config::copilot_dir(),
     })
 }
 
@@ -220,10 +221,13 @@ pub fn default_dir(app: &AppType) -> Result<PathBuf, AppError> {
             home.join(".pi").join("agent"),
         )?,
         AppType::Omp => crate::omp_config::get_omp_native_agent_dir()?,
+        AppType::Dsh => crate::dsh_config::default_data_dir(),
         // These apps have no saved directory override today.
-        AppType::ClaudeDesktop | AppType::Mcode | AppType::Dsh | AppType::Kimi | AppType::Agy => {
-            current_dir(app)?
-        }
+        AppType::ClaudeDesktop
+        | AppType::Mcode
+        | AppType::Kimi
+        | AppType::Agy
+        | AppType::Copilot => current_dir(app)?,
     })
 }
 
@@ -313,6 +317,7 @@ fn environment_candidates(
         AppType::Hermes => push("HERMES_HOME", &[]),
         AppType::Pi => push("PI_CODING_AGENT_DIR", &[]),
         AppType::Dsh => push("DSH_HOME", &[]),
+        AppType::Copilot => push("COPILOT_HOME", &[]),
         AppType::Kimi => push("KIMI_CODE_HOME", &[]),
         AppType::Mcode => {
             // Preserve the tool's nonblank MINIMAX > MAVIS priority per scope.

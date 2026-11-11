@@ -19,6 +19,7 @@ const SESSION_PROVIDER_APPS: Record<string, AppId> = {
   "ZCode (Session)": "zcode",
   "Oh My Pi (Session)": "omp",
   "Antigravity (Session)": "agy",
+  "Copilot CLI (Session)": "copilot",
   "DeepSeek Harness (Session)": "dsh",
 };
 

@@ -212,15 +212,24 @@ impl Provider {
                     .unwrap_or_default();
                 (base_url, api_key)
             }
+            // Copilot CLI 自带模型卡：provider 节点（旧版环境变量形状兜底）。
+            AppType::Copilot => {
+                let converted = crate::copilot_config::convert_legacy_settings(settings);
+                let provider = converted.as_ref().unwrap_or(settings).get("provider");
+                (
+                    str_at(provider.and_then(|p| p.get("baseUrl"))),
+                    first_non_empty(provider, &["apiKey", "bearerToken"]),
+                )
+            }
             AppType::Dsh => (
                 str_at(settings.pointer("/options/baseURL")),
                 str_at(settings.pointer("/options/apiKey")),
             ),
-            // Hermes (config.yaml) flattens credentials at the top level, snake_case.
             AppType::Kimi => (
                 str_at(settings.pointer("/provider/base_url")),
                 str_at(settings.pointer("/provider/api_key")),
             ),
+            // Hermes (config.yaml) flattens credentials at the top level, snake_case.
             AppType::Hermes => (
                 str_at(settings.get("base_url")),
                 str_at(settings.get("api_key")),
@@ -952,7 +961,6 @@ impl UniversalProvider {
             r#"model_provider = "custom"
 model = "{model}"
 model_reasoning_effort = "{reasoning_effort}"
-disable_response_storage = true
 
 [model_providers.custom]
 name = "NewAPI"

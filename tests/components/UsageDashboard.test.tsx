@@ -394,6 +394,7 @@ describe("UsageDashboard", () => {
         agy: false,
         zcode: false,
         omp: false,
+        copilot: false,
       },
     });
     renderDashboard({ initialAppType: "gemini" });

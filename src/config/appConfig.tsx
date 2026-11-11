@@ -33,6 +33,7 @@ export const APP_IDS: AppId[] = [
   "agy",
   "zcode",
   "omp",
+  "copilot",
 ];
 
 export const DEFAULT_VISIBLE_APPS: VisibleApps = {
@@ -52,6 +53,7 @@ export const DEFAULT_VISIBLE_APPS: VisibleApps = {
   agy: true,
   zcode: true,
   omp: true,
+  copilot: true,
 };
 
 /**
@@ -93,6 +95,7 @@ export const SKILLS_APP_IDS: SkillsAppId[] = [
   "agy",
   "zcode",
   "omp",
+  "copilot",
 ];
 
 export type ProxyAppId = Extract<
@@ -144,6 +147,10 @@ export function isStackAppId(appId: string): appId is StackAppId {
   return (STACK_APP_IDS as string[]).includes(appId);
 }
 
+/**
+ * 累加式应用（后端 `AppType::is_additive_mode`）。Copilot CLI 是混合的：自带模型卡累加写进
+ * providers.json，官方卡仍是启动式（只有「打开终端」）。
+ */
 export type AdditiveAppId = Extract<
   AppId,
   | "opencode"
@@ -155,6 +162,7 @@ export type AdditiveAppId = Extract<
   | "dsh"
   | "zcode"
   | "omp"
+  | "copilot"
 >;
 
 export const ADDITIVE_APP_IDS: AdditiveAppId[] = [
@@ -167,6 +175,7 @@ export const ADDITIVE_APP_IDS: AdditiveAppId[] = [
   "pi",
   "zcode",
   "omp",
+  "copilot",
 ];
 
 export function isAdditiveAppId(appId: string): appId is AdditiveAppId {
@@ -211,6 +220,7 @@ export const MCP_APP_IDS: McpAppId[] = [
   "agy",
   "zcode",
   "omp",
+  "copilot",
 ];
 
 export function isMcpAppId(appId: string): appId is McpAppId {
@@ -370,6 +380,21 @@ export const APP_ICON_MAP: Record<AppId, AppConfig> = {
       "bg-cyan-500/10 ring-1 ring-cyan-500/20 hover:bg-cyan-500/20 text-cyan-600 dark:text-cyan-400",
     badgeClass:
       "bg-cyan-500/10 text-cyan-700 dark:text-cyan-300 hover:bg-cyan-500/20 border-0 gap-1.5",
+  },
+  copilot: {
+    label: "Copilot CLI",
+    icon: (
+      <ProviderIcon
+        icon="githubcopilot"
+        name="GitHub Copilot CLI"
+        size={14}
+        showFallback={false}
+      />
+    ),
+    activeClass:
+      "bg-slate-500/10 ring-1 ring-slate-500/20 hover:bg-slate-500/20 text-slate-700 dark:text-slate-300",
+    badgeClass:
+      "bg-slate-500/10 text-slate-700 dark:text-slate-300 hover:bg-slate-500/20 border-0 gap-1.5",
   },
 };
 

@@ -85,16 +85,20 @@ describe("ConfigDirectoryDetection", () => {
 
   it("keeps applications without a directory override read-only", async () => {
     detectMock.mockResolvedValue({
-      currentDir: "D:/native/dsh",
-      defaultDir: "D:/native/dsh",
+      currentDir: "D:/native/copilot",
+      defaultDir: "D:/native/copilot",
       candidates: [
-        { path: "D:/native/dsh", sources: ["process:DSH_HOME"], exists: true },
+        {
+          path: "D:/native/copilot",
+          sources: ["process:COPILOT_HOME"],
+          exists: true,
+        },
       ],
     });
-    render(<ConfigDirectoryDetection app="dsh" />);
+    render(<ConfigDirectoryDetection app="copilot" />);
 
-    await screen.findByText("Process environment variable DSH_HOME");
-    expect(screen.getAllByText("D:/native/dsh")[0]).toBeInTheDocument();
+    await screen.findByText("Process environment variable COPILOT_HOME");
+    expect(screen.getAllByText("D:/native/copilot")[0]).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: /Use this directory/ }),
     ).toBeNull();

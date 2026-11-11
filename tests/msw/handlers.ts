@@ -11,6 +11,7 @@ import {
   getProviders,
   listProviders,
   listSessions,
+  searchSessionContent,
   resetProviderState,
   setCurrentProviderId,
   ackPendingDeepLink,
@@ -176,6 +177,25 @@ export const handlers = [
 
   http.post(`${TAURI_ENDPOINT}/list_sessions`, () => success(listSessions())),
 
+  http.post(`${TAURI_ENDPOINT}/sync_session_index`, () => {
+    const total = listSessions().length;
+    return success({ running: false, processed: total, total });
+  }),
+
+  http.post(`${TAURI_ENDPOINT}/search_session_content`, async ({ request }) => {
+    const { query, providerIds } = await withJson<{
+      query: string;
+      providerIds?: string[];
+    }>(request);
+    const total = listSessions().length;
+    return success({
+      hits: searchSessionContent(query, providerIds),
+      status: { running: false, processed: total, total },
+    });
+  }),
+
+  http.post(`${TAURI_ENDPOINT}/clear_session_index`, () => success(true)),
+
   http.post(`${TAURI_ENDPOINT}/get_session_messages`, async ({ request }) => {
     const { providerId, sourcePath } = await withJson<{
       providerId: string;
@@ -311,6 +331,18 @@ export const handlers = [
     success("D:/CCSwitch/data"),
   ),
 
+  http.post(`${TAURI_ENDPOINT}/get_privacy_filter_config`, () =>
+    success({ enabled: false, filterToolResults: false }),
+  ),
+
+  http.post(`${TAURI_ENDPOINT}/get_codex_session_compression`, () =>
+    success(false),
+  ),
+
+  http.post(`${TAURI_ENDPOINT}/get_codex_sessions_disk_usage`, () =>
+    success(0),
+  ),
+
   http.post(
     `${TAURI_ENDPOINT}/apply_claude_plugin_config`,
     async ({ request }) => {
@@ -346,6 +378,7 @@ export const handlers = [
       pi: ".pi/agent",
       zcode: ".zcode",
       omp: ".omp/agent",
+      dsh: ".dsh",
     };
     return success(`/home/mock/${folders[app] ?? app}`);
   }),

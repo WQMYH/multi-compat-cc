@@ -4,7 +4,7 @@ use cc_switch_lib::{
 use serde_json::json;
 use std::{ffi::OsString, fs, path::PathBuf};
 
-#[path = "support.rs"]
+#[path = "support/mod.rs"]
 mod support;
 use support::{create_test_state, reset_test_fs, test_mutex};
 
@@ -149,6 +149,46 @@ fn dsh_provider_listing_bootstraps_official_profiles_and_preserves_legacy_rows()
             .unwrap();
         assert_eq!(saved.settings_config, legacy.settings_config);
     }
+}
+
+#[test]
+fn dsh_directory_setting_takes_precedence_over_dsh_home() {
+    let _guard = test_mutex().lock().unwrap();
+    reset_test_fs();
+    let home = DshHome::new();
+    let configured = home.directory.path().join("configured-dsh");
+    cc_switch_lib::update_settings(cc_switch_lib::AppSettings {
+        dsh_config_dir: Some(configured.to_string_lossy().into_owned()),
+        ..Default::default()
+    })
+    .unwrap();
+    let state = create_test_state().unwrap();
+
+    ProviderService::add(&state, AppType::Dsh, provider("draft"), true).unwrap();
+
+    let written = configured.join("profiles/web/cordis.patch.yml");
+    assert!(fs::read_to_string(&written)
+        .unwrap()
+        .contains("https://example.com/v1"));
+    assert!(!home.config().exists());
+
+    // Resetting the override must reveal DSH_HOME, not the saved override again.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    assert_eq!(
+        runtime
+            .block_on(cc_switch_lib::get_config_dir("dsh".into()))
+            .unwrap(),
+        configured.to_string_lossy()
+    );
+    assert_eq!(
+        runtime
+            .block_on(cc_switch_lib::get_default_config_dir("dsh".into()))
+            .unwrap(),
+        home.directory.path().to_string_lossy()
+    );
+    reset_test_fs();
 }
 
 #[test]

@@ -127,6 +127,7 @@ const APP_SHORT_NAME: Record<AppId | "qoder", string> = {
   agy: "Antigravity",
   zcode: "ZCode",
   omp: "omp",
+  copilot: "Copilot",
 };
 
 export function appShortName(appType: string): string {

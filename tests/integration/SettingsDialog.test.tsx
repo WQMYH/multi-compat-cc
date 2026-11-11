@@ -404,6 +404,15 @@ describe("SettingsPage integration", () => {
       "HERMES_HOME",
       "settings.browsePlaceholderHermes",
     ],
+    [
+      "dsh",
+      "dshConfigDir",
+      "C:/manual/dsh",
+      "D:/agents/dsh",
+      "D:/agents/dsh",
+      "DSH_HOME",
+      "settings.browsePlaceholderDsh",
+    ],
   ] as const)(
     "adopts and saves a detected %s path explicitly, then resets through the backend default",
     async (
@@ -499,37 +508,44 @@ describe("SettingsPage integration", () => {
     },
   );
 
-  it("shows the resolved DSH directory and source in a read-only app section", async () => {
+  it("shows the resolved Copilot directory in a read-only app section", async () => {
     server.use(
       http.post(
         "http://tauri.local/detect_config_directories",
         async ({ request }) => {
           const { app } = (await request.json()) as { app: string };
-          const path = app === "dsh" ? "D:/agents/dsh" : `/default/${app}`;
+          const path =
+            app === "copilot" ? "D:/agents/copilot" : `/default/${app}`;
           return HttpResponse.json({
             currentDir: path,
             defaultDir: path,
             candidates:
-              app === "dsh"
-                ? [{ path, sources: ["DSH_HOME"], exists: true }]
+              app === "copilot"
+                ? [{ path, sources: ["COPILOT_HOME"], exists: true }]
                 : [],
           });
         },
       ),
     );
     renderDialog({ section: "appConfig" });
-    await screen.findByText("DSH_HOME");
-    const block = document.getElementById("app-config-dsh")!;
-    expect(within(block).getAllByText("D:/agents/dsh")[0]).toBeInTheDocument();
+    await screen.findByText("COPILOT_HOME");
+    const block = document.getElementById("app-config-copilot")!;
+    expect(
+      within(block).getAllByText("D:/agents/copilot")[0],
+    ).toBeInTheDocument();
     expect(within(block).queryByRole("textbox")).toBeNull();
     expect(
       within(block).queryByRole("button", {
         name: /settings.adoptConfigDirectory/,
       }),
     ).toBeNull();
-    for (const app of ["dsh", "kimi", "mcode", "agy", "claude-desktop"]) {
+    for (const app of ["copilot", "kimi", "mcode", "agy", "claude-desktop"]) {
       expect(document.getElementById(`app-config-${app}`)).toBeInTheDocument();
     }
+    expect(document.querySelectorAll("#app-config-dsh")).toHaveLength(1);
+    expect(
+      within(document.getElementById("app-config-dsh")!).getByRole("textbox"),
+    ).toBeInTheDocument();
   });
 
   it("notifies when export fails", async () => {
