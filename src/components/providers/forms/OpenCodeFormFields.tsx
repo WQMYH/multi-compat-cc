@@ -1073,7 +1073,8 @@ export function OpenCodeFormFields({
 
                     {!modelsOnly &&
                       modelDialect === "dsh" &&
-                      isPlainObject(model.compat) && (
+                      (model.compat === undefined ||
+                        isPlainObject(model.compat)) && (
                         <StructuredOptionsEditor
                           id={`opencode-${key}-compat`}
                           title={t("pi.form.compatibility")}
@@ -1085,7 +1086,7 @@ export function OpenCodeFormFields({
                           keyPlaceholder="supportsDeveloperRole"
                           valuePlaceholder="false"
                           removeLabel={t("pi.form.removeCompatibilityOption")}
-                          options={model.compat}
+                          options={model.compat ?? {}}
                           onOptionsChange={(compat) => {
                             const { compat: _previous, ...rest } = model;
                             updateModel(
