@@ -69,6 +69,44 @@ describe("findManagedAccountUsers", () => {
     expect(users.map((u) => u.providerId)).toEqual(["legacy-a2"]);
   });
 
+  it("reports explicitly linked DSH cards without assigning unbound cards to the default account", () => {
+    const dsh = byId(
+      provider("chatgpt-dsh", {
+        meta: {
+          providerType: "codex_oauth",
+          authBinding: {
+            source: "managed_account",
+            authProvider: "codex_oauth",
+            accountId: "selected",
+          },
+        },
+      }),
+      provider("unbound-dsh", { meta: { providerType: "codex_oauth" } }),
+    );
+    const users = findManagedAccountUsers(
+      "codex_oauth",
+      ["selected"],
+      "default",
+      {
+        dsh,
+      },
+    );
+    expect(users).toEqual([
+      {
+        appId: "dsh",
+        providerId: "chatgpt-dsh",
+        name: "chatgpt-dsh",
+        viaDefault: false,
+      },
+    ]);
+    expect(groupUsersByApp(users)).toEqual([
+      { appId: "dsh", names: ["chatgpt-dsh"] },
+    ]);
+    expect(
+      findManagedAccountUsers("codex_oauth", ["default"], "default", { dsh }),
+    ).toEqual([]);
+  });
+
   it("collects every provider when removing all accounts", () => {
     const users = findManagedAccountUsers(
       "github_copilot",

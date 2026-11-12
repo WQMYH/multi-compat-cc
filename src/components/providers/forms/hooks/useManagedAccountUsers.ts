@@ -1,6 +1,7 @@
 import { useCallback } from "react";
+import { useQuery } from "@tanstack/react-query";
 import type { ManagedAuthProvider } from "@/lib/api/auth";
-import { useProvidersQuery } from "@/lib/query";
+import { providersQueryOptions, useProvidersQuery } from "@/lib/query";
 import {
   findManagedAccountUsers,
   type ManagedAccountUser,
@@ -18,6 +19,10 @@ export function useManagedAccountUsers(
   const { data: codex } = useProvidersQuery("codex");
   const { data: agy } = useProvidersQuery("agy");
   const { data: copilot } = useProvidersQuery("copilot");
+  const { data: dsh } = useQuery({
+    ...providersQueryOptions("dsh"),
+    enabled: authProvider === "codex_oauth",
+  });
 
   return useCallback(
     (accountIds: readonly string[]): ManagedAccountUser[] =>
@@ -27,7 +32,8 @@ export function useManagedAccountUsers(
         codex: codex?.providers,
         agy: agy?.providers,
         copilot: copilot?.providers,
+        dsh: dsh?.providers,
       }),
-    [authProvider, defaultAccountId, claude, desktop, codex, agy, copilot],
+    [authProvider, defaultAccountId, claude, desktop, codex, agy, copilot, dsh],
   );
 }

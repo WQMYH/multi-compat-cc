@@ -98,6 +98,11 @@ pub(crate) fn is_legacy_dsh_observation(provider: &Provider) -> bool {
                 })))
 }
 
+/// Keep retired observations and reserved local route credentials out of UI snapshots.
+pub(crate) fn is_visible_dsh_provider(provider: &Provider) -> bool {
+    !is_legacy_dsh_observation(provider) && !dsh_oauth::has_local_bearer(&provider.settings_config)
+}
+
 /// Codex official providers are safe to select during takeover: Codex keeps
 /// ownership of the active ChatGPT login and the proxy only forwards the
 /// authenticated request. Other apps' official providers retain the block.
@@ -5593,7 +5598,7 @@ impl ProviderService {
             };
             let mut saved = state.db.get_all_providers(app_type.as_str())?;
             if app_type == AppType::Dsh {
-                saved.retain(|_, provider| !is_legacy_dsh_observation(provider));
+                saved.retain(|_, provider| is_visible_dsh_provider(provider));
             }
             let nicknames = if app_type == AppType::Kimi {
                 crate::services::kimi_oauth::account_nicknames()
@@ -5601,6 +5606,9 @@ impl ProviderService {
                 Default::default()
             };
             for (id, config) in &native {
+                if app_type == AppType::Dsh && dsh_oauth::has_local_bearer(config) {
+                    continue;
+                }
                 if !saved.contains_key(id) {
                     let name = config.get("name").and_then(Value::as_str).unwrap_or(id);
                     saved.insert(
@@ -5614,7 +5622,10 @@ impl ProviderService {
                     // The native OAuth projection contains a per-listener secret.
                     // Keep the account-bound draft in CC's database and out of
                     // frontend responses; ordinary native providers still refresh.
-                    if app_type != AppType::Dsh || !dsh_oauth::is_managed(provider) {
+                    if app_type != AppType::Dsh
+                        || (!dsh_oauth::is_managed(provider)
+                            && !dsh_oauth::has_local_bearer(config))
+                    {
                         if let Some(name) = config.get("name").and_then(Value::as_str) {
                             provider.name = name.into();
                         }
@@ -5623,8 +5634,11 @@ impl ProviderService {
                 }
                 let in_live = native.get(id).is_some_and(|config| {
                     app_type != AppType::Dsh
-                        || !dsh_oauth::is_managed(provider)
-                        || dsh_oauth::is_own_projection(id, config)
+                        || if dsh_oauth::is_managed(provider) {
+                            dsh_oauth::is_own_projection(id, config)
+                        } else {
+                            !dsh_oauth::has_local_bearer(config)
+                        }
                 });
                 Self::set_provider_live_config_managed(provider, in_live);
                 if app_type == AppType::Kimi {
@@ -5830,21 +5844,17 @@ impl ProviderService {
             return Err(AppError::Conflict("DSH_OAUTH_CONFIG_CHANGED".into()));
         }
         crate::dsh_config::validate_provider(&current.id, &projected)?;
-        let exists = crate::dsh_config::provider_key_exists(&current.id)?;
-        if exists {
-            let native = crate::dsh_config::get_providers()?;
-            let ours = Self::provider_live_config_managed(&current) == Some(true)
-                && native
-                    .get(&current.id)
-                    .is_some_and(|config| dsh_oauth::is_own_projection(&current.id, config));
-            if !ours {
-                return Err(AppError::Conflict("DSH_OAUTH_CONFIG_CONFLICT".into()));
-            }
+        if !dsh_oauth::is_own_projection(&current.id, &projected) {
+            return Err(AppError::InvalidInput("DSH_OAUTH_DRAFT_INVALID".into()));
         }
+        let may_replace = Self::provider_live_config_managed(&current) == Some(true);
         Self::set_provider_live_config_managed(&mut current, true);
-        crate::dsh_config::save_and_commit(&current.id, Some(projected), !exists, || {
-            state.db.save_provider("dsh", &current)
-        })
+        crate::dsh_config::save_owned_provider_and_commit(
+            &current.id,
+            Some(projected),
+            |config| may_replace && dsh_oauth::is_own_projection(&current.id, config),
+            || state.db.save_provider("dsh", &current),
+        )
     }
 
     fn dsh_oauth_owns_live(provider: &Provider) -> Result<bool, AppError> {
@@ -6890,10 +6900,13 @@ impl ProviderService {
         }
         if app_type == AppType::Dsh {
             if let Some(provider) = state.db.get_provider_by_id(id, "dsh")? {
-                if dsh_oauth::is_managed(&provider) && !Self::dsh_oauth_owns_live(&provider)? {
-                    // A draft or an independently replaced native provider is
-                    // not ours to remove from the user's DSH configuration.
-                    return state.db.delete_provider("dsh", id);
+                if dsh_oauth::is_managed(&provider) {
+                    return crate::dsh_config::save_owned_provider_and_commit(
+                        id,
+                        None,
+                        |config| dsh_oauth::is_own_projection(id, config),
+                        || state.db.delete_provider("dsh", id),
+                    );
                 }
             }
             return crate::dsh_config::save_and_commit(id, None, false, || {
@@ -7072,10 +7085,14 @@ impl ProviderService {
         }
         if app_type == AppType::Dsh {
             if let Some(mut provider) = state.db.get_provider_by_id(id, "dsh")? {
-                if dsh_oauth::is_managed(&provider) && !Self::dsh_oauth_owns_live(&provider)? {
-                    // Leave any independently modified native provider intact.
+                if dsh_oauth::is_managed(&provider) {
                     Self::set_provider_live_config_managed(&mut provider, false);
-                    return state.db.save_provider("dsh", &provider);
+                    return crate::dsh_config::save_owned_provider_and_commit(
+                        id,
+                        None,
+                        |config| dsh_oauth::is_own_projection(id, config),
+                        || state.db.save_provider("dsh", &provider),
+                    );
                 }
             }
             return crate::dsh_config::save_and_commit(id, None, false, || {

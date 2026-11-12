@@ -122,13 +122,16 @@ export const dshProviderPresets: McodeProviderPreset[] =
 export const DSH_ACCOUNT_PRESET_ID = "dsh-official-account";
 export const DSH_CODEX_OAUTH_PRESET_ID = "dsh-codex-oauth";
 
-export const dshCodexOAuthPreset: McodeProviderPreset = {
+export const dshCodexOAuthPreset: McodeProviderPreset & {
+  providerType: "codex_oauth";
+} = {
   name: "ChatGPT",
   nameKey: "dsh.codexOAuth.presetName",
   providerKey: "chatgpt",
   websiteUrl: "https://chatgpt.com",
   icon: "openai",
   category: "custom",
+  providerType: "codex_oauth",
   settingsConfig: {
     name: "ChatGPT",
     kind: "custom",

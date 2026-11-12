@@ -87,15 +87,21 @@ pub(crate) fn is_own_projection(provider_id: &str, config: &Value) -> bool {
         && config["options"]["baseURL"]
             .as_str()
             .is_some_and(|base| loopback_endpoint(provider_id, base).is_some())
-        && config["options"]["apiKey"]
-            .as_str()
-            .and_then(|key| key.strip_prefix(ROUTE_KEY_PREFIX))
-            .is_some_and(|key| {
-                key.len() == 64
-                    && key
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            })
+        && has_local_bearer(config)
+}
+
+/// Reserve local route credentials at provider import and IPC boundaries even
+/// if the surrounding native configuration has subsequently changed.
+pub(crate) fn has_local_bearer(config: &Value) -> bool {
+    config["options"]["apiKey"]
+        .as_str()
+        .and_then(|key| key.strip_prefix(ROUTE_KEY_PREFIX))
+        .is_some_and(|key| {
+            key.len() == 64
+                && key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
 }
 
 fn loopback_endpoint(provider_id: &str, base: &str) -> Option<Url> {

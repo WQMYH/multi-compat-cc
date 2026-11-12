@@ -928,6 +928,7 @@ pub(crate) fn initialize_dsh_profiles(state: &AppState) -> Result<(), AppError> 
             // listener instance and are published only after explicit activation.
             if super::is_legacy_dsh_observation(provider)
                 || super::dsh_oauth::is_managed(provider)
+                || super::dsh_oauth::has_local_bearer(&provider.settings_config)
                 || (provider.settings_config["config"].is_string()
                     && provider.settings_config["api"].is_null())
             {
@@ -1134,7 +1135,11 @@ pub fn read_live_settings(app_type: AppType) -> Result<Value, AppError> {
         }
         AppType::Mcode => Ok(json!(crate::mcode_config::get_providers()?)),
         AppType::Kimi => Ok(json!(crate::kimi_config::get_providers()?)),
-        AppType::Dsh => Ok(json!(crate::dsh_config::get_providers()?)),
+        AppType::Dsh => {
+            let mut providers = crate::dsh_config::get_providers()?;
+            providers.retain(|_, config| !super::dsh_oauth::has_local_bearer(config));
+            Ok(json!(providers))
+        }
         AppType::Pi => Err(AppError::InvalidInput(
             "Pi providers are read from Pi's native models file".to_string(),
         )),

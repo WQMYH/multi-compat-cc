@@ -38,7 +38,7 @@ pub async fn get_providers(
                 .map_err(|e| e.to_string())?;
             if app_type == AppType::Dsh {
                 providers.retain(|_, provider| {
-                    !crate::services::provider::is_legacy_dsh_observation(provider)
+                    crate::services::provider::is_visible_dsh_provider(provider)
                 });
             }
             return Ok(providers);

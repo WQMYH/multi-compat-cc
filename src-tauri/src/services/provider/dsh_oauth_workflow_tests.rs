@@ -216,6 +216,118 @@ async fn conflicting_native_provider_is_not_replaced_or_left_with_listener() {
     assert_eq!(fs::read(&web).unwrap(), before);
 }
 
+#[test]
+#[serial_test::serial]
+fn missing_authoritative_node_does_not_hide_a_conflicting_profile() {
+    let sandbox = Sandbox::new();
+    let state = AppState::new(Arc::new(Database::memory().unwrap()));
+    let mut card = account_card();
+    card.meta.as_mut().unwrap().live_config_managed = Some(true);
+    state.db.save_provider("dsh", &card).unwrap();
+    let base = "http://127.0.0.1:15721/dsh/oauth/chatgpt-card/v1";
+    let key = format!("ccsw-dsh-v1-{}", "a".repeat(64));
+    let projection = super::dsh_oauth::project(&card, base, &key).unwrap();
+    crate::dsh_config::set_provider(&card.id, projection.clone()).unwrap();
+
+    let web = web_profile(&sandbox.dsh());
+    let desktop = sandbox.dsh().join("profiles/desktop/cordis.patch.yml");
+    let headless = sandbox.dsh().join("profiles/headless/cordis.patch.yml");
+    fs::write(&web, "- id: user-plugin\n  config: {keep: true}\n").unwrap();
+    fs::create_dir_all(headless.parent().unwrap()).unwrap();
+    fs::write(
+        &headless,
+        fs::read_to_string(&desktop)
+            .unwrap()
+            .replace(base, "https://independent.example/v1"),
+    )
+    .unwrap();
+    // The merged reader sees Desktop's projection and hides the independent
+    // headless copy, so checking only its result cannot authorize a write.
+    let merged = crate::dsh_config::get_providers().unwrap();
+    assert!(super::dsh_oauth::is_own_projection(
+        &card.id,
+        &merged[&card.id]
+    ));
+    let paths = [
+        web,
+        desktop,
+        headless,
+        sandbox.dsh().join(".credentials.yaml"),
+    ];
+    let before = paths.each_ref().map(|path| fs::read(path).unwrap());
+
+    let error = ProviderService::publish_dsh_oauth(&state, &card, projection).unwrap_err();
+    assert!(error.to_string().contains("DSH_OAUTH_CONFIG_CONFLICT"));
+    assert_eq!(paths.each_ref().map(|path| fs::read(path).unwrap()), before);
+
+    ProviderService::remove_from_live_config(&state, AppType::Dsh, &card.id).unwrap();
+    let saved = state
+        .db
+        .get_provider_by_id(&card.id, "dsh")
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.meta.unwrap().live_config_managed, Some(false));
+    assert_eq!(paths.each_ref().map(|path| fs::read(path).unwrap()), before);
+
+    ProviderService::delete(&state, AppType::Dsh, &card.id).unwrap();
+    assert!(state
+        .db
+        .get_provider_by_id(&card.id, "dsh")
+        .unwrap()
+        .is_none());
+    assert_eq!(paths.each_ref().map(|path| fs::read(path).unwrap()), before);
+}
+
+#[test]
+#[serial_test::serial]
+fn orphaned_route_credential_is_not_imported_or_returned_as_live_settings() {
+    let _sandbox = Sandbox::new();
+    let state = AppState::new(Arc::new(Database::memory().unwrap()));
+    let card = account_card();
+    let key = format!("ccsw-dsh-v1-{}", "b".repeat(64));
+    let mut projection = super::dsh_oauth::project(
+        &card,
+        "http://127.0.0.1:15721/dsh/oauth/chatgpt-card/v1",
+        &key,
+    )
+    .unwrap();
+    // The reserved local credential still needs protection after the endpoint
+    // is edited and no longer qualifies as an owned projection.
+    projection["options"]["baseURL"] = json!("https://independent.example/v1");
+    let orphan = Provider::with_id(card.id.clone(), card.name.clone(), projection.clone(), None);
+    assert!(!super::is_visible_dsh_provider(&orphan));
+    let mut ordinary = orphan.clone();
+    ordinary.settings_config["options"]["apiKey"] = json!("synthetic-ordinary-key");
+    assert!(super::is_visible_dsh_provider(&ordinary));
+    crate::dsh_config::set_provider(&card.id, projection).unwrap();
+    crate::dsh_config::set_provider(
+        "ordinary-api",
+        json!({"api":"openai-responses", "options":{"baseURL":"https://example.com/v1","apiKey":"synthetic-ordinary-key"},
+               "models":{"ordinary-model":{}}}),
+    )
+    .unwrap();
+
+    let listed = ProviderService::list(&state, AppType::Dsh).unwrap();
+    assert!(!listed.contains_key(&card.id));
+    assert_eq!(
+        listed["ordinary-api"].settings_config["options"]["apiKey"],
+        "synthetic-ordinary-key"
+    );
+    assert!(state
+        .db
+        .get_provider_by_id(&card.id, "dsh")
+        .unwrap()
+        .is_none());
+
+    let live = ProviderService::read_live_settings(AppType::Dsh).unwrap();
+    assert!(live.get(&card.id).is_none());
+    assert_eq!(
+        live["ordinary-api"]["options"]["apiKey"],
+        "synthetic-ordinary-key"
+    );
+    assert!(!live.to_string().contains(&key));
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn removing_the_selected_account_revokes_the_route_but_keeps_dsh_data() {

@@ -716,11 +716,7 @@ fn get_providers_from(
             .get("apiKeyEnv")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let key = credentials["refs"][reference]
-            .as_str()
-            .map(str::to_string)
-            .or_else(|| std::env::var(reference).ok())
-            .unwrap_or_default();
+        let key = provider_credential(&credentials, reference);
         let mut models = serde_json::Map::new();
         for model in config
             .get("models")
@@ -752,6 +748,14 @@ fn get_providers_from(
         result.insert(id.into(), config);
     }
     Ok(result)
+}
+
+fn provider_credential(credentials: &Yaml, reference: &str) -> String {
+    credentials["refs"][reference]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| std::env::var(reference).ok())
+        .unwrap_or_default()
 }
 
 pub(crate) fn validate_provider(id: &str, config: &Value) -> Result<(), AppError> {
@@ -904,6 +908,69 @@ pub(crate) fn save_and_commit<T>(
     )
 }
 
+/// Check every same-named node under the native locks before replacing or
+/// removing an account projection. A conflicting removal only commits the CC
+/// state change, leaving all profile and credential files intact.
+pub(crate) fn save_owned_provider_and_commit<T>(
+    id: &str,
+    config: Option<Value>,
+    owns: impl Fn(&Value) -> bool,
+    commit: impl FnOnce() -> Result<T, AppError>,
+) -> Result<T, AppError> {
+    let mut profiles = target_paths();
+    if config.is_some() {
+        ensure_providers_not_shadowed(&home_patch_path())?;
+    } else {
+        profiles.retain(|path| path.exists());
+        if profiles.is_empty() {
+            return commit();
+        }
+    }
+    let mut files = vec![credentials_path()];
+    files.extend(profiles.iter().cloned());
+    edit_files_and_commit(
+        &files,
+        |texts| {
+            let credentials = credential_document_from(&texts[0])?;
+            let mut exists = false;
+            for text in &texts[1..] {
+                if let Some(node) = existing_provider_node(text, id)? {
+                    exists = true;
+                    let reference = node["apiKeyEnv"].as_str().unwrap_or_default();
+                    let readback = json!({
+                        "api": node["api"].as_str(),
+                        "options": {
+                            "baseURL": node["baseURL"].as_str(),
+                            "apiKey": provider_credential(&credentials, reference),
+                        },
+                    });
+                    if !owns(&readback) {
+                        if config.is_some() {
+                            return Err(AppError::Conflict("DSH_OAUTH_CONFIG_CONFLICT".into()));
+                        }
+                        return Ok(texts.to_vec());
+                    }
+                }
+            }
+            if let Some(config) = &config {
+                return plan_provider_update(&profiles, texts, id, config, !exists);
+            }
+            ensure_provider_copies_agree(
+                &profiles,
+                authoritative_index(&profiles),
+                &texts[1..],
+                id,
+            )?;
+            let mut next = vec![texts[0].clone()];
+            for text in &texts[1..] {
+                next.push(update_provider(text, id, None, false)?);
+            }
+            Ok(next)
+        },
+        commit,
+    )
+}
+
 fn save_paths_and_commit<T>(
     paths: &[PathBuf],
     credentials_path: &Path,
@@ -933,32 +1000,39 @@ fn save_paths_and_commit<T>(
     };
     let mut files = vec![credentials_path.to_path_buf()];
     files.extend(paths.iter().cloned());
-    let authoritative = authoritative_index(paths);
     edit_files_and_commit(
         &files,
-        |texts| {
-            let profile_texts = &texts[1..];
-            if create {
-                ensure_provider_key_is_free(paths, profile_texts, id)?;
-            } else {
-                ensure_provider_copies_agree(paths, authoritative, profile_texts, id)?;
-            }
-            let (credentials, native) = native_provider(id, &config, &texts[0])?;
-            let mut next = vec![];
-            for (path, text) in paths.iter().zip(profile_texts) {
-                let text = update_provider(text, id, Some(native.clone()), create)?;
-                next.push(restore_headless_credentials(
-                    path,
-                    &text,
-                    &native,
-                    &credentials,
-                )?);
-            }
-            next.insert(0, credentials);
-            Ok(next)
-        },
+        |texts| plan_provider_update(paths, texts, id, &config, create),
         commit,
     )
+}
+
+fn plan_provider_update(
+    paths: &[PathBuf],
+    texts: &[String],
+    id: &str,
+    config: &Value,
+    create: bool,
+) -> Result<Vec<String>, AppError> {
+    let profile_texts = &texts[1..];
+    if create {
+        ensure_provider_key_is_free(paths, profile_texts, id)?;
+    } else {
+        ensure_provider_copies_agree(paths, authoritative_index(paths), profile_texts, id)?;
+    }
+    let (credentials, native) = native_provider(id, config, &texts[0])?;
+    let mut next = vec![];
+    for (path, text) in paths.iter().zip(profile_texts) {
+        let text = update_provider(text, id, Some(native.clone()), create)?;
+        next.push(restore_headless_credentials(
+            path,
+            &text,
+            &native,
+            &credentials,
+        )?);
+    }
+    next.insert(0, credentials);
+    Ok(next)
 }
 
 /// Seed a newly encountered profile once. Keep the receipt beside the native profiles, rather
