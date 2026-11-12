@@ -486,6 +486,8 @@ describe("SessionManagerPage", () => {
     await waitFor(() => expect(sync).toHaveBeenCalledTimes(1));
 
     // 列表内容不变（正文可能变了）：刷新后仍要再同步一次
+    // 本组用例冻结了 Date；模拟刷新发生在后一个时刻。
+    vi.setSystemTime(Date.now() + 1);
     await userEvent.click(
       screen.getByRole("button", { name: "会话的更多操作" }),
     );
@@ -552,8 +554,8 @@ describe("SessionManagerPage", () => {
     await openAppMenu();
     const menu = await screen.findByRole("menu");
     const items = within(menu).getAllByRole("menuitemradio");
-    // 全部应用 + 14 个来源，按会话数从多到少
-    expect(items).toHaveLength(15);
+    // 全部应用 + 15 个来源，按会话数从多到少
+    expect(items).toHaveLength(16);
     expect(items[0]).toHaveTextContent("全部应用5");
     expect(items[1]).toHaveTextContent("Codex3");
     expect(items[items.length - 1]).toHaveTextContent("无会话");
@@ -594,6 +596,7 @@ describe("SessionManagerPage", () => {
         zcode: false,
         omp: false,
         copilot: false,
+        workbuddy: false,
       },
     });
     renderPage("codex");

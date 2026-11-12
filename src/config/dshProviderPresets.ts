@@ -1,5 +1,6 @@
 import { piProviderPresets, type PiPresetModel } from "./piProviderPresets";
 import type { McodeProviderPreset } from "./mcodeProviderPresets";
+import { OPENAI_OFFICIAL_PRESET_DISPLAY } from "./codexProviderPresets";
 
 // Configurable fields offered by dsh-llm-pi-ai@0.2.1-rc.2 COMPAT_GATES.
 // Pi also has vendor-only switches; DSH rejects those in profile overrides.
@@ -123,13 +124,16 @@ export const DSH_ACCOUNT_PRESET_ID = "dsh-official-account";
 export const DSH_CODEX_OAUTH_PRESET_ID = "dsh-codex-oauth";
 
 export const dshCodexOAuthPreset: McodeProviderPreset & {
+  displayName: string;
   providerType: "codex_oauth";
 } = {
   name: "ChatGPT",
   nameKey: "dsh.codexOAuth.presetName",
+  displayName: OPENAI_OFFICIAL_PRESET_DISPLAY.name,
   providerKey: "chatgpt",
   websiteUrl: "https://chatgpt.com",
-  icon: "openai",
+  icon: OPENAI_OFFICIAL_PRESET_DISPLAY.icon,
+  iconColor: OPENAI_OFFICIAL_PRESET_DISPLAY.iconColor,
   category: "custom",
   providerType: "codex_oauth",
   settingsConfig: {

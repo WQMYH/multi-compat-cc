@@ -113,6 +113,12 @@ export const settingsApi = {
     return await invoke("detect_config_directories", { app: appId });
   },
 
+  async getConfigStatus(
+    appId: AppId,
+  ): Promise<{ exists: boolean; path: string }> {
+    return await invoke("get_config_status", { app: appId });
+  },
+
   async openConfigFolder(appId: AppId): Promise<void> {
     await invoke("open_config_folder", { app: appId });
   },

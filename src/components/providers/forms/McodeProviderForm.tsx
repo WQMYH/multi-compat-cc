@@ -475,28 +475,15 @@ export function McodeProviderForm({
               </p>
               <CodexOAuthSection
                 mode="select"
-                showAccountQuota={false}
                 selectedAccountId={codexAccountId}
                 onAccountSelect={setCodexAccountId}
                 allowUnboundSelection={false}
-                requireExplicitSelection={!isEdit}
                 onManageAccounts={
                   onManageAuthAccounts
                     ? () => onManageAuthAccounts("codex_oauth")
                     : undefined
                 }
               />
-              {codexStatusLoaded &&
-                !codexStatus?.accounts.length &&
-                onManageAuthAccounts && (
-                  <Button
-                    type="button"
-                    variant="neutral"
-                    onClick={() => onManageAuthAccounts("codex_oauth")}
-                  >
-                    {t("codexOauth.addOrManageAccounts")}
-                  </Button>
-                )}
             </div>
           )}
           <OpenCodeFormFields

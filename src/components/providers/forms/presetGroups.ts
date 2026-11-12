@@ -36,6 +36,7 @@ export const PRESET_GROUP_ORDER: PresetGroup[] = [
 ];
 
 type PresetFields = AnyPreset & {
+  displayName?: string;
   websiteUrl?: string;
   requiresOAuth?: boolean;
   providerType?: string;
@@ -84,7 +85,8 @@ export function domainBody(domain: string): string {
 }
 
 export function presetDisplayName(preset: AnyPreset, t: Translate): string {
-  return preset.nameKey ? String(t(preset.nameKey)) : preset.name;
+  const { displayName, nameKey, name } = preset as PresetFields;
+  return displayName ?? (nameKey ? String(t(nameKey)) : name);
 }
 
 /**
@@ -115,14 +117,18 @@ export function presetMatches(
   query: string,
   t: Translate,
 ): boolean {
-  const domain = presetDomain(entry.preset);
+  const preset = entry.preset as PresetFields;
+  const domain = presetDomain(preset);
+  const localizedAlias =
+    preset.displayName && preset.nameKey ? String(t(preset.nameKey)) : "";
   return fieldsMatch(
     query,
     [
-      presetDisplayName(entry.preset, t),
-      entry.preset.name,
+      presetDisplayName(preset, t),
+      preset.name,
+      localizedAlias,
       domainBody(domain),
-      PRESET_SEARCH_ALIASES[entry.preset.name] ?? "",
+      PRESET_SEARCH_ALIASES[preset.name] ?? "",
     ],
     [domain],
   );
@@ -478,6 +484,8 @@ export function loginAccountKey(
       return "github";
     case "dsh":
       return "deepseek";
+    case "workbuddy":
+      return "workbuddy";
     default:
       return "claude";
   }

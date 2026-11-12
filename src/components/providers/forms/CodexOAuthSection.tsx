@@ -181,17 +181,14 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
   const selectedAccount = accounts.find(
     (account) => account.id === selectedAccountId,
   );
-  const accountChoicePlaceholder = t(
-    "codexOauth.officialAccountPlaceholder",
-    "请选择登录方式",
-  );
-  const accountSelectValue =
-    requireExplicitSelection && !selectedAccountId
-      ? "__official_account_required__"
-      : (selectedAccountId ??
-        (allowUnboundSelection ? "none" : "__managed_account_required__"));
+  const accountChoicePlaceholder = allowUnboundSelection
+    ? t("codexOauth.officialAccountPlaceholder", "请选择登录方式")
+    : t("codexOauth.selectAccountPlaceholder", "选择一个 ChatGPT 账号");
   const isAccountSelectionPlaceholder =
     !selectedAccountId && (requireExplicitSelection || !allowUnboundSelection);
+  const accountSelectValue = isAccountSelectionPlaceholder
+    ? "__account_required__"
+    : (selectedAccountId ?? "none");
   const accountSelectLabel = isAccountSelectionPlaceholder
     ? accountChoicePlaceholder
     : selectedAccount?.login ||
@@ -240,13 +237,8 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
             </span>
           </SelectTrigger>
           <SelectContent className="w-[var(--radix-select-trigger-width)] max-w-[var(--radix-select-content-available-width)]">
-            {requireExplicitSelection && !selectedAccountId && (
-              <SelectItem value="__official_account_required__" disabled>
-                <span className="text-fg-2">{accountChoicePlaceholder}</span>
-              </SelectItem>
-            )}
-            {!allowUnboundSelection && !selectedAccountId && (
-              <SelectItem value="__managed_account_required__" disabled>
+            {isAccountSelectionPlaceholder && (
+              <SelectItem value="__account_required__" disabled>
                 <span className="text-fg-2">{accountChoicePlaceholder}</span>
               </SelectItem>
             )}
@@ -355,6 +347,12 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
   );
 
   if (mode === "select") {
+    const showManageAccountsButton =
+      isStatusSuccess &&
+      !hasAnyAccount &&
+      !allowUnboundSelection &&
+      !nativeLoginOnly &&
+      onManageAccounts;
     return (
       <div className={`space-y-4 ${className || ""}`}>
         {statusErrorBanner}
@@ -366,8 +364,13 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
           </div>
         )}
 
-        {/* 账号选择器 */}
-        {accountSelect}
+        {showManageAccountsButton ? (
+          <Button type="button" variant="neutral" onClick={onManageAccounts}>
+            {t("codexOauth.addOrManageAccounts")}
+          </Button>
+        ) : (
+          accountSelect
+        )}
 
         {/* 所选账号需重新登录的内联提示 */}
         {selectedAccountNeedsReauth && (

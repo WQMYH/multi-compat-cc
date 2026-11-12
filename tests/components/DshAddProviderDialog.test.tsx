@@ -137,12 +137,10 @@ describe("Account entries in the DeepSeek Harness add-provider dialog", () => {
       await user.clear(search);
       await user.type(search, query);
       expect(
-        screen.getByRole("button", { name: "dsh.codexOAuth.presetName" }),
+        screen.getByRole("button", { name: "OpenAI Official" }),
       ).toBeVisible();
     }
-    await user.click(
-      screen.getByRole("button", { name: "dsh.codexOAuth.presetName" }),
-    );
+    await user.click(screen.getByRole("button", { name: "OpenAI Official" }));
 
     const add = await screen.findByRole("button", { name: "common.add" });
     expect(screen.queryByLabelText("API Key")).not.toBeInTheDocument();
@@ -152,7 +150,12 @@ describe("Account entries in the DeepSeek Harness add-provider dialog", () => {
     fireEvent.blur(model);
     expect(add).toBeDisabled();
 
-    await user.click(await screen.findByRole("combobox"));
+    const accountSelect = await screen.findByRole("combobox");
+    expect(accountSelect).toHaveTextContent("选择一个 ChatGPT 账号");
+    await user.click(accountSelect);
+    expect(
+      await screen.findAllByRole("option", { name: "选择一个 ChatGPT 账号" }),
+    ).toHaveLength(1);
     await user.click(
       await screen.findByRole("option", {
         name: /chatgpt-fixture@example\.test/,

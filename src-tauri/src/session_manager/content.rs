@@ -623,6 +623,15 @@ fn canonical_local_image(path: &str) -> Result<PathBuf, String> {
 
 /// 本地图片允许的目录（均已规范化）：会话根、会话附属目录、provider 自有目录
 fn local_image_dirs(source: &ValidatedSource) -> Vec<PathBuf> {
+    let codex_root =
+        (source.provider_id == "codex").then(crate::codex_config::get_codex_session_dir);
+    local_image_dirs_with_codex_root(source, codex_root.as_deref())
+}
+
+fn local_image_dirs_with_codex_root(
+    source: &ValidatedSource,
+    codex_root: Option<&Path>,
+) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let SourceLocation::Path { root, .. } = &source.location {
         dirs.push(root.clone());
@@ -631,7 +640,9 @@ fn local_image_dirs(source: &ValidatedSource) -> Vec<PathBuf> {
         dirs.push(base);
     }
     if source.provider_id == "codex" {
-        dirs.push(crate::codex_config::get_codex_config_dir().join("visualizations"));
+        if let Some(root) = codex_root {
+            dirs.push(root.join("visualizations"));
+        }
     }
     dirs.into_iter()
         .filter_map(|dir| dir.canonicalize().ok())
@@ -672,6 +683,7 @@ fn project_dir_for(source: &ValidatedSource) -> Option<PathBuf> {
         "kimi" => kimi::scan_sessions(),
         "omp" => omp::scan_sessions(),
         "dsh" => super::providers::dsh::scan_sessions(),
+        "workbuddy" => super::providers::workbuddy::scan_sessions(),
         "agy" => super::providers::agy::scan_sessions(),
         "copilot" => super::providers::copilot::scan_sessions(),
         _ => return None,
@@ -1352,5 +1364,42 @@ mod tests {
         assert!(canonical_local_image("relative.png").is_err());
         assert!(canonical_local_image("/tmp/x.svg").is_err());
         assert!(canonical_local_image("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn codex_image_roots_follow_the_selected_session_directory() {
+        let selected = tempdir().unwrap();
+        let other = tempdir().unwrap();
+        let sessions = selected.path().join("sessions");
+        let visualizations = selected.path().join("visualizations");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&visualizations).unwrap();
+        let session = sessions.join("rollout.jsonl");
+        let image = visualizations.join("chart.png");
+        let outside = other.path().join("other.png");
+        std::fs::write(&session, "{}\n").unwrap();
+        std::fs::write(&image, [1u8, 2, 3]).unwrap();
+        std::fs::write(&outside, [4u8, 5, 6]).unwrap();
+        let source = ValidatedSource {
+            provider_id: "codex".into(),
+            raw: session.to_string_lossy().into_owned(),
+            location: SourceLocation::Path {
+                path: session.canonicalize().unwrap(),
+                root: sessions.canonicalize().unwrap(),
+            },
+        };
+        let dirs = local_image_dirs_with_codex_root(&source, Some(selected.path()));
+        assert_eq!(
+            read_local_image(&image.canonicalize().unwrap(), &dirs, 32).unwrap(),
+            vec![1, 2, 3]
+        );
+        assert!(read_local_image(&outside.canonicalize().unwrap(), &dirs, 32).is_err());
+
+        let other_provider = ValidatedSource {
+            provider_id: "claude".into(),
+            ..source
+        };
+        let dirs = local_image_dirs_with_codex_root(&other_provider, Some(selected.path()));
+        assert!(read_local_image(&image.canonicalize().unwrap(), &dirs, 32).is_err());
     }
 }

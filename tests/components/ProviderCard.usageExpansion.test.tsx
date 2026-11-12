@@ -76,22 +76,27 @@ function renderCard({
 }
 
 describe("ProviderCard cached usage expansion", () => {
-  it("offers retry when a DSH ChatGPT provider is configured and its route is inactive", async () => {
+  it("tracks the DSH ChatGPT route separately from account status", async () => {
     let active = false;
+    let accountStatusUnavailable = false;
     server.use(
       http.post("http://tauri.local/auth_get_status", () =>
-        HttpResponse.json({
-          provider: "codex_oauth",
-          authenticated: true,
-          default_account_id: "fixture-account",
-          accounts: [
-            {
-              id: "fixture-account",
-              login: "Fixture account",
-              reauth_required: false,
-            },
-          ],
-        }),
+        accountStatusUnavailable
+          ? HttpResponse.json("Fixture account status unavailable", {
+              status: 503,
+            })
+          : HttpResponse.json({
+              provider: "codex_oauth",
+              authenticated: true,
+              default_account_id: "fixture-account",
+              accounts: [
+                {
+                  id: "fixture-account",
+                  login: "Fixture account",
+                  reauth_required: false,
+                },
+              ],
+            }),
       ),
       http.post("http://tauri.local/get_dsh_oauth_route_status", () =>
         HttpResponse.json({ active }),
@@ -146,6 +151,15 @@ describe("ProviderCard cached usage expansion", () => {
     expect(
       screen.queryByRole("button", { name: "dsh.codexOAuth.retryActivation" }),
     ).toBeNull();
+    accountStatusUnavailable = true;
+    await act(async () => {
+      await queryClient.invalidateQueries({
+        queryKey: ["managed-auth-status", "codex_oauth"],
+      });
+    });
+    await screen.findByText("codex.accountStatusUnavailable");
+    expect(screen.queryByText("dsh.codexOAuth.routeInactive")).toBeNull();
+    expect(screen.queryByText("dsh.codexOAuth.routeActive")).toBeNull();
   });
 
   it("keeps official subscription quota inline despite cached script tiers", () => {

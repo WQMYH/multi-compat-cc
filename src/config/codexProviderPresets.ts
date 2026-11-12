@@ -131,9 +131,15 @@ function modelCatalog(
   );
 }
 
+export const OPENAI_OFFICIAL_PRESET_DISPLAY = {
+  name: "OpenAI Official",
+  icon: "openai",
+  iconColor: "#00A67E",
+} as const;
+
 export const codexProviderPresets: CodexProviderPreset[] = [
   {
-    name: "OpenAI Official",
+    ...OPENAI_OFFICIAL_PRESET_DISPLAY,
     websiteUrl: "https://chatgpt.com/codex",
     isOfficial: true,
     category: "official",
@@ -145,8 +151,6 @@ export const codexProviderPresets: CodexProviderPreset[] = [
       backgroundColor: "#1F2937", // gray-800
       textColor: "#FFFFFF",
     },
-    icon: "openai",
-    iconColor: "#00A67E",
   },
   {
     name: "GitHub Copilot",

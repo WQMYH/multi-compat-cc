@@ -415,12 +415,13 @@ describe("McodeProviderForm", () => {
 
     fireEvent.click(
       screen.getByRole("button", {
-        name: /ChatGPT|dsh\.codexOAuth\.presetName/,
+        name: "OpenAI Official",
       }),
     );
     const manage = await screen.findByRole("button", {
       name: "codexOauth.addOrManageAccounts",
     });
+    expect(screen.queryByRole("combobox")).toBeNull();
     fireEvent.click(manage);
     expect(onManageAuthAccounts).toHaveBeenCalledWith("codex_oauth");
     expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();

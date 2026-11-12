@@ -28,9 +28,12 @@ import {
 import { providerPresets } from "@/config/claudeProviderPresets";
 import {
   dshAccountPreset,
+  dshCodexOAuthPreset,
   DSH_ACCOUNT_PRESET_ID,
+  DSH_CODEX_OAUTH_PRESET_ID,
 } from "@/config/dshProviderPresets";
 import { codexProviderPresets } from "@/config/codexProviderPresets";
+import { workbuddyOfficialPreset } from "@/config/workbuddyProviderPresets";
 import {
   PRESET_FAMILIES,
   PRESET_PLAN_KEYS,
@@ -43,8 +46,21 @@ import ja from "@/i18n/locales/ja.json";
 import tr from "@/i18n/locales/tr.json";
 
 vi.mock("@/components/ProviderIcon", () => ({
-  ProviderIcon: ({ name }: { name: string }) => (
-    <span data-testid="provider-icon" data-name={name} />
+  ProviderIcon: ({
+    icon,
+    name,
+    color,
+  }: {
+    icon?: string;
+    name: string;
+    color?: string;
+  }) => (
+    <span
+      data-testid="provider-icon"
+      data-icon={icon}
+      data-name={name}
+      data-color={color}
+    />
   ),
 }));
 
@@ -494,7 +510,7 @@ describe("ProviderPresetSelector", () => {
     expect(await screen.findByTestId("host")).toBeInTheDocument();
   });
 
-  it("shows the DeepSeek account subtitle for the DSH official preset", async () => {
+  it("shows DeepSeek and OpenAI Official account entries for DSH", async () => {
     const onPresetChange = vi.fn();
     render(
       <TwoSteps
@@ -502,6 +518,7 @@ describe("ProviderPresetSelector", () => {
         onPresetChange={onPresetChange}
         presetEntries={[
           { id: DSH_ACCOUNT_PRESET_ID, preset: dshAccountPreset },
+          { id: DSH_CODEX_OAUTH_PRESET_ID, preset: dshCodexOAuthPreset },
         ]}
       />,
     );
@@ -509,6 +526,16 @@ describe("ProviderPresetSelector", () => {
     expect(
       within(host).getByText("providerPreset.loginWith.deepseek"),
     ).toBeInTheDocument();
+    const openAi = within(host).getByRole("button", {
+      name: "OpenAI Official",
+    });
+    expect(
+      within(openAi).getByText("providerPreset.loginWith.chatgpt"),
+    ).toBeInTheDocument();
+    const openAiIcon = within(openAi).getByTestId("provider-icon");
+    expect(openAiIcon).toHaveAttribute("data-icon", "openai");
+    expect(openAiIcon).toHaveAttribute("data-name", "ChatGPT");
+    expect(openAiIcon).toHaveAttribute("data-color", "#00A67E");
     expect(
       within(host).queryByText("providerPreset.loginWith.claude"),
     ).not.toBeInTheDocument();
@@ -523,6 +550,30 @@ describe("ProviderPresetSelector", () => {
         within(host).getByRole("button", { name: "dsh.account.presetName" }),
       );
     expect(onPresetChange).toHaveBeenCalledWith(DSH_ACCOUNT_PRESET_ID);
+  });
+
+  it("shows the WorkBuddy account subtitle for the WorkBuddy official preset", async () => {
+    render(
+      <TwoSteps
+        appId="workbuddy"
+        onPresetChange={vi.fn()}
+        presetEntries={[
+          { id: "workbuddy-official", preset: workbuddyOfficialPreset },
+        ]}
+      />,
+    );
+    const host = await screen.findByTestId("host");
+    expect(
+      within(host).getByText("providerPreset.loginWith.workbuddy"),
+    ).toBeInTheDocument();
+    expect(
+      within(host).queryByText("providerPreset.loginWith.claude"),
+    ).not.toBeInTheDocument();
+    for (const locale of [zh, zhTW, en, ja, tr]) {
+      expect(
+        (locale.providerPreset.loginWith as Record<string, string>).workbuddy,
+      ).toContain("WorkBuddy");
+    }
   });
 
   it("filters by category and keeps the search text when clicking around", async () => {

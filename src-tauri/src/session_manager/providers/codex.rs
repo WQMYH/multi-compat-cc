@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -11,7 +11,7 @@ use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::codex_config::{get_codex_config_dir, read_codex_config_text};
+use crate::codex_config::get_codex_session_dir;
 use crate::codex_rollout_file;
 use crate::codex_state_db::{codex_state_db_is_lockable, codex_state_db_paths};
 use crate::session_manager::model::{
@@ -59,22 +59,32 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
 }
 
 pub(crate) fn scan_sessions_with_status(status: &mut ScanStatus) -> Vec<SessionMeta> {
-    let roots = session_roots();
-    scan_sessions_in_roots_with_titles_and_status(&roots, &load_thread_titles(), status)
+    scan_sessions_in_dir_with_status(&get_codex_session_dir(), status)
+}
+
+fn scan_sessions_in_dir_with_status(
+    session_dir: &Path,
+    status: &mut ScanStatus,
+) -> Vec<SessionMeta> {
+    let roots = session_roots_in(session_dir);
+    let thread_titles = load_thread_titles(session_dir);
+    scan_sessions_in_roots_with_titles_and_status(&roots, &thread_titles, status)
 }
 
 pub fn session_roots() -> Vec<PathBuf> {
-    let config_dir = get_codex_config_dir();
+    session_roots_in(&get_codex_session_dir())
+}
+
+fn session_roots_in(session_dir: &Path) -> Vec<PathBuf> {
     vec![
-        config_dir.join("sessions"),
-        config_dir.join("archived_sessions"),
+        session_dir.join("sessions"),
+        session_dir.join("archived_sessions"),
     ]
 }
 
 #[cfg(test)]
 fn scan_sessions_in_roots(roots: &[PathBuf]) -> Vec<SessionMeta> {
-    let thread_titles = load_thread_titles();
-    scan_sessions_in_roots_with_titles(roots, &thread_titles)
+    scan_sessions_in_roots_with_titles(roots, &HashMap::new())
 }
 
 #[cfg(test)]
@@ -110,14 +120,13 @@ fn scan_sessions_in_roots_with_titles_and_status(
 /// 会话页每次打开都会全量扫描；没变过的文件直接复用上次的解析结果。
 static PARSE_CACHE: LazyLock<FileParseCache> = LazyLock::new(FileParseCache::new);
 
-fn load_thread_titles() -> HashMap<String, String> {
-    let config_dir = get_codex_config_dir();
-    let config_text = read_codex_config_text().unwrap_or_default();
-    let db_paths: Vec<PathBuf> = codex_state_db_paths(&config_dir, &config_text)
+fn load_thread_titles(session_dir: &Path) -> HashMap<String, String> {
+    let config_text = fs::read_to_string(session_dir.join("config.toml")).unwrap_or_default();
+    let db_paths: Vec<PathBuf> = codex_state_db_paths(session_dir, &config_text)
         .into_iter()
         .filter(|path| codex_state_db_is_lockable(path))
         .collect();
-    load_thread_titles_from_paths(&config_dir.join(CODEX_SESSION_INDEX_FILENAME), &db_paths)
+    load_thread_titles_from_paths(&session_dir.join(CODEX_SESSION_INDEX_FILENAME), &db_paths)
 }
 
 fn load_thread_titles_from_paths(
@@ -2238,6 +2247,70 @@ mod tests {
 
         assert!(ids.contains(&"active-id".to_string()));
         assert!(ids.contains(&"archived-id".to_string()));
+    }
+
+    #[test]
+    fn session_titles_and_state_database_follow_the_selected_root() {
+        if crate::config::sqlite_unsupported_in_temp_dir() {
+            return;
+        }
+        let temp = tempdir().expect("tempdir");
+        for label in ["legacy", "migrated"] {
+            let root = temp.path().join(label);
+            let sessions = root.join("sessions");
+            let archives = root.join("archived_sessions");
+            let sqlite_home = temp.path().join(format!("{label}-state"));
+            fs::create_dir_all(&sessions).expect("active sessions");
+            fs::create_dir_all(&archives).expect("archived sessions");
+            fs::create_dir_all(&sqlite_home).expect("SQLite home");
+            write_codex_session(&sessions.join("active.jsonl"), "state-id", "First prompt");
+            write_codex_session(&archives.join("archived.jsonl"), "index-id", "First prompt");
+
+            let mut config = toml_edit::DocumentMut::new();
+            config["sqlite_home"] = toml_edit::value(sqlite_home.to_string_lossy().into_owned());
+            fs::write(root.join("config.toml"), config.to_string()).expect("write root config");
+            let index_title = format!("{label} index title");
+            let index_record = serde_json::json!({
+                "id": "index-id",
+                "thread_name": &index_title,
+                "updated_at": "2026-03-06T21:50:13Z"
+            });
+            fs::write(
+                root.join(CODEX_SESSION_INDEX_FILENAME),
+                format!("{index_record}\n"),
+            )
+            .expect("write root index");
+
+            let state_title = format!("{label} state title");
+            let conn = Connection::open(sqlite_home.join(CODEX_STATE_DB_FILENAME))
+                .expect("open root state database");
+            conn.execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, first_user_message TEXT)",
+                [],
+            )
+            .expect("create thread table");
+            conn.execute(
+                "INSERT INTO threads VALUES (?1, ?2, ?3)",
+                ("state-id", &state_title, "First prompt"),
+            )
+            .expect("insert explicit title");
+            drop(conn);
+
+            let sessions = scan_sessions_in_dir_with_status(&root, &mut ScanStatus::default());
+            let titles: HashMap<_, _> = sessions
+                .into_iter()
+                .map(|session| (session.session_id, session.title))
+                .collect();
+            assert_eq!(titles.len(), 2);
+            assert_eq!(
+                titles.get("state-id").and_then(Option::as_deref),
+                Some(state_title.as_str())
+            );
+            assert_eq!(
+                titles.get("index-id").and_then(Option::as_deref),
+                Some(index_title.as_str())
+            );
+        }
     }
 
     #[test]

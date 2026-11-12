@@ -135,6 +135,23 @@ impl NativeEnvironment {
     }
 }
 
+/// Prefer the process setting, but also find a Windows user or system setting
+/// when the launching shell has not refreshed its environment yet.
+pub(crate) fn preferred_codex_home() -> Option<PathBuf> {
+    let environment = NativeEnvironment::new();
+    preferred_codex_home_with(&|scope, name| environment.get(scope, name))
+}
+
+fn preferred_codex_home_with(lookup: &EnvLookup<'_>) -> Option<PathBuf> {
+    [Scope::Process, Scope::User, Scope::System]
+        .into_iter()
+        .find_map(|scope| {
+            lookup(scope, "CODEX_HOME")
+                .filter(|value| !value.to_string_lossy().trim().is_empty())
+                .map(PathBuf::from)
+        })
+}
+
 /// Existing effective roots, without inventing new environment fallbacks.
 fn current_dir(app: &AppType) -> Result<PathBuf, AppError> {
     Ok(match app {
@@ -154,6 +171,7 @@ fn current_dir(app: &AppType) -> Result<PathBuf, AppError> {
         AppType::Agy => crate::agy_config::agy_dir(),
         AppType::ZCode => crate::zcode_config::get_zcode_dir(),
         AppType::Copilot => crate::copilot_config::copilot_dir(),
+        AppType::WorkBuddy => crate::workbuddy_config::data_dir(),
     })
 }
 
@@ -227,7 +245,8 @@ pub fn default_dir(app: &AppType) -> Result<PathBuf, AppError> {
         | AppType::Mcode
         | AppType::Kimi
         | AppType::Agy
-        | AppType::Copilot => current_dir(app)?,
+        | AppType::Copilot
+        | AppType::WorkBuddy => current_dir(app)?,
     })
 }
 
@@ -318,6 +337,7 @@ fn environment_candidates(
         AppType::Pi => push("PI_CODING_AGENT_DIR", &[]),
         AppType::Dsh => push("DSH_HOME", &[]),
         AppType::Copilot => push("COPILOT_HOME", &[]),
+        AppType::WorkBuddy => push("WORKBUDDY_CONFIG_DIR", &[]),
         AppType::Kimi => push("KIMI_CODE_HOME", &[]),
         AppType::Mcode => {
             // Preserve the tool's nonblank MINIMAX > MAVIS priority per scope.
@@ -660,6 +680,34 @@ mod tests {
     }
 
     #[test]
+    fn codex_home_uses_process_then_user_then_system_environment() {
+        let process = root("process");
+        let user = root("user");
+        let system = root("system");
+        let lookup = |scope, name: &str| {
+            assert_eq!(name, "CODEX_HOME");
+            Some(match scope {
+                Scope::Process => process.as_os_str().to_owned(),
+                Scope::User => user.as_os_str().to_owned(),
+                Scope::System => system.as_os_str().to_owned(),
+            })
+        };
+        assert_eq!(preferred_codex_home_with(&lookup), Some(process));
+
+        let lookup = |scope, _: &str| match scope {
+            Scope::Process => Some("  ".into()),
+            Scope::User => Some(user.as_os_str().to_owned()),
+            Scope::System => Some(system.as_os_str().to_owned()),
+        };
+        assert_eq!(preferred_codex_home_with(&lookup), Some(user));
+
+        let lookup =
+            |scope, _: &str| (scope == Scope::System).then(|| system.as_os_str().to_owned());
+        assert_eq!(preferred_codex_home_with(&lookup), Some(system));
+        assert_eq!(preferred_codex_home_with(&|_, _| None), None);
+    }
+
+    #[test]
     fn candidates_are_visible_without_changing_a_saved_root() {
         let saved = root("saved");
         let native = root("native");
@@ -679,6 +727,18 @@ mod tests {
         assert_eq!(result.candidates.len(), 3);
         assert_eq!(result.candidates[2].path, native.to_string_lossy());
         assert_eq!(result.candidates[2].sources, ["process:CODEX_HOME"]);
+    }
+
+    #[test]
+    fn workbuddy_environment_candidate_uses_the_native_directory() {
+        let native = root("workbuddy");
+        let lookup = |scope, name: &str| {
+            (scope == Scope::Process && name == "WORKBUDDY_CONFIG_DIR")
+                .then(|| native.as_os_str().to_owned())
+        };
+        let candidates =
+            environment_candidates(&AppType::WorkBuddy, &root("home"), Scope::Process, &lookup);
+        assert_eq!(candidates, vec![(native, "WORKBUDDY_CONFIG_DIR")]);
     }
 
     #[test]

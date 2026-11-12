@@ -389,9 +389,10 @@ pub async fn rebuild_codex_usage(
         .lock()
         .await;
     tauri::async_runtime::spawn_blocking(move || {
+        let codex_dir = crate::codex_config::get_codex_session_dir();
         db.backup_database_file()?;
-        db.reset_codex_usage()?;
-        let result = crate::services::session_usage_codex::sync_codex_usage(&db);
+        db.reset_codex_usage_in(&codex_dir)?;
+        let result = crate::services::session_usage_codex::sync_codex_usage_in(&db, &codex_dir);
         finish_codex_rebuild(result)
     })
     .await

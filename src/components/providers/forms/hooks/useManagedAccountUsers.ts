@@ -23,6 +23,7 @@ export function useManagedAccountUsers(
     ...providersQueryOptions("dsh"),
     enabled: authProvider === "codex_oauth",
   });
+  const { data: workbuddy } = useProvidersQuery("workbuddy");
 
   return useCallback(
     (accountIds: readonly string[]): ManagedAccountUser[] =>
@@ -33,7 +34,18 @@ export function useManagedAccountUsers(
         agy: agy?.providers,
         copilot: copilot?.providers,
         dsh: dsh?.providers,
+        workbuddy: workbuddy?.providers,
       }),
-    [authProvider, defaultAccountId, claude, desktop, codex, agy, copilot, dsh],
+    [
+      authProvider,
+      defaultAccountId,
+      claude,
+      desktop,
+      codex,
+      agy,
+      copilot,
+      dsh,
+      workbuddy,
+    ],
   );
 }

@@ -46,6 +46,10 @@ vi.mock("@/components/providers/KimiAccountLogin", () => ({
   KimiAccountLogin: () => <div />,
 }));
 
+vi.mock("@/components/settings/auth/WorkBuddyAccountSection", () => ({
+  WorkBuddyAccountSection: () => <div />,
+}));
+
 vi.mock("@/components/providers/DshAccount", () => ({
   DshAccountLogin: () => <div />,
 }));
@@ -456,7 +460,7 @@ describe("CodexOAuthSection", () => {
       />,
     );
 
-    const accountPlaceholder = screen.getByText("请选择登录方式");
+    const accountPlaceholder = screen.getByText("选择一个 ChatGPT 账号");
     expect(accountPlaceholder.parentElement).toHaveClass(
       "text-sm",
       "font-normal",

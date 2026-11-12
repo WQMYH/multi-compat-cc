@@ -14,7 +14,7 @@
 //! - `event_msg` (type=token_count) → 提取累计 token 用量，计算 delta
 //! - `token_usage_record` → 随后的 token_count last 为 0 时补记这次用量
 
-use crate::codex_config::get_codex_config_dir;
+use crate::codex_config::get_codex_session_dir;
 use crate::codex_rollout_file;
 use crate::database::{lock_conn, Database};
 use crate::error::AppError;
@@ -31,6 +31,7 @@ use crate::services::usage_stats::{
 };
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 use std::io::BufRead;
@@ -228,16 +229,25 @@ struct ParsedTokenEvent {
 /// 后面的正文（工具输出可能上百 KB）不用解析。
 const LINE_HEAD_BYTES: usize = 512;
 
+fn is_usage_line(line: &str) -> bool {
+    if line.contains("\"event_msg\"") {
+        return line.contains("\"token_count\"") || line.contains("\"thread_settings_applied\"");
+    }
+    line.contains("\"turn_context\"")
+        || line.contains("\"session_meta\"")
+        || line.contains("\"token_usage_record\"")
+}
+
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
 }
 
-/// 从行头里取 `"key":"value"` 的值。只用于时间戳、类型名、角色这类不含转义的短值。
-fn head_str<'a>(head: &'a [u8], key: &str) -> Option<&'a str> {
-    let needle = format!("\"{key}\":\"");
-    let start = find_bytes(head, needle.as_bytes())? + needle.len();
+/// 从行头里取 `"key":"value"` 的值，needle 是静态的 `"key":"` 字节串。
+/// 只用于时间戳、类型名、角色这类不含转义的短值，避免逐行分配搜索串。
+fn head_str<'a>(head: &'a [u8], needle: &[u8]) -> Option<&'a str> {
+    let start = find_bytes(head, needle)? + needle.len();
     let len = head[start..].iter().position(|b| *b == b'"')?;
     std::str::from_utf8(&head[start..start + len]).ok()
 }
@@ -267,11 +277,11 @@ fn classify_timing_line(line: &str) -> Option<(i64, TimingLine)> {
         Some(at) => head.split_at(at),
         None => (head, &[][..]),
     };
-    let kind = match head_str(envelope, "type")? {
+    let kind = match head_str(envelope, b"\"type\":\"")? {
         "turn_context" => TimingLine::Boundary,
         "token_usage_record" => TimingLine::UsageRecord,
-        "response_item" => match head_str(payload, "type")? {
-            "message" => match head_str(payload, "role")? {
+        "response_item" => match head_str(payload, b"\"type\":\"")? {
+            "message" => match head_str(payload, b"\"role\":\"")? {
                 "assistant" => TimingLine::ModelOutput,
                 _ => TimingLine::Boundary,
             },
@@ -280,14 +290,14 @@ fn classify_timing_line(line: &str) -> Option<(i64, TimingLine)> {
             item if item.ends_with("_call") => TimingLine::ModelOutput,
             _ => return None,
         },
-        "event_msg" => match head_str(payload, "type")? {
+        "event_msg" => match head_str(payload, b"\"type\":\"")? {
             "task_started" | "turn_aborted" => TimingLine::TurnReset,
             "item_completed" => output_item_started_ms(line, payload)?,
             _ => return None,
         },
         _ => return None,
     };
-    let timestamp_ms = head_str(envelope, "timestamp").and_then(parse_timestamp_millis)?;
+    let timestamp_ms = head_str(envelope, b"\"timestamp\":\"").and_then(parse_timestamp_millis)?;
     Some((timestamp_ms, kind))
 }
 
@@ -296,7 +306,7 @@ fn classify_timing_line(line: &str) -> Option<(i64, TimingLine)> {
 /// 要解析整行；这类行很短（实测中位数约 400 字节）。
 fn output_item_started_ms(line: &str, payload_head: &[u8]) -> Option<TimingLine> {
     let item_at = find_bytes(payload_head, b"\"item\":{")?;
-    match head_str(&payload_head[item_at..], "type")? {
+    match head_str(&payload_head[item_at..], b"\"type\":\"")? {
         "Reasoning" | "AgentMessage" => {}
         _ => return None,
     }
@@ -638,12 +648,11 @@ pub(crate) fn reset_codex_usage_on_conn(
 }
 
 impl Database {
-    pub(crate) fn reset_codex_usage(&self) -> Result<(), AppError> {
-        let codex_dir = get_codex_config_dir();
+    pub(crate) fn reset_codex_usage_in(&self, codex_dir: &Path) -> Result<(), AppError> {
         let conn = lock_conn!(self.conn);
         conn.execute("SAVEPOINT reset_codex_usage", [])
             .map_err(|error| AppError::Database(format!("开启 Codex 重建事务失败: {error}")))?;
-        let result = reset_codex_usage_on_conn(&conn, &codex_dir);
+        let result = reset_codex_usage_on_conn(&conn, codex_dir);
         match result {
             Ok(()) => {
                 conn.execute("RELEASE reset_codex_usage", [])
@@ -1047,8 +1056,14 @@ struct CodexFileSyncResult {
 
 /// 同步 Codex 使用数据（从 JSONL 会话日志）
 pub fn sync_codex_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
-    let codex_dir = get_codex_config_dir();
-    let files = collect_codex_session_files(&codex_dir);
+    sync_codex_usage_in(db, &get_codex_session_dir())
+}
+
+pub(crate) fn sync_codex_usage_in(
+    db: &Database,
+    codex_dir: &Path,
+) -> Result<SessionSyncResult, AppError> {
+    let files = collect_codex_session_files(codex_dir);
     let rollout_index = build_rollout_index(&files);
     let mut pass = CodexSyncPass::load(db)?;
 
@@ -1285,9 +1300,10 @@ fn parse_codex_file_with_index(
     let mut observed_bytes = 0i64;
     let mut has_billable_tokens = false;
     let mut timer = RequestTimer::default();
+    let mut bytes = Vec::new();
 
     loop {
-        let mut bytes = Vec::new();
+        bytes.clear();
         let read = reader
             .read_until(b'\n', &mut bytes)
             .map_err(|e| AppError::Config(format!("无法读取 Codex 日志: {e}")))?;
@@ -1297,14 +1313,15 @@ fn parse_codex_file_with_index(
         // A live writer may have only written part of the final JSON record.
         // Leave its line cursor unconsumed for the next file change, but retain
         // support for a complete final JSON record without a newline.
+        // Validate it without allocating a Value tree for a potentially huge body.
         if read == 0
             || (bytes.last() != Some(&b'\n')
-                && serde_json::from_slice::<serde_json::Value>(&bytes).is_err())
+                && serde_json::from_slice::<IgnoredJsonValue>(&bytes).is_err())
         {
             break;
         }
         line_offset += 1;
-        let line = match String::from_utf8(bytes) {
+        let line = match std::str::from_utf8(&bytes) {
             Ok(line) => line,
             Err(_) => continue,
         };
@@ -1312,23 +1329,13 @@ fn parse_codex_file_with_index(
             continue;
         }
 
-        timer.observe_line(&line);
+        timer.observe_line(line);
 
-        let is_event_msg = line.contains("\"event_msg\"");
-        let is_turn_context = line.contains("\"turn_context\"");
-        let is_session_meta = line.contains("\"session_meta\"");
-        let is_usage_record = line.contains("\"token_usage_record\"");
-        if !is_event_msg && !is_turn_context && !is_session_meta && !is_usage_record {
-            continue;
-        }
-        if is_event_msg
-            && !line.contains("\"token_count\"")
-            && !line.contains("\"thread_settings_applied\"")
-        {
+        if !is_usage_line(line) {
             continue;
         }
 
-        let value: serde_json::Value = match serde_json::from_str(&line) {
+        let value: serde_json::Value = match serde_json::from_str(line) {
             Ok(value) => value,
             Err(_) => continue,
         };
@@ -1696,6 +1703,160 @@ fn parent_signatures_before(
         .map_err(ParentSignatureError::content)
 }
 
+#[derive(Default)]
+struct ParentRecord {
+    timestamp: Option<serde_json::Value>,
+    event_type: Option<serde_json::Value>,
+    payload: Option<ParentPayload>,
+}
+
+#[derive(Default)]
+struct ParentPayload {
+    event_type: Option<serde_json::Value>,
+    info: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum ParentField {
+    Timestamp,
+    #[serde(rename = "type")]
+    EventType,
+    Payload,
+    Info,
+    #[serde(other)]
+    Other,
+}
+
+// Deserialize ignored values normally so invalid Unicode escapes, numeric
+// overflow, and excessive nesting retain Value's validation without its allocations.
+struct IgnoredJsonValue;
+
+impl<'de> Deserialize<'de> for IgnoredJsonValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(ObjectOrIgnored(Self))
+    }
+}
+
+// Preserve Value::get's permissive handling of non-object records/payloads.
+// Validate and discard them in one pass instead of rebuilding a full Value.
+struct ObjectOrIgnored<T>(T);
+
+impl<'de, T: serde::de::Visitor<'de, Value = T>> serde::de::Visitor<'de> for ObjectOrIgnored<T> {
+    type Value = T;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_unit<E>(self) -> Result<T, E> {
+        Ok(self.0)
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<T, E> {
+        Ok(self.0)
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<T, E> {
+        Ok(self.0)
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<T, E> {
+        Ok(self.0)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<T, E> {
+        Ok(self.0)
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<T, E> {
+        Ok(self.0)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut sequence: A) -> Result<T, A::Error> {
+        while sequence.next_element::<IgnoredJsonValue>()?.is_some() {}
+        Ok(self.0)
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<T, A::Error> {
+        self.0.visit_map(map)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for IgnoredJsonValue {
+    type Value = Self;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self, A::Error> {
+        while map.next_key::<Self>()?.is_some() {
+            map.next_value::<Self>()?;
+        }
+        Ok(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for ParentRecord {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(ObjectOrIgnored(Self::default()))
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for ParentRecord {
+    type Value = Self;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a rollout record")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(mut self, mut map: A) -> Result<Self, A::Error> {
+        while let Some(field) = map.next_key::<ParentField>()? {
+            match field {
+                ParentField::Timestamp => self.timestamp = map.next_value()?,
+                ParentField::EventType => self.event_type = map.next_value()?,
+                ParentField::Payload => self.payload = map.next_value()?,
+                _ => {
+                    map.next_value::<IgnoredJsonValue>()?;
+                }
+            }
+        }
+        Ok(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for ParentPayload {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(ObjectOrIgnored(Self::default()))
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for ParentPayload {
+    type Value = Self;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a rollout payload")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(mut self, mut map: A) -> Result<Self, A::Error> {
+        while let Some(field) = map.next_key::<ParentField>()? {
+            match field {
+                ParentField::EventType => self.event_type = map.next_value()?,
+                ParentField::Info => self.info = map.next_value()?,
+                _ => {
+                    map.next_value::<IgnoredJsonValue>()?;
+                }
+            }
+        }
+        Ok(self)
+    }
+}
+
+fn parse_parent_record(line: &str) -> Result<ParentRecord, serde_json::Error> {
+    serde_json::from_str(line)
+}
+
 /// 读取（或命中缓存）父 rollout 单个文件的完整 token 时间线。
 fn load_parent_timeline(
     parent_path: &Path,
@@ -1752,25 +1913,31 @@ fn load_parent_timeline(
         let Ok(line) = std::str::from_utf8(&bytes) else {
             continue;
         };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        let Ok(record) = parse_parent_record(line) else {
             continue;
         };
-        let timestamp = parse_timestamp(value.get("timestamp"));
+        let timestamp = parse_timestamp(record.timestamp.as_ref());
         if let Some(timestamp) = timestamp {
             max_timestamp = Some(max_timestamp.map_or(timestamp, |current| current.max(timestamp)));
         }
-        if value.get("type").and_then(serde_json::Value::as_str) != Some("event_msg")
-            || value
-                .get("payload")
-                .and_then(|payload| payload.get("type"))
+        if record
+            .event_type
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            != Some("event_msg")
+            || record
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.event_type.as_ref())
                 .and_then(serde_json::Value::as_str)
                 != Some("token_count")
         {
             continue;
         }
-        let Some(info) = value
-            .get("payload")
-            .and_then(|payload| payload.get("info"))
+        let Some(info) = record
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.info.as_ref())
             .filter(|info| !info.is_null())
         else {
             continue;
@@ -2564,6 +2731,163 @@ mod tests {
     use crate::services::sql_helpers::INPUT_TOKEN_SEMANTICS_LEGACY;
     use tempfile::tempdir;
 
+    #[test]
+    fn test_usage_line_filter_preserves_existing_predicate() {
+        let tags = [
+            "\"event_msg\"",
+            "\"turn_context\"",
+            "\"session_meta\"",
+            "\"token_usage_record\"",
+            "\"token_count\"",
+            "\"thread_settings_applied\"",
+        ];
+        for mask in 0..(1 << tags.len()) {
+            let line = tags
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| mask & (1 << index) != 0)
+                .map(|(_, tag)| *tag)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let event = line.contains(tags[0]);
+            let expected = (event
+                || line.contains(tags[1])
+                || line.contains(tags[2])
+                || line.contains(tags[3]))
+                && (!event || line.contains(tags[4]) || line.contains(tags[5]));
+            assert_eq!(is_usage_line(&line), expected, "tag mask {mask}");
+        }
+    }
+
+    #[test]
+    fn test_parent_record_preserves_value_projection() {
+        let records = [
+            r#"{"timestamp":"2026-07-10T03:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100}}}}"#,
+            r#"{"payload":{"info":{"last_token_usage":{"output_tokens":10}},"type":"token_count"},"type":"event_msg","timestamp":"2026-07-10T03:00:01Z"}"#,
+            r#"{"timestamp":1,"type":false,"payload":{"type":[],"info":{}}}"#,
+            r#"{"timestamp":"2026-07-10T03:00:01Z","payload":"legacy payload"}"#,
+            r#"{"timestamp":"2026-07-10T03:00:01Z","payload":[]}"#,
+            r#"{"timestamp":"2026-07-10T03:00:01Z","payload":[{"type":"token_count","info":{}},true,1.5,"text",null]}"#,
+            r#"{"payload":false,"payload":{"type":"token_count","info":{}}}"#,
+            r#"{"payload":[1,2,3],"payload":{"type":"token_count","info":{}}}"#,
+            r#"{"payload":{"type":"token_count","info":{}},"payload":42}"#,
+            r#"{"payload":{"type":"token_count","info":{}},"payload":[{"type":"token_count","info":{}}]}"#,
+            r#"{"type":"response_item","type":"event_msg","timestamp":null,"timestamp":"2026-07-10T03:00:01Z","payload":{"type":"token_count","info":{}}}"#,
+            r#"{"payload":{"type":"message","type":"token_count","info":{"old":1},"info":{"last_token_usage":{}}},"type":"event_msg"}"#,
+            r#"{"payload":{"type":"token_count","info":{}},"payload":null}"#,
+            r#"{"payload":null,"payload":{"type":"token_count","info":{}}}"#,
+            r#"{"timestamp":null,"type":null,"payload":{"type":null,"info":null}}"#,
+            r#"{"unknown":{"nested":[1,true,null,"text"]}}"#,
+            "[]",
+            r#"[{"timestamp":"2026-07-10T03:00:01Z","payload":{"type":"token_count","info":{}}}]"#,
+            r#""legacy record""#,
+            "true",
+            "-1",
+            "18446744073709551615",
+            "1.5",
+            "null",
+        ];
+        for line in records {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            let record = parse_parent_record(line).unwrap();
+            assert_eq!(
+                parse_timestamp(record.timestamp.as_ref()),
+                parse_timestamp(value.get("timestamp"))
+            );
+            assert_eq!(
+                record
+                    .event_type
+                    .as_ref()
+                    .and_then(serde_json::Value::as_str),
+                value.get("type").and_then(serde_json::Value::as_str)
+            );
+            assert_eq!(
+                record
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.event_type.as_ref())
+                    .and_then(serde_json::Value::as_str),
+                value
+                    .get("payload")
+                    .and_then(|payload| payload.get("type"))
+                    .and_then(serde_json::Value::as_str)
+            );
+            assert_eq!(
+                record
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.info.as_ref())
+                    .filter(|info| !info.is_null()),
+                value
+                    .get("payload")
+                    .and_then(|payload| payload.get("info"))
+                    .filter(|info| !info.is_null())
+            );
+        }
+        for line in [
+            r#"{"timestamp":"2026-07-10T03:00:01Z","payload":{ "#,
+            r#"{"timestamp":"2026-07-10T03:00:01Z","ignored":{"text":"\ud800"}}"#,
+            r#"{"timestamp":"2026-07-10T03:00:01Z","payload":{"text":"\udc00"}}"#,
+            r#"{"timestamp":"2026-07-10T03:00:01Z","ignored":[1e999]}"#,
+            r#"{"payload":["\ud800"],"payload":{"type":"token_count","info":{}}}"#,
+            r#"{"payload":[1e999],"payload":null}"#,
+            r#"{"payload":[{"\udc00":null}]}"#,
+            r#"["\ud800"]"#,
+            "{} {}",
+        ] {
+            assert!(serde_json::from_str::<serde_json::Value>(line).is_err());
+            assert!(parse_parent_record(line).is_err());
+        }
+    }
+
+    #[test]
+    fn test_projected_json_preserves_value_validation() {
+        // Exercise all three validation paths: a top-level non-object, a legacy
+        // payload, and an ignored field. Even overwritten values must be valid.
+        let values = [
+            "null",
+            "true",
+            "false",
+            "0",
+            "-1",
+            "1.5",
+            "1e300",
+            "1e999",
+            "18446744073709551616",
+            r#""\ud83d\ude00""#,
+            r#""\ud800""#,
+            r#""\udc00""#,
+            r#"{"\ud800":0}"#,
+            "[1,]",
+            "{\"a\":}",
+            "01",
+            "",
+        ];
+        let nested =
+            (125..=130).map(|depth| format!("{}0{}", "[".repeat(depth), "]".repeat(depth)));
+        for value in values.iter().map(|value| value.to_string()).chain(nested) {
+            for line in [
+                value.clone(),
+                format!(r#"{{"payload":{value},"payload":null}}"#),
+                format!(r#"{{"ignored":{value}}}"#),
+                format!(r#"{{"payload":{{"ignored":{value}}}}}"#),
+            ] {
+                let expected = serde_json::from_str::<serde_json::Value>(&line).is_ok();
+                assert_eq!(parse_parent_record(&line).is_ok(), expected, "{line}");
+                assert_eq!(
+                    serde_json::from_slice::<IgnoredJsonValue>(line.as_bytes()).is_ok(),
+                    expected,
+                    "{line}"
+                );
+            }
+        }
+        // from_slice must reject invalid UTF-8 too, including object keys.
+        for line in [b"\"\xff\"".as_slice(), b"{\"\xff\":0}", b"[\"\xff\"]"] {
+            assert!(serde_json::from_slice::<serde_json::Value>(line).is_err());
+            assert!(serde_json::from_slice::<IgnoredJsonValue>(line).is_err());
+        }
+    }
+
     const PARENT_ID: &str = "00000000-0000-4000-8000-000000000001";
     const CHILD_A_ID: &str = "00000000-0000-4000-8000-000000000002";
     const CHILD_B_ID: &str = "00000000-0000-4000-8000-000000000003";
@@ -2830,6 +3154,80 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| AppError::Database(error.to_string()))?;
         Ok(rows)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn sync_codex_usage_follows_codex_home_without_changing_config_dir() -> Result<(), AppError> {
+        const CHILD_FIXTURE: &str = "CC_SWITCH_TEST_CODEX_USAGE_FIXTURE";
+        if let Some(fixture) = std::env::var_os(CHILD_FIXTURE).map(PathBuf::from) {
+            let fallback_home = fixture.join("fallback-home");
+            let config_dir = fallback_home.join(".codex");
+            let migrated_dir = fixture.join("migrated-codex");
+            assert_eq!(
+                std::env::var_os("CC_SWITCH_TEST_HOME").map(PathBuf::from),
+                Some(fallback_home)
+            );
+            assert_eq!(
+                std::env::var_os("CODEX_HOME").map(PathBuf::from),
+                Some(migrated_dir.clone())
+            );
+            assert_eq!(crate::settings::get_codex_override_dir(), None);
+            assert_eq!(crate::codex_config::get_codex_config_dir(), config_dir);
+            assert_eq!(get_codex_session_dir(), migrated_dir);
+
+            let db = Database::memory()?;
+            let first = sync_codex_usage(&db)?;
+            assert!(first.errors.is_empty(), "{:?}", first.errors);
+            assert_eq!((first.files_scanned, first.imported), (1, 1));
+            let rows = codex_usage_rows(&db)?;
+            assert_eq!(rows.len(), 1);
+            assert_eq!((rows[0].1, rows[0].2), (100, 11));
+
+            let second = sync_codex_usage(&db)?;
+            assert!(second.errors.is_empty(), "{:?}", second.errors);
+            assert_eq!((second.files_scanned, second.imported), (1, 0));
+            assert_eq!(codex_usage_rows(&db)?, rows);
+            assert_eq!(crate::codex_config::get_codex_config_dir(), config_dir);
+            return Ok(());
+        }
+
+        let fixture = tempdir().unwrap();
+        let fallback_home = fixture.path().join("fallback-home");
+        let migrated_dir = fixture.path().join("migrated-codex");
+        for (root, id, input, output) in [
+            (fallback_home.join(".codex"), CHILD_A_ID, 900, 90),
+            (migrated_dir.clone(), PARENT_ID, 100, 11),
+        ] {
+            let sessions = root.join("sessions/2026/07/10");
+            fs::create_dir_all(&sessions).unwrap();
+            write_jsonl(
+                &rollout_path(&sessions, id),
+                &[
+                    session_meta(id),
+                    turn_context(),
+                    token_count(input, 0, output),
+                ],
+            );
+        }
+
+        // A fresh test process isolates both the environment and the settings cache.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "services::session_usage_codex::tests::sync_codex_usage_follows_codex_home_without_changing_config_dir",
+                "--nocapture",
+            ])
+            .env(CHILD_FIXTURE, fixture.path())
+            .env("CC_SWITCH_TEST_HOME", fallback_home)
+            .env("CODEX_HOME", migrated_dir)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("1 passed"), "{stdout}");
+        Ok(())
     }
 
     #[test]
@@ -3265,6 +3663,52 @@ mod tests {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         assert_eq!(totals, (2, 250, 30));
+        Ok(())
+    }
+
+    #[test]
+    fn test_final_record_validation_preserves_cursor() -> Result<(), AppError> {
+        let large_body = format!(
+            r#"{{"type":"response_item","payload":{{"content":[{}]}}}}"#,
+            vec![r#"{"text":"tool output","nested":[1,true,null]}"#; 2048].join(",")
+        );
+        let cases: &[(&[u8], bool)] = &[
+            (large_body.as_bytes(), true),
+            (br#"{"ignored":"\ud83d\ude00"} "#, true),
+            (br#"{"ignored":"\ud800"}"#, false),
+            (br#"{"ignored":[1e999]}"#, false),
+            (b"{\"ignored\":\"\xff\"}", false),
+            (br#"{"ignored":[1,"#, false),
+        ];
+        for compressed in [false, true] {
+            for &(tail, complete) in cases {
+                let dir = tempdir().unwrap();
+                let file = rollout_path(dir.path(), PARENT_ID);
+                write_jsonl(
+                    &file,
+                    &[
+                        session_meta(PARENT_ID),
+                        turn_context(),
+                        token_count(100, 50, 10),
+                    ],
+                );
+                let mut contents = fs::read(&file).unwrap();
+                contents.extend_from_slice(tail);
+                fs::write(&file, contents).unwrap();
+                let file = if compressed {
+                    compress_rollout(&file)
+                } else {
+                    file
+                };
+                let parsed = parse_codex_file(&file, Some(PARENT_ID.into()))?;
+                assert_eq!(parsed.line_offset, 3 + i64::from(complete));
+                assert_eq!(
+                    parsed.observed_bytes as u64,
+                    fs::metadata(&file).unwrap().len()
+                );
+                assert_eq!(parsed.token_events.len(), 1);
+            }
+        }
         Ok(())
     }
 
@@ -5864,6 +6308,70 @@ mod tests {
         compressed
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn sync_from_session_root_imports_compressed_children_and_archived_parents(
+    ) -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let root = tempdir().unwrap();
+        let sessions = root.path().join("sessions/2026/07/10");
+        let archives = root.path().join("archived_sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::create_dir_all(&archives).unwrap();
+        let parent = rollout_path(&archives, PARENT_ID);
+        let child = rollout_path(&sessions, CHILD_A_ID);
+        write_jsonl(
+            &parent,
+            &[
+                session_meta(PARENT_ID),
+                token_count_at(1_000, 900, 100, "2026-07-10T03:00:01Z"),
+                turn_context_at("2026-07-10T03:00:10Z"),
+            ],
+        );
+        write_jsonl(
+            &child,
+            &[
+                session_meta_at(CHILD_A_ID, None, Some(PARENT_ID), "2026-07-10T03:00:05Z"),
+                turn_context(),
+                token_count_at(1_000, 900, 100, "2026-07-10T03:00:06Z"),
+                token_count_at(1_300, 1_050, 150, "2026-07-10T03:00:07Z"),
+            ],
+        );
+        let compressed_child = compress_rollout(&child);
+
+        let first = sync_codex_usage_in(&db, root.path())?;
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        assert_eq!(
+            (first.files_scanned, first.imported, first.deferred_files),
+            (2, 2, 0)
+        );
+        let imported = codex_usage_rows(&db)?;
+        assert_eq!(imported.len(), 2);
+        assert!(imported.contains(&(
+            format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{CHILD_A_ID}:2"),
+            300,
+            50,
+        )));
+
+        let archived_child = archives.join(compressed_child.file_name().unwrap());
+        fs::rename(&compressed_child, archived_child).unwrap();
+        let second = sync_codex_usage_in(&db, root.path())?;
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert_eq!(
+            (second.files_scanned, second.imported, second.deferred_files),
+            (2, 0, 0)
+        );
+        assert_eq!(codex_usage_rows(&db)?, imported);
+
+        db.reset_codex_usage_in(root.path())?;
+        assert!(codex_usage_rows(&db)?.is_empty());
+        let rebuilt = sync_codex_usage_in(&db, root.path())?;
+        assert!(rebuilt.errors.is_empty(), "{:?}", rebuilt.errors);
+        assert_eq!(rebuilt.imported, 2);
+        assert_eq!(codex_usage_rows(&db)?, imported);
+        Ok(())
+    }
+
     fn decompress_rollout(compressed: &Path) -> PathBuf {
         let plain = codex_rollout_file::logical_path(compressed);
         let text = codex_rollout_file::read_to_string(compressed).unwrap();
@@ -6254,9 +6762,10 @@ mod tests {
 
     /// 真实语料回放验收 harness（仅手动运行，勿在 CI 跑）。
     ///
-    /// 把真实 `~/.codex/sessions` 语料在内存库上做一次全量重导，输出计时与
+    /// 把真实 `~/.codex/sessions` 和 `archived_sessions` 在内存库上全量重导，输出计时与
     /// 结果快照。用于性能改动的行为等价验证：改动前后各跑一次，两侧
     /// `CODEX_REPLAY_OUT` 文件必须逐字节相同。
+    /// `CODEX_REPLAY_ROOT` 可指定包含这两个目录的固定语料快照。
     ///
     /// ```bash
     /// CODEX_REPLAY_OUT=/tmp/replay.tsv \
@@ -6269,7 +6778,10 @@ mod tests {
             eprintln!("[REPLAY] no home dir, skipping");
             return Ok(());
         };
-        let real_sessions = real_home.join(".codex").join("sessions");
+        let real_codex = std::env::var_os("CODEX_REPLAY_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| real_home.join(".codex"));
+        let real_sessions = real_codex.join("sessions");
         if !real_sessions.is_dir() {
             eprintln!("[REPLAY] {} not found, skipping", real_sessions.display());
             return Ok(());
@@ -6278,10 +6790,16 @@ mod tests {
         // 临时 HOME 里只放一个指向真实语料的只读 symlink，避免测试
         // 触碰真实 ~/.cc-switch / ~/.codex 下的任何其他内容。
         let temp = tempfile::tempdir().expect("create temp home");
-        fs::create_dir_all(temp.path().join(".codex")).expect("mkdir .codex");
+        let replay_codex_dir = temp.path().join(".codex");
+        fs::create_dir_all(&replay_codex_dir).expect("mkdir .codex");
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&real_sessions, temp.path().join(".codex").join("sessions"))
-            .expect("symlink sessions");
+        for directory in ["sessions", "archived_sessions"] {
+            let source = real_codex.join(directory);
+            if source.is_dir() {
+                std::os::unix::fs::symlink(&source, replay_codex_dir.join(directory))
+                    .expect("symlink rollout directory");
+            }
+        }
         let previous_home = std::env::var_os("CC_SWITCH_TEST_HOME");
         std::env::set_var("CC_SWITCH_TEST_HOME", temp.path());
 
@@ -6294,7 +6812,7 @@ mod tests {
             Database::memory()?
         };
         let start = std::time::Instant::now();
-        let result = sync_codex_usage(&db)?;
+        let result = sync_codex_usage_in(&db, &replay_codex_dir)?;
         let full_elapsed = start.elapsed();
         eprintln!(
             "[REPLAY] full reimport: imported={} skipped={} suspected_dup={} deferred={} files={} errors={} elapsed={:.2?}",
@@ -6308,7 +6826,7 @@ mod tests {
         );
 
         let start = std::time::Instant::now();
-        let steady = sync_codex_usage(&db)?;
+        let steady = sync_codex_usage_in(&db, &replay_codex_dir)?;
         eprintln!(
             "[REPLAY] steady pass: imported={} deferred={} elapsed={:.2?}",
             steady.imported,

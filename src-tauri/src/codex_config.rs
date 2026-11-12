@@ -275,6 +275,25 @@ pub fn get_codex_config_dir() -> PathBuf {
     get_home_dir().join(".codex")
 }
 
+/// Resolve the root used to discover Codex sessions and their indexes.
+pub(crate) fn get_codex_session_dir() -> PathBuf {
+    resolve_codex_session_dir(
+        crate::settings::get_codex_override_dir(),
+        crate::config_directory::preferred_codex_home(),
+        || get_home_dir().join(".codex"),
+    )
+}
+
+fn resolve_codex_session_dir(
+    config_override: Option<PathBuf>,
+    codex_home: Option<PathBuf>,
+    fallback: impl FnOnce() -> PathBuf,
+) -> PathBuf {
+    config_override
+        .or_else(|| codex_home.filter(|path| !path.as_os_str().to_string_lossy().trim().is_empty()))
+        .unwrap_or_else(fallback)
+}
+
 /// 获取 Codex auth.json 路径
 pub fn get_codex_auth_path() -> PathBuf {
     get_codex_config_dir().join("auth.json")
@@ -3278,6 +3297,36 @@ mod tests {
     use serde_json::json;
     use serial_test::serial;
     use std::ffi::OsString;
+
+    #[test]
+    fn codex_session_dir_prefers_the_explicit_override_then_codex_home() {
+        let configured = PathBuf::from("configured-codex");
+        let migrated = PathBuf::from("migrated codex");
+
+        assert_eq!(
+            resolve_codex_session_dir(Some(configured.clone()), Some(migrated.clone()), || {
+                panic!("the configured session root takes precedence")
+            }),
+            configured
+        );
+        assert_eq!(
+            resolve_codex_session_dir(None, Some(migrated.clone()), || {
+                panic!("a nonempty CODEX_HOME takes precedence over the default")
+            }),
+            migrated
+        );
+    }
+
+    #[test]
+    fn codex_session_dir_uses_the_default_for_an_unset_or_blank_codex_home() {
+        let default = PathBuf::from("synthetic-home").join(".codex");
+        for value in [None, Some(PathBuf::new()), Some(PathBuf::from(" \t"))] {
+            assert_eq!(
+                resolve_codex_session_dir(None, value, || default.clone()),
+                default
+            );
+        }
+    }
 
     #[test]
     fn official_proxy_route_is_recognized_by_its_address() {
