@@ -35,6 +35,11 @@ fn store_file() -> PathBuf {
 
 /// Read the saved next-start selection without changing the active database root.
 pub fn read_app_config_dir_override(app: &tauri::AppHandle) -> Result<Option<PathBuf>, AppError> {
+    // An explicit launch root takes precedence; an old, unavailable store
+    // override must not prevent the selected root from starting.
+    if crate::data_paths::has_explicit_data_dir() {
+        return Ok(None);
+    }
     let store = app
         .store_builder(store_file())
         .build()
@@ -73,6 +78,11 @@ pub fn set_app_config_dir_to_store(
     app: &tauri::AppHandle,
     path: Option<&str>,
 ) -> Result<(), AppError> {
+    if crate::data_paths::has_explicit_data_dir() {
+        return Err(AppError::Message(
+            "当前数据目录由 --data-dir 启动参数指定，请修改启动参数后重启".into(),
+        ));
+    }
     let store = app
         .store_builder(store_file())
         .build()
@@ -82,7 +92,10 @@ pub fn set_app_config_dir_to_store(
         Some(p) => {
             let trimmed = p.trim();
             if !trimmed.is_empty() {
-                validate_override_path(trimmed)?;
+                let _selected = validate_override_path(trimmed)?;
+                #[cfg(windows)]
+                crate::data_migration::validate_app_override_for_current_targets(&_selected)
+                    .map_err(|error| AppError::Message(error.to_string()))?;
                 store.set(STORE_KEY_APP_CONFIG_DIR, Value::String(trimmed.to_string()));
                 log::info!("已将 app_config_dir 写入 Store: {trimmed}");
             } else {

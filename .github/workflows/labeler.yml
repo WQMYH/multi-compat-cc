@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   label:
+    if: github.repository == 'farion1231/cc-switch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/labeler@v5

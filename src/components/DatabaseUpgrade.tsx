@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
-const RELEASES_URL = "https://github.com/farion1231/cc-switch/releases";
+const RELEASES_URL = "https://github.com/WQMYH/multi-compat-cc/releases";
 
 interface DatabaseUpgradeProps {
   payload: {
@@ -52,10 +52,28 @@ export function DatabaseUpgrade({ payload }: DatabaseUpgradeProps) {
   const [availableVersion, setAvailableVersion] = useState<string | null>(null);
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  // Fail closed while detection is pending or unavailable.
+  const [externallyManaged, setExternallyManaged] = useState<boolean | null>(
+    null,
+  );
   const unlistenRef = useRef<(() => void) | null>(null);
 
   const dbVersion = payload.db_version;
   const supportedVersion = payload.supported_version;
+
+  useEffect(() => {
+    let cancelled = false;
+    void invoke<boolean>("is_portable_mode")
+      .then((value) => {
+        if (!cancelled) setExternallyManaged(value);
+      })
+      .catch(() => {
+        if (!cancelled) setExternallyManaged(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // 启动时检查可用更新，决定 upgradable / incompatible
   useEffect(() => {
@@ -89,10 +107,19 @@ export function DatabaseUpgrade({ payload }: DatabaseUpgradeProps) {
   }, []);
 
   const startUpgrade = useCallback(async () => {
-    setPhase("updating");
-    setProgress(null);
-    setErrorMsg(null);
     try {
+      // Recheck before installation; the backend enforces the same policy.
+      if (
+        externallyManaged !== false ||
+        (await invoke<boolean>("is_portable_mode"))
+      ) {
+        setExternallyManaged(true);
+        await invoke("open_external", { url: RELEASES_URL });
+        return;
+      }
+      setPhase("updating");
+      setProgress(null);
+      setErrorMsg(null);
       unlistenRef.current?.();
       unlistenRef.current = await listen<DownloadProgress>(
         "update-download-progress",
@@ -113,7 +140,7 @@ export function DatabaseUpgrade({ payload }: DatabaseUpgradeProps) {
       setErrorMsg(e instanceof Error ? e.message : String(e));
       setPhase("error");
     }
-  }, []);
+  }, [externallyManaged]);
 
   const percent =
     progress && progress.total && progress.total > 0
@@ -250,18 +277,23 @@ export function DatabaseUpgrade({ payload }: DatabaseUpgradeProps) {
               onClick={startUpgrade}
               className="gap-2 bg-warning text-white hover:bg-warning"
             >
-              {phase === "error" ? (
+              {externallyManaged !== false ? (
+                <ExternalLink className="h-4 w-4" />
+              ) : phase === "error" ? (
                 <RefreshCw className="h-4 w-4" />
               ) : (
                 <Download className="h-4 w-4" />
               )}
-              {phase === "error"
-                ? t("dbUpgrade.retry", "重试升级")
-                : t("dbUpgrade.upgradeNow", "升级应用")}
+              {externallyManaged !== false
+                ? t("dbUpgrade.openReleases", "打开发布页")
+                : phase === "error"
+                  ? t("dbUpgrade.retry", "重试升级")
+                  : t("dbUpgrade.upgradeNow", "升级应用")}
             </Button>
           )}
 
-          {(phase === "incompatible" || phase === "error") && (
+          {(phase === "incompatible" ||
+            (phase === "error" && externallyManaged === false)) && (
             <Button
               variant="outline"
               className="gap-2"

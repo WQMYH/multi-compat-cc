@@ -444,8 +444,21 @@ fn handle_second_instance(app: &tauri::AppHandle, args: Vec<String>) {
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     log::debug!("Args count: {}", args.len());
-    for (i, arg) in args.iter().enumerate() {
-        log::debug!("  arg[{i}]: {}", url_for_log(arg));
+
+    #[cfg(target_os = "windows")]
+    if !matches!(
+        crate::data_paths::second_instance_storage_conflict(&args),
+        Ok(false)
+    ) {
+        app.dialog()
+            .message(
+                "已有 CC Switch 实例正在使用其他数据目录。请先退出当前实例，再使用指定目录启动。",
+            )
+            .title("CC Switch")
+            .kind(MessageDialogKind::Warning)
+            .buttons(MessageDialogButtons::Ok)
+            .blocking_show();
+        return;
     }
 
     if crate::lightweight::is_lightweight_mode() {
@@ -560,6 +573,7 @@ pub fn run() {
         tauri::plugin::Builder::<_, ()>::new("data-migration")
             .setup(|_, _| {
                 if !readonly_provider_preview() {
+                    data_paths::ensure_storage_ready()?;
                     data_migration::migrate()?;
                 }
                 Ok(())

@@ -76,62 +76,87 @@ pub async fn copy_text_to_clipboard(text: String) -> Result<bool, String> {
     .map_err(|e| format!("剪贴板任务执行失败: {e}"))?
 }
 
+pub(super) const RELEASES_URL: &str = "https://github.com/WQMYH/multi-compat-cc/releases";
+
 /// 检查更新
 #[tauri::command]
 pub async fn check_for_updates(handle: AppHandle) -> Result<bool, String> {
     handle
         .opener()
-        .open_url(
-            "https://github.com/farion1231/cc-switch/releases/latest",
-            None::<String>,
-        )
+        .open_url(RELEASES_URL, None::<String>)
         .map_err(|e| format!("打开更新页面失败: {e}"))?;
 
     Ok(true)
 }
 
-/// 便携版新版本压缩包的下载地址，命名与 release.yml 的「Prepare Windows Assets」一致：
-/// `CC-Switch-v<版本>-Windows[-arm64]-Portable.zip`。版本号不像版本号时返回 None。
-fn portable_zip_url(version: &str, arm64: bool) -> Option<String> {
-    let version = version.trim().trim_start_matches('v');
-    let looks_like_version = version.starts_with(|c: char| c.is_ascii_digit())
-        && version
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'));
-    if !looks_like_version {
-        return None;
-    }
-    let suffix = if arm64 { "-arm64" } else { "" };
-    Some(format!(
-        "https://github.com/farion1231/cc-switch/releases/download/v{version}/CC-Switch-v{version}-Windows{suffix}-Portable.zip"
-    ))
-}
-
-/// 便携版更新：直接下载对应架构的新版压缩包（解压覆盖即可，数据在 ~/.cc-switch 不受影响）。
-/// 不做原地替换自身 exe：那样很容易被杀毒软件当成病毒拦截。
+/// 外部管理的安装和便携版都打开自有发布页，由其既有安装方式处理更新。
 #[tauri::command]
 pub async fn open_portable_update_download(
     handle: AppHandle,
     version: String,
 ) -> Result<bool, String> {
-    let url = portable_zip_url(&version, cfg!(target_arch = "aarch64"))
-        .unwrap_or_else(|| "https://github.com/farion1231/cc-switch/releases/latest".to_string());
+    // Preserve the argument expected by older frontends; release assets can vary.
+    let _ = version;
     handle
         .opener()
-        .open_url(url, None::<String>)
+        .open_url(RELEASES_URL, None::<String>)
         .map_err(|e| format!("打开更新页面失败: {e}"))?;
 
     Ok(true)
 }
 
-/// 判断是否为便携版（绿色版）运行
+/// Only a directory registered by this fork's MSI is eligible for MSI updates.
+/// Resolve both paths on disk so path aliases and trailing separators work;
+/// an inaccessible directory or marker is treated as externally managed.
+#[cfg(any(target_os = "windows", test))]
+fn registered_msi_directory_matches(exe_dir: &Path, registered_dir: Option<&Path>) -> bool {
+    match std::fs::symlink_metadata(exe_dir.join("portable.ini")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        // A marker of any type, including a dangling symlink, must fail closed.
+        _ => return false,
+    }
+    let Some(registered_dir) = registered_dir else {
+        return false;
+    };
+    match (exe_dir.canonicalize(), registered_dir.canonicalize()) {
+        (Ok(exe_dir), Ok(registered_dir)) => exe_dir == registered_dir,
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub(super) fn is_registered_msi_installation() -> bool {
+    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+
+    let Ok(exe_path) = std::env::current_exe() else {
+        return false;
+    };
+    let Some(exe_dir) = exe_path.parent() else {
+        return false;
+    };
+    let registered_dir = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(r"Software\WQMYH\MultiCompatCC\Installer")
+        .and_then(|key| key.get_value::<String, _>("InstallDir"))
+        .ok()
+        .map(PathBuf::from);
+    registered_msi_directory_matches(exe_dir, registered_dir.as_deref())
+}
+
+/// 未由本项目 MSI 管理的 Windows 运行实例走外部管理/便携更新路径。
 #[tauri::command]
 pub async fn is_portable_mode() -> Result<bool, String> {
-    let exe_path = std::env::current_exe().map_err(|e| format!("获取可执行路径失败: {e}"))?;
-    if let Some(dir) = exe_path.parent() {
-        Ok(dir.join("portable.ini").is_file())
-    } else {
-        Ok(false)
+    #[cfg(target_os = "windows")]
+    {
+        Ok(!is_registered_msi_installation())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let exe_path = std::env::current_exe().map_err(|e| format!("获取可执行路径失败: {e}"))?;
+        if let Some(dir) = exe_path.parent() {
+            Ok(dir.join("portable.ini").is_file())
+        } else {
+            Ok(false)
+        }
     }
 }
 
@@ -7318,18 +7343,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn portable_zip_url_matches_release_asset_names() {
-        assert_eq!(
-            portable_zip_url("4.0.12", false).as_deref(),
-            Some("https://github.com/farion1231/cc-switch/releases/download/v4.0.12/CC-Switch-v4.0.12-Windows-Portable.zip")
-        );
-        assert_eq!(
-            portable_zip_url("v4.1.0-beta.1", true).as_deref(),
-            Some("https://github.com/farion1231/cc-switch/releases/download/v4.1.0-beta.1/CC-Switch-v4.1.0-beta.1-Windows-arm64-Portable.zip")
-        );
-        for bad in ["", "v", "latest", "4.0/../x", "4.0.0?x=1"] {
-            assert!(portable_zip_url(bad, false).is_none(), "{bad}");
+    fn registered_msi_requires_matching_directory_and_no_portable_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let exe_dir = root.path().join("app");
+        let other_dir = root.path().join("other");
+        std::fs::create_dir(&exe_dir).unwrap();
+        std::fs::create_dir(&other_dir).unwrap();
+
+        assert!(!registered_msi_directory_matches(&exe_dir, None));
+        assert!(!registered_msi_directory_matches(
+            &exe_dir,
+            Some(&other_dir)
+        ));
+        assert!(!registered_msi_directory_matches(
+            &exe_dir,
+            Some(&root.path().join("missing"))
+        ));
+        assert!(registered_msi_directory_matches(
+            &exe_dir,
+            Some(&exe_dir.join("."))
+        ));
+        std::fs::write(exe_dir.join("portable.ini"), "").unwrap();
+        assert!(!registered_msi_directory_matches(&exe_dir, Some(&exe_dir)));
+        std::fs::remove_file(exe_dir.join("portable.ini")).unwrap();
+        std::fs::create_dir(exe_dir.join("portable.ini")).unwrap();
+        assert!(!registered_msi_directory_matches(&exe_dir, Some(&exe_dir)));
+        #[cfg(unix)]
+        {
+            std::fs::remove_dir(exe_dir.join("portable.ini")).unwrap();
+            std::os::unix::fs::symlink("missing-target", exe_dir.join("portable.ini")).unwrap();
+            assert!(!registered_msi_directory_matches(&exe_dir, Some(&exe_dir)));
         }
+    }
+
+    #[test]
+    fn external_release_page_is_owned() {
+        assert_eq!(
+            RELEASES_URL,
+            "https://github.com/WQMYH/multi-compat-cc/releases"
+        );
     }
 
     #[test]

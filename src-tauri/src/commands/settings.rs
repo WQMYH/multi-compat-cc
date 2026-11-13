@@ -339,13 +339,75 @@ pub async fn restart_app(app: AppHandle) -> Result<bool, String> {
     Ok(true)
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn require_registered_msi_installation(is_registered: bool) -> Result<(), String> {
+    if is_registered {
+        Ok(())
+    } else {
+        Err(format!(
+            "当前安装由外部管理，请前往发布页获取更新：{}",
+            super::misc::RELEASES_URL
+        ))
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn is_owned_msi_url(url: &url::Url) -> bool {
+    url.scheme() == "https"
+        && url.host_str() == Some("github.com")
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url
+            .path()
+            .starts_with("/WQMYH/multi-compat-cc/releases/download/")
+        && url.path().to_ascii_lowercase().ends_with(".msi")
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn is_msi_payload(bytes: &[u8]) -> bool {
+    // Matches the updater plugin's own MSI dispatch check; never dispatch an
+    // EXE/NSIS payload through the MSI-only update path.
+    bytes.starts_with(&[0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1])
+}
+
+/// The updater's `download` must verify the artifact and minisign global
+/// signature before this function is called. Only then is the trusted comment
+/// authenticated and safe to use for binding the artifact to the version.
+#[cfg(any(target_os = "windows", test))]
+fn require_signed_update_version(signature: &str, expected: &str) -> Result<(), String> {
+    use base64::Engine;
+
+    let invalid = || "更新包签名版本缺失、重复或不匹配，已停止安装".to_string();
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(signature)
+        .map_err(|_| invalid())?;
+    let signature = std::str::from_utf8(&decoded).map_err(|_| invalid())?;
+    let mut lines = signature.lines();
+    let _untrusted_comment = lines.next().ok_or_else(invalid)?;
+    let _artifact_signature = lines.next().ok_or_else(invalid)?;
+    let trusted_comment = lines
+        .next()
+        .and_then(|line| line.strip_prefix("trusted comment: "))
+        .ok_or_else(invalid)?;
+    let _global_signature = lines.next().ok_or_else(invalid)?;
+
+    let mut versions = trusted_comment
+        .split('\t')
+        .filter_map(|field| field.trim_start_matches(' ').strip_prefix("version:"));
+    match (versions.next(), versions.next()) {
+        (Some(version), None) if !version.is_empty() && version == expected => Ok(()),
+        _ => Err(invalid()),
+    }
+}
+
 /// 下载并安装应用更新，然后由后端直接重启应用。
-///
-/// macOS 更新会原地替换 `.app` bundle。如果先返回前端、再让旧 WebView 调
-/// `process.relaunch()`，旧进程可能已经处在 bundle 被替换后的不稳定窗口期。
-/// 这里把退出清理、安装和重启串在同一个后端流程中，避免依赖旧前端继续执行。
+/// macOS 更新会原地替换 `.app` bundle，退出清理和重启都由后端完成。
 #[tauri::command]
 pub async fn install_update_and_restart(app: AppHandle) -> Result<bool, String> {
+    #[cfg(target_os = "windows")]
+    require_registered_msi_installation(super::misc::is_registered_msi_installation())?;
+
     let builder = app.updater_builder();
     // Windows 上 updater 以 `msiexec /passive /promptrestart` 安装 MSI。passive 没有模态框、
     // 未指定重启选项时，安装目录里有文件被占用，Windows Installer 会不经确认直接重启系统
@@ -366,6 +428,11 @@ pub async fn install_update_and_restart(app: AppHandle) -> Result<bool, String> 
         return Ok(false);
     };
 
+    #[cfg(target_os = "windows")]
+    if !is_owned_msi_url(&update.download_url) {
+        return Err("更新包不是本项目发布的 MSI，已停止安装".to_string());
+    }
+
     log::info!("开始下载应用更新: {}", update.version);
     let progress_handle = app.clone();
     let mut downloaded: u64 = 0;
@@ -385,6 +452,21 @@ pub async fn install_update_and_restart(app: AppHandle) -> Result<bool, String> 
         )
         .await
         .map_err(|e| format!("下载更新失败: {e}"))?;
+
+    // download() verifies the artifact and global signature before returning;
+    // only now may the trusted comment bind this artifact to update.version.
+    #[cfg(target_os = "windows")]
+    require_signed_update_version(&update.signature, &update.version)?;
+
+    #[cfg(target_os = "windows")]
+    if !is_msi_payload(&bytes) {
+        return Err("更新包内容不是 MSI，已停止安装".to_string());
+    }
+
+    // Registration or portable.ini may have changed while the download ran.
+    // Recheck before any exit cleanup or installer launch.
+    #[cfg(target_os = "windows")]
+    require_registered_msi_installation(super::misc::is_registered_msi_installation())?;
 
     log::info!("开始安装应用更新: {}", update.version);
 
@@ -486,12 +568,106 @@ pub async fn set_auto_launch(enabled: bool) -> Result<bool, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::merge_settings_for_save;
+    use super::{
+        is_msi_payload, is_owned_msi_url, merge_settings_for_save,
+        require_registered_msi_installation, require_signed_update_version,
+    };
     use crate::settings::{
         AppSettings, CodexOfficialHistoryUnifyMigration, CodexProviderTemplateMigration,
         CodexThirdPartyHistoryProviderBucketMigration, LocalMigrations, S3SyncSettings,
         WebDavSyncSettings,
     };
+
+    // These strings test parsing only; they are deliberately not real signatures.
+    // Production invokes the parser exclusively after the updater verifies one.
+    fn synthetic_signature(trusted_comment: &str) -> String {
+        use base64::Engine;
+
+        let signature = format!(
+            "untrusted comment: synthetic\nsynthetic-artifact-signature\ntrusted comment: {trusted_comment}\nsynthetic-global-signature\n"
+        );
+        base64::engine::general_purpose::STANDARD.encode(signature)
+    }
+
+    #[test]
+    fn signed_update_version_accepts_exactly_one_matching_version() {
+        let signature = synthetic_signature("timestamp:1\tfile:CC Switch.msi\tversion:4.0.32");
+        assert!(require_signed_update_version(&signature, "4.0.32").is_ok());
+
+        let prerelease = synthetic_signature(
+            "timestamp:1\tfile:with version:in-filename.msi\tversion:4.0.32-beta.1+build.2",
+        );
+        assert!(require_signed_update_version(&prerelease, "4.0.32-beta.1+build.2").is_ok());
+    }
+
+    #[test]
+    fn signed_update_version_rejects_missing_duplicate_or_mismatched_versions() {
+        for comment in [
+            "timestamp:1\tfile:CC Switch.msi",
+            "timestamp:1\tfile:CC Switch.msi\tversion:",
+            "timestamp:1\tfile:CC Switch.msi\tversion:4.0.31",
+            "timestamp:1\tfile:CC Switch.msi\tversion:v4.0.32",
+            "timestamp:1\tfile:CC Switch.msi\tversion:4.0.32 ",
+            "timestamp:1\tfile:CC Switch.msi\tversion:4.0.32\tversion:4.0.32",
+            "timestamp:1\tfile:CC Switch.msi\tversion:4.0.32\t version:4.0.31",
+        ] {
+            assert!(
+                require_signed_update_version(&synthetic_signature(comment), "4.0.32").is_err(),
+                "accepted {comment:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_update_version_rejects_malformed_signature_containers() {
+        use base64::Engine;
+
+        let encode = |value: &[u8]| base64::engine::general_purpose::STANDARD.encode(value);
+        for signature in [
+            "not base64!".to_string(),
+            encode(&[0xff, 0xfe]),
+            encode(b"untrusted comment\nartifact\n"),
+            encode(b"untrusted comment\nartifact\nversion:4.0.32\nglobal\n"),
+            encode(b"untrusted comment\nartifact\ntrusted comment: version:4.0.32\n"),
+        ] {
+            assert!(require_signed_update_version(&signature, "4.0.32").is_err());
+        }
+    }
+
+    #[test]
+    fn windows_update_rejects_an_unregistered_installation() {
+        assert!(require_registered_msi_installation(true).is_ok());
+        let error = require_registered_msi_installation(false).unwrap_err();
+        assert!(error.contains("https://github.com/WQMYH/multi-compat-cc/releases"));
+    }
+
+    #[test]
+    fn windows_update_only_accepts_owned_msi_urls() {
+        let good = url::Url::parse(
+            "https://github.com/WQMYH/multi-compat-cc/releases/download/v4.0.32/cc-switch.msi",
+        )
+        .unwrap();
+        assert!(is_owned_msi_url(&good));
+        for bad in [
+            "https://github.com/farion1231/cc-switch/releases/download/v4.0.32/cc-switch.msi",
+            "https://github.com/WQMYH/multi-compat-cc/releases/download/v4.0.32/cc-switch.exe",
+            "https://github.com/WQMYH/multi-compat-cc/releases/download/v4.0.32/cc-switch.msi.zip",
+            "https://example.com/WQMYH/multi-compat-cc/releases/download/v4.0.32/cc-switch.msi",
+            "http://github.com/WQMYH/multi-compat-cc/releases/download/v4.0.32/cc-switch.msi",
+        ] {
+            assert!(!is_owned_msi_url(&url::Url::parse(bad).unwrap()), "{bad}");
+        }
+    }
+
+    #[test]
+    fn windows_update_rejects_exe_zip_and_truncated_payloads() {
+        assert!(is_msi_payload(&[
+            0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1
+        ]));
+        assert!(!is_msi_payload(b"MZinstaller"));
+        assert!(!is_msi_payload(b"PK\x03\x04"));
+        assert!(!is_msi_payload(&[0xd0, 0xcf, 0x11]));
+    }
 
     #[test]
     fn save_settings_should_keep_the_existing_lightweight_mode() {

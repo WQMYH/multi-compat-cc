@@ -26,6 +26,69 @@ struct Targets {
 struct Completion {
     version: u8,
     targets: Targets,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_source: Option<SourceKind>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SourceKind {
+    LocalD,
+    Official,
+    OfficialAux,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MigrationDecision {
+    Migrate,
+    StartFresh,
+    Cancel,
+}
+
+fn ask_migration(source: &SourceRoots, target: &Path) -> io::Result<MigrationDecision> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, IDCANCEL, IDNO, IDYES, MB_DEFBUTTON3, MB_ICONQUESTION, MB_YESNOCANCEL,
+    };
+
+    let message = if source.auxiliary_only {
+        let device = if source.device != source.app {
+            format!("设备资料：{}\n", source.device.display())
+        } else {
+            String::new()
+        };
+        format!(
+            "当前已使用指定目录中的 CC Switch 数据库。\n\n发现旧版辅助资料：\n{}配置目录：{}\n浏览器资料：{}\n\n是否复制这些辅助资料到当前数据目录？\n{}\n\n数据库和原目录不会被删除或覆盖。",
+            device, source.tauri.display(), source.webview.display(), target.display()
+        )
+    } else {
+        format!(
+        "发现旧版 CC Switch 数据。\n应用目录：{}\n设备目录：{}\n配置目录：{}\n浏览器资料：{}\n\n是否复制到当前数据目录？\n{}\n\n原目录不会被删除。选择“否”将跳过此来源，并继续检查其他来源。",
+        source.app.display(),
+        source.device.display(),
+        source.tauri.display(),
+        source.webview.display(),
+        target.display()
+        )
+    };
+    let message: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
+    let title: Vec<u16> = "迁移 CC Switch 数据"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let result = unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            message.as_ptr(),
+            title.as_ptr(),
+            MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON3,
+        )
+    };
+    match result {
+        IDYES => Ok(MigrationDecision::Migrate),
+        IDNO => Ok(MigrationDecision::StartFresh),
+        IDCANCEL => Ok(MigrationDecision::Cancel),
+        _ => Err(io::Error::last_os_error()),
+    }
 }
 
 struct Legacy {
@@ -34,6 +97,7 @@ struct Legacy {
     tauri: PathBuf,
     local_data: PathBuf,
     webview: PathBuf,
+    local_d: Option<Targets>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -63,6 +127,8 @@ pub fn migrate() -> io::Result<()> {
         webview: crate::data_paths::webview_dir(),
         cache: crate::data_paths::cache_dir(),
     };
+    let local_data = dirs::data_local_dir()
+        .ok_or_else(|| invalid("Cannot resolve the legacy local-data directory"))?;
     let legacy = Legacy {
         home: dirs::home_dir()
             .ok_or_else(|| invalid("Cannot resolve the legacy home directory"))?,
@@ -74,23 +140,47 @@ pub fn migrate() -> io::Result<()> {
         tauri: dirs::data_dir()
             .ok_or_else(|| invalid("Cannot resolve the legacy Tauri directory"))?
             .join("com.ccswitch.desktop"),
-        local_data: dirs::data_local_dir()
-            .ok_or_else(|| invalid("Cannot resolve the legacy local-data directory"))?,
-        webview: crate::data_paths::legacy_webview_dir(),
+        webview: local_data.join("com.ccswitch.desktop"),
+        local_data,
+        local_d: Some(Targets {
+            app: PathBuf::from(r"D:\Data\CCSwitch\app"),
+            device: PathBuf::from(r"D:\Data\CCSwitch\device"),
+            tauri: PathBuf::from(r"D:\Data\CCSwitch\tauri"),
+            webview: PathBuf::from(r"D:\Data\CCSwitch\webview2"),
+            cache: PathBuf::from(r"D:\Cache\CCSwitch"),
+        }),
     };
-    migrate_from(
+    migrate_prompted(
         &targets,
         &legacy,
         crate::data_paths::validate_data_dir,
         is_d_path,
+        crate::data_paths::has_explicit_data_dir(),
+        true,
+        ask_migration,
     )
 }
 
+#[cfg(test)]
 fn migrate_from(
     targets: &Targets,
     legacy: &Legacy,
     validate_dir: fn(&Path) -> io::Result<()>,
     on_d: fn(&Path) -> bool,
+) -> io::Result<()> {
+    migrate_prompted(targets, legacy, validate_dir, on_d, false, false, |_, _| {
+        Ok(MigrationDecision::Migrate)
+    })
+}
+
+fn migrate_prompted(
+    targets: &Targets,
+    legacy: &Legacy,
+    validate_dir: fn(&Path) -> io::Result<()>,
+    _on_d: fn(&Path) -> bool,
+    explicit_data_dir: bool,
+    protect_existing_target: bool,
+    mut ask: impl FnMut(&SourceRoots, &Path) -> io::Result<MigrationDecision>,
 ) -> io::Result<()> {
     for (directory, allow_shared_links) in [
         (&targets.app, true),
@@ -103,20 +193,91 @@ fn migrate_from(
         validate_owned_tree(directory, allow_shared_links)?;
     }
     let marker = targets.tauri.join(MARKER_FILE);
+    let mut pending_marker: Option<(Vec<u8>, SourceKind)> = None;
     if let Some(metadata) = metadata_if_present(&marker)? {
         require_plain_file(&marker, &metadata)?;
-        let completion: Completion = serde_json::from_slice(&fs::read(&marker)?)
+        let original = fs::read(&marker)?;
+        let completion: Completion = serde_json::from_slice(&original)
             .map_err(|error| invalid(format!("Invalid migration marker: {error}")))?;
-        if completion.version != 1 || completion.targets != *targets {
+        if completion.version != 1 {
             return Err(invalid(
                 "Migration marker targets do not match this application",
             ));
         }
-        validate_active_app(targets, legacy, validate_dir, on_d)?;
+        if completion.targets != *targets {
+            rebase_portable_marker(&marker, &original, &completion, targets, legacy)?;
+        }
+        if completion.pending_source.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                format!(
+                    "上次数据迁移未完成，旧目录和新目录均已保留。请检查后使用 --data-dir 指定新的空目录并重试。\n当前数据目录：{}",
+                    targets.app.display()
+                ),
+            ));
+        }
+        validate_active_app(targets, legacy, validate_dir, explicit_data_dir)?;
         return Ok(());
     }
 
-    let (mut store, original_store) = read_legacy_store(&legacy.tauri)?;
+    // A chosen target with existing data is already in use. Never merge a
+    // different legacy profile into it or ask to replace it.
+    if pending_marker.is_none() && protect_existing_target && target_has_data(targets)? {
+        let official_root = legacy.home.join(".cc-switch");
+        if targets.app == targets.device && metadata_if_present(&official_root)?.is_some() {
+            let direct_match = same_official_data(&official_root, &targets.app)?;
+            // Explicit data roots must remain usable even when an unrelated old
+            // Store cannot be parsed. Only a proven override links device data.
+            let override_match = if explicit_data_dir {
+                match read_legacy_store(&legacy.tauri) {
+                    Ok((store, _)) => store_override_matches(&store, &legacy.home, &targets.app)?,
+                    Err(error) => {
+                        log::warn!("Cannot inspect optional legacy Store: {error}");
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            if direct_match || override_match {
+                let copy_device = override_match
+                    && fs::canonicalize(&official_root)? != fs::canonicalize(&targets.app)?;
+                return migrate_direct_auxiliary(targets, legacy, None, copy_device, &mut ask);
+            }
+        }
+        return Ok(());
+    }
+
+    let candidates = legacy_candidates(legacy, targets)?;
+    let mut selected = None;
+    for (kind, source) in candidates {
+        match ask(&source, &targets.app)? {
+            MigrationDecision::Migrate => {
+                selected = Some((kind, source));
+                break;
+            }
+            MigrationDecision::StartFresh => continue,
+            MigrationDecision::Cancel => {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "已取消数据迁移"));
+            }
+        }
+    }
+    let (source_kind, shown_source) = match selected {
+        Some(selected) => selected,
+        None => {
+            publish_bytes(&targets.tauri.join(STORE_FILE), b"{}")?;
+            return publish_bytes(&marker, &completion_bytes(targets, None)?);
+        }
+    };
+
+    let source = source_roots(source_kind, legacy)?;
+    if source != shown_source {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "迁移来源在确认后发生变化，未开始复制，请重新选择。",
+        ));
+    }
+    let (mut store, original_store) = read_legacy_store(&source.tauri)?;
     let override_path = match store.get("app_config_dir_override") {
         Some(Value::String(raw)) if !raw.trim().is_empty() => {
             let path = resolve_override(raw.trim(), &legacy.home);
@@ -127,49 +288,70 @@ fn migrate_from(
         Some(_) => return Err(invalid("Legacy app_config_dir_override must be a string")),
     };
 
-    let legacy_device = legacy.home.join(".cc-switch");
     let source_app = match &override_path {
         Some(path) => path.clone(),
-        None => legacy_default_app(&legacy_device, legacy.home_env.as_deref())?,
+        None => source.app.clone(),
     };
+    if source_app != shown_source.app {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "迁移来源在确认后发生变化，未开始复制，请重新选择。",
+        ));
+    }
     if override_path.is_some() {
         reject_target_overlap(&source_app, targets)?;
     }
-    let app_target = if override_path.is_some() && on_d(&fs::canonicalize(&source_app)?) {
-        validate_dir(&source_app)?;
-        validate_owned_tree(&source_app, true)?;
-        source_app.clone()
-    } else {
-        targets.app.clone()
-    };
-    if metadata_if_present(&legacy.webview)?.is_some() {
-        reject_broad_source(&legacy.webview, legacy)?;
+    let app_target = targets.app.clone();
+    if metadata_if_present(&source.webview)?.is_some() {
+        reject_broad_source(&source.webview, legacy)?;
     }
-    let store_bytes = if override_path.is_some() && app_target != source_app {
-        store.insert(
-            "app_config_dir_override".into(),
-            Value::String(path_string(&app_target)?),
-        );
+    let store_bytes = if override_path.is_some() {
+        // The selected root now owns the copied app data. Keeping the old
+        // absolute override would silently switch back to the legacy source.
+        store.remove("app_config_dir_override");
         serde_json::to_vec_pretty(&store).map_err(|error| invalid(error.to_string()))?
     } else {
-        original_store.unwrap_or_else(|| b"{}".to_vec())
+        original_store.clone().unwrap_or_else(|| b"{}".to_vec())
     };
 
     // The legacy default mixed application and device files in one directory.
-    // Preserve its complete layout in both new namespaces rather than guessing
-    // which unknown historical files can be discarded.
-    let trees: [(&Path, &Path, Option<&str>, bool); 4] = [
-        (&source_app, &app_target, None, true),
-        (&legacy_device, &targets.device, None, true),
-        (&legacy.tauri, &targets.tauri, Some(STORE_FILE), false),
-        (&legacy.webview, &targets.webview, None, false),
-    ];
+    // Copy it only once when the new layout also shares that directory.
+    let mut trees: Vec<(&Path, &Path, Option<&str>, bool)> =
+        vec![(&source_app, &app_target, None, true)];
+    let same_source = metadata_if_present(&source_app)?.is_some()
+        && metadata_if_present(&source.device)?.is_some()
+        && fs::canonicalize(&source_app)? == fs::canonicalize(&source.device)?;
+    let same_target = app_target == targets.device;
+    let copy_known_device = !(same_target && same_source) && (same_target || same_source);
+    if !(same_target && same_source) && !copy_known_device {
+        trees.push((&source.device, &targets.device, None, true));
+    }
+    trees.push((&source.tauri, &targets.tauri, Some(STORE_FILE), false));
+    trees.push((&source.webview, &targets.webview, None, false));
+    let mut preflight = trees.clone();
+    if copy_known_device {
+        preflight.push((&source.device, &targets.device, None, true));
+    }
+    preflight_disjoint_sources(&preflight, targets)?;
+    if pending_marker.is_none() {
+        let bytes = completion_bytes(targets, Some(source_kind))?;
+        publish_bytes(&marker, &bytes)?;
+        pending_marker = Some((bytes, source_kind));
+    }
     let snapshots = trees
         .iter()
         .map(|(source, _, skip, allow)| snapshot_source(source, *skip, *allow))
         .collect::<io::Result<Vec<_>>>()?;
-    for (source, target, skip, allow) in trees {
-        copy_tree(source, target, skip, allow)?;
+    let selected_device = if copy_known_device {
+        Some(snapshot_known_device(&source.device)?)
+    } else {
+        None
+    };
+    for (source, target, skip, allow) in &trees {
+        copy_tree(source, target, *skip, *allow)?;
+    }
+    if let Some(snapshot) = &selected_device {
+        copy_known_device_entries(&source.device, &targets.device, snapshot)?;
     }
     publish_bytes(&targets.tauri.join(STORE_FILE), &store_bytes)?;
     for (directory, allow_shared_links) in [
@@ -187,13 +369,187 @@ fn migrate_from(
     for ((source, target, skip, allow), snapshot) in trees.into_iter().zip(snapshots) {
         verify_source(source, target, skip, allow, &snapshot)?;
     }
+    if let Some(snapshot) = &selected_device {
+        verify_known_device(&source.device, &targets.device, snapshot)?;
+    }
+    if read_legacy_store(&source.tauri)?.1 != original_store {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Legacy store changed during migration",
+        ));
+    }
 
-    let completion = serde_json::to_vec_pretty(&Completion {
-        version: 1,
-        targets: targets.clone(),
-    })
-    .map_err(|error| invalid(error.to_string()))?;
-    publish_bytes(&marker, &completion)
+    replace_known_file(
+        &marker,
+        &pending_marker
+            .ok_or_else(|| invalid("Missing migration state"))?
+            .0,
+        &completion_bytes(targets, None)?,
+    )
+}
+
+fn same_official_data(old: &Path, selected: &Path) -> io::Result<bool> {
+    if fs::canonicalize(old)? == fs::canonicalize(selected)? {
+        return Ok(true);
+    }
+    // A copied direct-layout directory is associated only when the old
+    // official DB and its WAL, if present, match byte for byte.
+    for name in ["cc-switch.db", "cc-switch.db-wal"] {
+        let left = old.join(name);
+        let right = selected.join(name);
+        match (metadata_if_present(&left)?, metadata_if_present(&right)?) {
+            (None, None) if name.ends_with("-wal") => {}
+            (Some(left_meta), Some(right_meta)) => {
+                require_plain_file(&left, &left_meta)?;
+                require_plain_file(&right, &right_meta)?;
+                if let Err(error) = require_equal(&left, &right) {
+                    if error.kind() == io::ErrorKind::AlreadyExists {
+                        return Ok(false);
+                    }
+                    return Err(error);
+                }
+            }
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+fn migrate_direct_auxiliary(
+    targets: &Targets,
+    legacy: &Legacy,
+    pending: Option<Vec<u8>>,
+    copy_device: bool,
+    ask: &mut impl FnMut(&SourceRoots, &Path) -> io::Result<MigrationDecision>,
+) -> io::Result<()> {
+    let source = SourceRoots {
+        app: targets.app.clone(),
+        device: if copy_device {
+            legacy.home.join(".cc-switch")
+        } else {
+            targets.device.clone()
+        },
+        tauri: legacy.tauri.clone(),
+        webview: legacy.webview.clone(),
+        auxiliary_only: true,
+    };
+    let trees: [(&Path, &Path, Option<&str>, bool); 2] = [
+        (&source.tauri, &targets.tauri, Some(STORE_FILE), false),
+        (&source.webview, &targets.webview, None, false),
+    ];
+    let device_snapshot = if copy_device {
+        snapshot_known_device(&source.device)?
+    } else {
+        None
+    };
+    if pending.is_none() {
+        let mut found = device_snapshot
+            .as_ref()
+            .is_some_and(|entries| !entries.is_empty());
+        for (old, target, _, _) in trees {
+            if directory_has_entries(old)? && fs::canonicalize(old)? != fs::canonicalize(target)? {
+                found = true;
+            }
+        }
+        if !found {
+            return Ok(());
+        }
+        match ask(&source, &targets.app)? {
+            MigrationDecision::StartFresh => {
+                return publish_bytes(
+                    &targets.tauri.join(MARKER_FILE),
+                    &completion_bytes(targets, None)?,
+                );
+            }
+            MigrationDecision::Cancel => {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "已取消数据迁移"));
+            }
+            MigrationDecision::Migrate => {}
+        }
+    }
+    let mut preflight = trees.to_vec();
+    if copy_device {
+        preflight.push((&source.device, &targets.device, None, true));
+    }
+    preflight_disjoint_sources(&preflight, targets)?;
+    if copy_device {
+        if snapshot_known_device(&source.device)? != device_snapshot {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Device source changed after confirmation",
+            ));
+        }
+        preflight_known_device(&source.device, &targets.device, &device_snapshot)?;
+    }
+    let (mut store, original_store) = read_legacy_store(&source.tauri)?;
+    if copy_device && !store_override_matches(&store, &legacy.home, &targets.app)? {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Legacy Store no longer selects this data directory",
+        ));
+    }
+    let store_bytes = if original_store.is_some() {
+        store.remove("app_config_dir_override");
+        Some(serde_json::to_vec_pretty(&store).map_err(|error| invalid(error.to_string()))?)
+    } else {
+        None
+    };
+    let marker = targets.tauri.join(MARKER_FILE);
+    let original_marker = match pending {
+        Some(bytes) => bytes,
+        None => {
+            let bytes = completion_bytes(targets, Some(SourceKind::OfficialAux))?;
+            publish_bytes(&marker, &bytes)?;
+            bytes
+        }
+    };
+    let snapshots = trees
+        .iter()
+        .map(|(old, _, skip, allow)| snapshot_source(old, *skip, *allow))
+        .collect::<io::Result<Vec<_>>>()?;
+    for (old, target, skip, allow) in trees {
+        copy_tree(old, target, skip, allow)?;
+    }
+    if copy_device {
+        copy_known_device_entries(&source.device, &targets.device, &device_snapshot)?;
+    }
+    if let Some(bytes) = store_bytes {
+        publish_bytes(&targets.tauri.join(STORE_FILE), &bytes)?;
+    }
+    if read_legacy_store(&source.tauri)?.1 != original_store {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Legacy store changed during migration",
+        ));
+    }
+    for ((old, target, skip, allow), snapshot) in trees.into_iter().zip(snapshots) {
+        verify_source(old, target, skip, allow, &snapshot)?;
+    }
+    if copy_device {
+        verify_known_device(&source.device, &targets.device, &device_snapshot)?;
+    }
+    replace_known_file(&marker, &original_marker, &completion_bytes(targets, None)?)
+}
+
+fn store_override_matches(
+    store: &Map<String, Value>,
+    home: &Path,
+    target: &Path,
+) -> io::Result<bool> {
+    let Some(Value::String(raw)) = store.get("app_config_dir_override") else {
+        return Ok(false);
+    };
+    if raw.trim().is_empty() {
+        return Ok(false);
+    }
+    let target = fs::canonicalize(target)?;
+    match fs::canonicalize(resolve_override(raw.trim(), home)) {
+        Ok(source) => Ok(source == target),
+        Err(error) => {
+            log::warn!("Cannot resolve optional legacy override: {error}");
+            Ok(false)
+        }
+    }
 }
 
 fn read_legacy_store(directory: &Path) -> io::Result<(Map<String, Value>, Option<Vec<u8>>)> {
@@ -215,14 +571,304 @@ fn read_legacy_store(directory: &Path) -> io::Result<(Map<String, Value>, Option
     Ok((store, Some(bytes)))
 }
 
+fn completion_bytes(targets: &Targets, pending_source: Option<SourceKind>) -> io::Result<Vec<u8>> {
+    serde_json::to_vec_pretty(&Completion {
+        version: 1,
+        targets: targets.clone(),
+        pending_source,
+    })
+    .map_err(|error| invalid(error.to_string()))
+}
+
+fn replace_known_file(path: &Path, expected: &[u8], replacement: &[u8]) -> io::Result<()> {
+    require_plain_file(path, &fs::symlink_metadata(path)?)?;
+    if fs::read(path)? != expected {
+        return Err(conflict(path));
+    }
+    crate::config::atomic_write_private(path, replacement)
+        .map_err(|error| io::Error::other(error.to_string()))
+}
+
+fn directory_has_entries(path: &Path) -> io::Result<bool> {
+    let Some(_) = metadata_if_present(path)? else {
+        return Ok(false);
+    };
+    require_source_directory(path)?;
+    Ok(fs::read_dir(path)?.next().transpose()?.is_some())
+}
+
+fn target_has_data(targets: &Targets) -> io::Result<bool> {
+    if targets.app == targets.device {
+        for entry in fs::read_dir(&targets.app)? {
+            let path = entry?.path();
+            if path == targets.tauri || path == targets.webview || path == targets.cache {
+                continue;
+            }
+            return Ok(true);
+        }
+        return Ok(
+            directory_has_entries(&targets.tauri)? || directory_has_entries(&targets.webview)?
+        );
+    }
+    for path in [
+        &targets.app,
+        &targets.device,
+        &targets.tauri,
+        &targets.webview,
+    ] {
+        if directory_has_entries(path)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SourceRoots {
+    app: PathBuf,
+    device: PathBuf,
+    tauri: PathBuf,
+    webview: PathBuf,
+    auxiliary_only: bool,
+}
+
+fn source_roots(kind: SourceKind, legacy: &Legacy) -> io::Result<SourceRoots> {
+    let mut source = match kind {
+        SourceKind::LocalD => {
+            let local = legacy
+                .local_d
+                .as_ref()
+                .ok_or_else(|| invalid("Missing old D source"))?;
+            SourceRoots {
+                app: local.app.clone(),
+                device: local.device.clone(),
+                tauri: local.tauri.clone(),
+                webview: local.webview.clone(),
+                auxiliary_only: false,
+            }
+        }
+        SourceKind::Official => {
+            let device = legacy.home.join(".cc-switch");
+            SourceRoots {
+                app: legacy_default_app(&device, legacy.home_env.as_deref())?,
+                device,
+                tauri: legacy.tauri.clone(),
+                webview: legacy.webview.clone(),
+                auxiliary_only: false,
+            }
+        }
+        SourceKind::OfficialAux => {
+            return Err(invalid("Auxiliary source requires direct-root migration"))
+        }
+    };
+    let (store, _) = read_legacy_store(&source.tauri)?;
+    match store.get("app_config_dir_override") {
+        Some(Value::String(raw)) if !raw.trim().is_empty() => {
+            let path = resolve_override(raw.trim(), &legacy.home);
+            reject_broad_source(&path, legacy)?;
+            source.app = path;
+        }
+        None | Some(Value::String(_)) => {}
+        Some(_) => return Err(invalid("Legacy app_config_dir_override must be a string")),
+    }
+    Ok(source)
+}
+
+fn legacy_candidates(
+    legacy: &Legacy,
+    targets: &Targets,
+) -> io::Result<Vec<(SourceKind, SourceRoots)>> {
+    let mut candidates = Vec::new();
+    for kind in [SourceKind::LocalD, SourceKind::Official] {
+        if kind == SourceKind::LocalD {
+            let Some(local) = &legacy.local_d else {
+                continue;
+            };
+            let root = local
+                .app
+                .parent()
+                .ok_or_else(|| invalid("Missing old D source root"))?;
+            match fs::symlink_metadata(root) {
+                Ok(metadata) => {
+                    reject_link(root, &metadata)?;
+                    require_source_directory(root)?;
+                }
+                Err(error) if optional_local_missing(&error) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        let discover = || -> io::Result<Option<SourceRoots>> {
+            let source = source_roots(kind, legacy)?;
+            let found = {
+                let mut found = false;
+                for (old, target) in [
+                    (&source.app, &targets.app),
+                    (&source.device, &targets.device),
+                    (&source.tauri, &targets.tauri),
+                    (&source.webview, &targets.webview),
+                ] {
+                    if directory_has_entries(old)?
+                        && fs::canonicalize(old)? != fs::canonicalize(target)?
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+                found
+            };
+            Ok(found.then_some(source))
+        };
+        match discover() {
+            Ok(Some(source)) => candidates.push((kind, source)),
+            Ok(None) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(candidates)
+}
+
+fn optional_local_missing(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || matches!(error.raw_os_error(), Some(15) | Some(21))
+}
+
+fn preflight_disjoint_sources(
+    trees: &[(&Path, &Path, Option<&str>, bool)],
+    targets: &Targets,
+) -> io::Result<()> {
+    for (source, selected_target, _, _) in trees {
+        if metadata_if_present(source)?.is_none() {
+            continue;
+        }
+        require_source_directory(source)?;
+        let source_real = fs::canonicalize(source)?;
+        for target in [
+            &targets.app,
+            &targets.device,
+            &targets.tauri,
+            &targets.webview,
+            &targets.cache,
+        ] {
+            let target_real = fs::canonicalize(target)?;
+            if source_real == target_real && *selected_target == target.as_path() {
+                continue;
+            }
+            if source_real.starts_with(&target_real) || target_real.starts_with(&source_real) {
+                return Err(invalid(
+                    "Migration source overlaps the selected data directories",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+// Only recognize the portable default layout: <exe>/data/{app,device,tauri,
+// webview2} and <exe>/cache. A split or externally configured layout cannot
+// be inferred safely from a moved marker.
+fn portable_base(targets: &Targets) -> Option<&Path> {
+    let direct = targets.app == targets.device;
+    let data = if direct {
+        targets.app.as_path()
+    } else {
+        targets.app.parent()?
+    };
+    let base = data.parent()?;
+    if data.file_name()? != "data"
+        || (!direct && targets.app != data.join("app"))
+        || (!direct && targets.device != data.join("device"))
+        || targets.tauri != data.join("tauri")
+        || targets.webview != data.join("webview2")
+        || targets.cache != base.join("cache")
+    {
+        return None;
+    }
+    Some(base)
+}
+
+fn rebase_portable_marker(
+    marker: &Path,
+    original: &[u8],
+    completion: &Completion,
+    targets: &Targets,
+    legacy: &Legacy,
+) -> io::Result<()> {
+    if completion.pending_source.is_none()
+        && completion.targets.app == targets.app
+        && completion.targets.device == targets.device
+        && completion.targets.tauri == targets.tauri
+        && completion.targets.webview == targets.webview
+    {
+        return replace_known_file(marker, original, &completion_bytes(targets, None)?);
+    }
+    if completion.pending_source.is_some()
+        || portable_base(&completion.targets).is_none()
+        || portable_base(targets).is_none()
+    {
+        return Err(invalid(
+            "Migration marker targets do not match this application",
+        ));
+    }
+    // A completed, moved profile must still contain recognizable application
+    // state; a copied marker alone is not evidence that data was moved.
+    let has_state = [
+        &targets.app.join("cc-switch.db"),
+        &targets.app.join("config.json"),
+        &targets.device.join("settings.json"),
+    ]
+    .into_iter()
+    .try_fold(false, |found, path| {
+        Ok::<_, io::Error>(found || metadata_if_present(path)?.is_some())
+    })?;
+    if !has_state {
+        return Err(invalid("Moved CC Switch data is incomplete"));
+    }
+    for (source, target) in [
+        (&completion.targets.app, &targets.app),
+        (&completion.targets.device, &targets.device),
+    ] {
+        if let Some(snapshot) = snapshot_source(source, None, true)? {
+            verify_source(source, target, None, true, &Some(snapshot))?;
+        }
+    }
+    let (mut store, store_bytes) = read_legacy_store(&targets.tauri)?;
+    let Some(store_bytes) = store_bytes else {
+        if targets.app == targets.device {
+            return replace_known_file(marker, original, &completion_bytes(targets, None)?);
+        }
+        return Err(invalid("Completed migration is missing app_paths.json"));
+    };
+    match store.get("app_config_dir_override") {
+        Some(Value::String(raw)) if !raw.trim().is_empty() => {
+            if resolve_override(raw.trim(), &legacy.home) != completion.targets.app {
+                return Err(invalid(
+                    "Moved profile has an external application directory override",
+                ));
+            }
+            store.remove("app_config_dir_override");
+            let updated =
+                serde_json::to_vec_pretty(&store).map_err(|error| invalid(error.to_string()))?;
+            replace_known_file(&targets.tauri.join(STORE_FILE), &store_bytes, &updated)?;
+        }
+        None | Some(Value::String(_)) => {}
+        Some(_) => return Err(invalid("app_config_dir_override must be a string")),
+    }
+    replace_known_file(marker, original, &completion_bytes(targets, None)?)
+}
+
 fn validate_active_app(
     targets: &Targets,
     legacy: &Legacy,
     validate_dir: fn(&Path) -> io::Result<()>,
-    on_d: fn(&Path) -> bool,
+    explicit_data_dir: bool,
 ) -> io::Result<()> {
+    if explicit_data_dir {
+        return Ok(());
+    }
     let (store, bytes) = read_legacy_store(&targets.tauri)?;
     if bytes.is_none() {
+        if targets.app == targets.device {
+            return Ok(());
+        }
         return Err(invalid("Completed migration is missing app_paths.json"));
     }
     match store.get("app_config_dir_override") {
@@ -230,16 +876,34 @@ fn validate_active_app(
         Some(Value::String(raw)) if raw.trim().is_empty() => Ok(()),
         Some(Value::String(raw)) => {
             let path = resolve_override(raw.trim(), &legacy.home);
-            if !on_d(&path) {
-                return Err(invalid("The active application directory must be on D"));
-            }
             reject_broad_source(&path, legacy)?;
-            reject_target_overlap(&path, targets)?;
-            validate_dir(&path)?;
-            validate_owned_tree(&path, true)
+            validate_app_override(&path, targets, validate_dir)
         }
         Some(_) => Err(invalid("app_config_dir_override must be a string")),
     }
+}
+
+fn validate_app_override(
+    path: &Path,
+    targets: &Targets,
+    validate_dir: fn(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    validate_dir(path)?;
+    if fs::canonicalize(path)? != fs::canonicalize(&targets.app)? {
+        reject_target_overlap(path, targets)?;
+    }
+    validate_owned_tree(path, true)
+}
+
+pub(crate) fn validate_app_override_for_current_targets(path: &Path) -> io::Result<()> {
+    let targets = Targets {
+        app: crate::data_paths::app_dir(),
+        device: crate::data_paths::device_dir(),
+        tauri: crate::data_paths::tauri_dir(),
+        webview: crate::data_paths::webview_dir(),
+        cache: crate::data_paths::cache_dir(),
+    };
+    validate_app_override(path, &targets, crate::data_paths::validate_data_dir)
 }
 
 fn resolve_override(raw: &str, home: &Path) -> PathBuf {
@@ -263,6 +927,136 @@ fn legacy_default_app(default: &Path, home_env: Option<&Path>) -> io::Result<Pat
     Ok(default.to_path_buf())
 }
 
+fn snapshot_known_device(source: &Path) -> io::Result<SourceSnapshot> {
+    if metadata_if_present(source)?.is_none() {
+        return Ok(None);
+    }
+    require_source_directory(source)?;
+    let mut entries = BTreeMap::new();
+    for name in [
+        "settings.json",
+        "live-state.json",
+        "codex-login-stash.json",
+        "codex-catalog-history.json",
+        "codex-login-history.json",
+        "codex-client-ack.json",
+        "codex-official-models.json",
+    ] {
+        snapshot_known_entry(source, Path::new(name), &mut entries)?;
+    }
+    let backups = source.join("backups");
+    if metadata_if_present(&backups)?.is_some() {
+        require_source_directory(&backups)?;
+        let before = entries.len();
+        for name in ["live-first-write", "proxy-live-backup"] {
+            snapshot_known_entry(source, &Path::new("backups").join(name), &mut entries)?;
+        }
+        for entry in fs::read_dir(&backups)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name
+                .to_str()
+                .is_some_and(|value| value.starts_with("env-backup-") && value.ends_with(".json"))
+            {
+                snapshot_known_entry(source, &Path::new("backups").join(name), &mut entries)?;
+            }
+        }
+        if entries.len() != before {
+            entries.insert(PathBuf::from("backups"), SourceEntry::Directory);
+        }
+    }
+    Ok(Some(entries))
+}
+
+fn snapshot_known_entry(
+    root: &Path,
+    relative: &Path,
+    entries: &mut BTreeMap<PathBuf, SourceEntry>,
+) -> io::Result<()> {
+    let path = root.join(relative);
+    let Some(metadata) = metadata_if_present(&path)? else {
+        return Ok(());
+    };
+    reject_link(&path, &metadata)?;
+    if metadata.is_dir() {
+        entries.insert(relative.to_path_buf(), SourceEntry::Directory);
+        snapshot_contents(&path, root, None, false, entries)?;
+    } else {
+        require_plain_file(&path, &metadata)?;
+        entries.insert(
+            relative.to_path_buf(),
+            SourceEntry::File {
+                length: metadata.len(),
+                modified: metadata.modified()?,
+                readonly: metadata.permissions().readonly(),
+            },
+        );
+    }
+    Ok(())
+}
+
+fn copy_known_device_entries(
+    source: &Path,
+    target: &Path,
+    snapshot: &SourceSnapshot,
+) -> io::Result<()> {
+    if let Some(entries) = snapshot {
+        for (relative, entry) in entries {
+            let destination = target.join(relative);
+            match entry {
+                SourceEntry::Directory => ensure_directory(&destination)?,
+                SourceEntry::File { .. } => copy_file(&source.join(relative), &destination)?,
+                SourceEntry::SharedLink(_) => return Err(invalid("Unexpected device link")),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn preflight_known_device(
+    source: &Path,
+    target: &Path,
+    snapshot: &SourceSnapshot,
+) -> io::Result<()> {
+    if let Some(entries) = snapshot {
+        for (relative, entry) in entries {
+            let destination = target.join(relative);
+            let Some(metadata) = metadata_if_present(&destination)? else {
+                continue;
+            };
+            match entry {
+                SourceEntry::Directory => require_plain_directory(&destination)?,
+                SourceEntry::File { .. } => {
+                    require_plain_file(&destination, &metadata)?;
+                    require_equal(&source.join(relative), &destination)?;
+                }
+                SourceEntry::SharedLink(_) => return Err(invalid("Unexpected device link")),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_known_device(source: &Path, target: &Path, before: &SourceSnapshot) -> io::Result<()> {
+    if &snapshot_known_device(source)? != before {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Device source changed during migration",
+        ));
+    }
+    if let Some(entries) = before {
+        for (relative, entry) in entries {
+            let destination = target.join(relative);
+            match entry {
+                SourceEntry::Directory => require_plain_directory(&destination)?,
+                SourceEntry::File { .. } => require_equal(&source.join(relative), &destination)?,
+                SourceEntry::SharedLink(_) => return Err(invalid("Unexpected device link")),
+            }
+        }
+    }
+    Ok(())
+}
+
 fn snapshot_source(source: &Path, skip: Option<&str>, allow: bool) -> io::Result<SourceSnapshot> {
     if metadata_if_present(source)?.is_none() {
         return Ok(None);
@@ -271,6 +1065,10 @@ fn snapshot_source(source: &Path, skip: Option<&str>, allow: bool) -> io::Result
     let mut entries = BTreeMap::new();
     snapshot_contents(source, source, skip, allow, &mut entries)?;
     Ok(Some(entries))
+}
+
+fn skip_root_entry(name: &std::ffi::OsStr, skip: Option<&str>) -> bool {
+    skip.is_some_and(|value| name == value) || (skip == Some(STORE_FILE) && name == MARKER_FILE)
 }
 
 fn snapshot_contents(
@@ -282,7 +1080,7 @@ fn snapshot_contents(
 ) -> io::Result<()> {
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
-        if skip.is_some_and(|name| entry.file_name() == name) {
+        if skip_root_entry(&entry.file_name(), skip) {
             continue;
         }
         let path = entry.path();
@@ -387,7 +1185,7 @@ fn copy_contents(
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let source_path = entry.path();
-        if skip_root_file.is_some_and(|name| entry.file_name() == name) {
+        if skip_root_entry(&entry.file_name(), skip_root_file) {
             continue;
         }
         let metadata = fs::symlink_metadata(&source_path)?;
@@ -731,12 +1529,6 @@ fn parent(path: &Path) -> io::Result<&Path> {
         .ok_or_else(|| invalid("Migration target has no parent"))
 }
 
-fn path_string(path: &Path) -> io::Result<String> {
-    path.to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| invalid("Migration target cannot be represented in app_paths.json"))
-}
-
 fn is_d_path(path: &Path) -> bool {
     #[cfg(windows)]
     {
@@ -794,6 +1586,7 @@ mod tests {
                 tauri: root.path().join("old/tauri"),
                 local_data: root.path().join("old/local"),
                 webview: root.path().join("old/webview"),
+                local_d: None,
             };
             Self {
                 _root: root,
@@ -815,6 +1608,12 @@ mod tests {
             self.targets.tauri.join(MARKER_FILE)
         }
 
+        fn assert_pending(&self) {
+            let marker: Completion =
+                serde_json::from_slice(&fs::read(self.marker()).unwrap()).unwrap();
+            assert!(marker.pending_source.is_some());
+        }
+
         fn store(&self, value: Value) {
             write(
                 self.legacy.tauri.join(STORE_FILE),
@@ -831,10 +1630,806 @@ mod tests {
         fs::create_dir_all(path)
     }
 
+    fn prompted(
+        fixture: &Fixture,
+        ask: impl FnMut(&SourceRoots, &Path) -> io::Result<MigrationDecision>,
+    ) -> io::Result<()> {
+        migrate_prompted(
+            &fixture.targets,
+            &fixture.legacy,
+            prepare_fixture_dir,
+            fixture_on_d,
+            false,
+            true,
+            ask,
+        )
+    }
+
+    #[test]
+    fn app_override_rejects_other_roots_children_and_common_parent() {
+        let fixture = Fixture::new();
+        for path in [
+            &fixture.targets.app,
+            &fixture.targets.device,
+            &fixture.targets.tauri,
+            &fixture.targets.webview,
+            &fixture.targets.cache,
+        ] {
+            fs::create_dir_all(path.join("child")).unwrap();
+        }
+        let separate = fixture._root.path().join("separate");
+        fs::create_dir_all(&separate).unwrap();
+        assert!(
+            validate_app_override(&fixture.targets.app, &fixture.targets, prepare_fixture_dir)
+                .is_ok()
+        );
+        assert!(validate_app_override(&separate, &fixture.targets, prepare_fixture_dir).is_ok());
+        assert!(validate_app_override(
+            fixture.targets.app.parent().unwrap(),
+            &fixture.targets,
+            prepare_fixture_dir
+        )
+        .is_err());
+        for root in [
+            &fixture.targets.device,
+            &fixture.targets.tauri,
+            &fixture.targets.webview,
+            &fixture.targets.cache,
+        ] {
+            assert!(validate_app_override(root, &fixture.targets, prepare_fixture_dir).is_err());
+            assert!(validate_app_override(
+                &root.join("child"),
+                &fixture.targets,
+                prepare_fixture_dir
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn direct_root_override_uses_same_validation_for_save_and_restart() {
+        let mut fixture = Fixture::new();
+        let root = fixture._root.path().join("direct/data");
+        fixture.targets = Targets {
+            app: root.clone(),
+            device: root.clone(),
+            tauri: root.join("tauri"),
+            webview: root.join("webview2"),
+            cache: root.join("cache"),
+        };
+        for path in [
+            &fixture.targets.app,
+            &fixture.targets.tauri,
+            &fixture.targets.webview,
+            &fixture.targets.cache,
+        ] {
+            fs::create_dir_all(path).unwrap();
+        }
+        assert!(validate_app_override(&root, &fixture.targets, prepare_fixture_dir).is_ok());
+        let store = serde_json::json!({"app_config_dir_override":root.to_str().unwrap()});
+        write(
+            fixture.targets.tauri.join(STORE_FILE),
+            serde_json::to_vec(&store).unwrap(),
+        );
+        assert!(validate_active_app(
+            &fixture.targets,
+            &fixture.legacy,
+            prepare_fixture_dir,
+            false
+        )
+        .is_ok());
+        assert!(validate_app_override(
+            &fixture.targets.tauri,
+            &fixture.targets,
+            prepare_fixture_dir
+        )
+        .is_err());
+    }
+
+    fn portable_targets(base: &Path) -> Targets {
+        Targets {
+            app: base.join("data/app"),
+            device: base.join("data/device"),
+            tauri: base.join("data/tauri"),
+            webview: base.join("data/webview2"),
+            cache: base.join("cache"),
+        }
+    }
+
     fn write(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) {
         let path = path.as_ref();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn prompt_yes_copies_old_data_and_keeps_the_source() {
+        let fixture = Fixture::new();
+        let old = fixture.legacy.home.join(".cc-switch/cc-switch.db");
+        write(&old, b"old database");
+        let mut asked = 0;
+        prompted(&fixture, |_, _| {
+            asked += 1;
+            Ok(MigrationDecision::Migrate)
+        })
+        .unwrap();
+        assert_eq!(asked, 1);
+        assert_eq!(fs::read(&old).unwrap(), b"old database");
+        assert_eq!(
+            fs::read(fixture.targets.app.join("cc-switch.db")).unwrap(),
+            b"old database"
+        );
+        assert!(fixture.marker().is_file());
+    }
+
+    #[test]
+    fn prompt_displays_resolved_legacy_override_and_related_directories() {
+        let fixture = Fixture::new();
+        let custom = fixture.legacy.home.join("chosen-old-data");
+        write(custom.join("cc-switch.db"), b"old");
+        fixture.store(serde_json::json!({"app_config_dir_override":"~/chosen-old-data"}));
+        prompted(&fixture, |source, target| {
+            assert_eq!(source.app, custom);
+            assert_eq!(source.device, fixture.legacy.home.join(".cc-switch"));
+            assert_eq!(source.tauri, fixture.legacy.tauri);
+            assert_eq!(source.webview, fixture.legacy.webview);
+            assert_eq!(target, fixture.targets.app.as_path());
+            Ok(MigrationDecision::StartFresh)
+        })
+        .unwrap();
+        assert_eq!(fs::read(custom.join("cc-switch.db")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn prompt_no_records_choice_and_cancel_does_not_publish() {
+        let fixture = Fixture::new();
+        let old = fixture.legacy.home.join(".cc-switch/cc-switch.db");
+        write(&old, b"old database");
+        let err = prompted(&fixture, |_, _| Ok(MigrationDecision::Cancel)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        assert!(!fixture.marker().exists());
+        assert!(!fixture.targets.app.join("cc-switch.db").exists());
+        prompted(&fixture, |_, _| Ok(MigrationDecision::StartFresh)).unwrap();
+        prompted(&fixture, |_, _| {
+            panic!("declined source must not prompt again")
+        })
+        .unwrap();
+        assert!(!fixture.targets.app.join("cc-switch.db").exists());
+        assert_eq!(fs::read(old).unwrap(), b"old database");
+    }
+
+    #[test]
+    fn no_legacy_or_existing_target_never_prompts_or_overwrites() {
+        let fresh = Fixture::new();
+        prompted(&fresh, |_, _| panic!("no source")).unwrap();
+        let existing = Fixture::new();
+        write(existing.targets.app.join("cc-switch.db"), b"current");
+        write(existing.legacy.home.join(".cc-switch/cc-switch.db"), b"old");
+        prompted(&existing, |_, _| panic!("target already has data")).unwrap();
+        assert_eq!(
+            fs::read(existing.targets.app.join("cc-switch.db")).unwrap(),
+            b"current"
+        );
+    }
+
+    #[test]
+    fn direct_root_initial_scaffolding_is_empty_but_existing_webview_is_not() {
+        let mut fixture = Fixture::new();
+        let root = fixture._root.path().join("new/data");
+        fixture.targets = Targets {
+            app: root.clone(),
+            device: root.clone(),
+            tauri: root.join("tauri"),
+            webview: root.join("webview2"),
+            cache: root.join("cache"),
+        };
+        for path in [
+            &fixture.targets.app,
+            &fixture.targets.tauri,
+            &fixture.targets.webview,
+            &fixture.targets.cache,
+        ] {
+            fs::create_dir_all(path).unwrap();
+        }
+        write(fixture.legacy.home.join(".cc-switch/cc-switch.db"), b"old");
+        let mut asked = 0;
+        prompted(&fixture, |_, _| {
+            asked += 1;
+            Ok(MigrationDecision::Migrate)
+        })
+        .unwrap();
+        assert_eq!(asked, 1);
+        assert_eq!(fs::read(root.join("cc-switch.db")).unwrap(), b"old");
+
+        let mut occupied = Fixture::new();
+        let root = occupied._root.path().join("new/data");
+        occupied.targets = Targets {
+            app: root.clone(),
+            device: root.clone(),
+            tauri: root.join("tauri"),
+            webview: root.join("webview2"),
+            cache: root.join("cache"),
+        };
+        for path in [
+            &occupied.targets.app,
+            &occupied.targets.tauri,
+            &occupied.targets.webview,
+            &occupied.targets.cache,
+        ] {
+            fs::create_dir_all(path).unwrap();
+        }
+        write(occupied.targets.webview.join("profile"), b"existing");
+        write(occupied.legacy.home.join(".cc-switch/cc-switch.db"), b"old");
+        prompted(&occupied, |_, _| panic!("existing profile")).unwrap();
+        assert_eq!(
+            fs::read(occupied.targets.webview.join("profile")).unwrap(),
+            b"existing"
+        );
+        assert!(!root.join("cc-switch.db").exists());
+    }
+
+    #[test]
+    fn local_source_errors_skip_only_confirmed_missing_paths() {
+        assert!(optional_local_missing(&io::Error::new(
+            io::ErrorKind::NotFound,
+            "missing"
+        )));
+        assert!(!optional_local_missing(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "denied"
+        )));
+        assert!(!optional_local_missing(&io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad"
+        )));
+        let mut fixture = Fixture::new();
+        let local = portable_targets(&fixture._root.path().join("bad-local"));
+        write(&local.tauri, b"not a directory");
+        fixture.legacy.local_d = Some(local);
+        assert!(prompted(&fixture, |_, _| panic!("invalid source")).is_err());
+        assert!(!fixture.marker().exists());
+    }
+
+    #[test]
+    fn existing_local_root_with_missing_override_is_not_skipped() {
+        let mut fixture = Fixture::new();
+        let local = portable_targets(&fixture._root.path().join("old-d"));
+        let store_path = local.tauri.join(STORE_FILE);
+        let store = br#"{"app_config_dir_override":"~/missing-old-app"}"#;
+        write(&store_path, store);
+        fixture.legacy.local_d = Some(local);
+        assert_eq!(
+            prompted(&fixture, |_, _| panic!("invalid source must not prompt"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(!fixture.marker().exists());
+        assert_eq!(fs::read(store_path).unwrap(), store);
+    }
+
+    #[test]
+    fn explicit_direct_old_root_is_reused_without_copy_or_prompt() {
+        let mut fixture = Fixture::new();
+        let old = fixture.legacy.home.join(".cc-switch");
+        write(old.join("cc-switch.db"), b"existing");
+        fixture.targets = Targets {
+            app: old.clone(),
+            device: old.clone(),
+            tauri: old.join("tauri"),
+            webview: old.join("webview2"),
+            cache: old.join("cache"),
+        };
+        migrate_prompted(
+            &fixture.targets,
+            &fixture.legacy,
+            prepare_fixture_dir,
+            fixture_on_d,
+            true,
+            true,
+            |_, _| panic!("already in use"),
+        )
+        .unwrap();
+        assert_eq!(fs::read(old.join("cc-switch.db")).unwrap(), b"existing");
+        assert!(!fixture.marker().exists());
+    }
+
+    #[test]
+    fn direct_root_offers_official_auxiliary_without_touching_database() {
+        for decision in [MigrationDecision::Migrate, MigrationDecision::StartFresh] {
+            let mut fixture = Fixture::new();
+            let old = fixture.legacy.home.join(".cc-switch");
+            write(old.join("cc-switch.db"), b"existing");
+            fixture.targets = Targets {
+                app: old.clone(),
+                device: old.clone(),
+                tauri: old.join("tauri"),
+                webview: old.join("webview2"),
+                cache: old.join("cache"),
+            };
+            fixture
+                .store(serde_json::json!({"app_config_dir_override":"~/elsewhere", "other":true}));
+            write(fixture.legacy.webview.join("profile"), b"browser");
+            let mut asked = 0;
+            migrate_prompted(
+                &fixture.targets,
+                &fixture.legacy,
+                prepare_fixture_dir,
+                fixture_on_d,
+                true,
+                true,
+                |source, _| {
+                    asked += 1;
+                    assert!(source.auxiliary_only);
+                    assert_eq!(source.tauri, fixture.legacy.tauri);
+                    assert_eq!(source.webview, fixture.legacy.webview);
+                    Ok(decision)
+                },
+            )
+            .unwrap();
+            assert_eq!(asked, 1);
+            assert_eq!(fs::read(old.join("cc-switch.db")).unwrap(), b"existing");
+            assert_eq!(
+                fs::read(fixture.legacy.webview.join("profile")).unwrap(),
+                b"browser"
+            );
+            if decision == MigrationDecision::Migrate {
+                assert_eq!(
+                    fs::read(fixture.targets.webview.join("profile")).unwrap(),
+                    b"browser"
+                );
+                let store: Value = serde_json::from_slice(
+                    &fs::read(fixture.targets.tauri.join(STORE_FILE)).unwrap(),
+                )
+                .unwrap();
+                assert!(store.get("app_config_dir_override").is_none());
+                assert_eq!(store["other"], true);
+            } else {
+                assert!(!fixture.targets.webview.join("profile").exists());
+            }
+            migrate_prompted(
+                &fixture.targets,
+                &fixture.legacy,
+                prepare_fixture_dir,
+                fixture_on_d,
+                true,
+                true,
+                |_, _| panic!("already decided"),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn copied_direct_db_offers_auxiliary_only_for_matching_official_source() {
+        let mut fixture = Fixture::new();
+        let root = fixture._root.path().join("new/data");
+        fixture.targets = Targets {
+            app: root.clone(),
+            device: root.clone(),
+            tauri: root.join("tauri"),
+            webview: root.join("webview2"),
+            cache: root.join("cache"),
+        };
+        write(root.join("cc-switch.db"), b"same");
+        write(fixture.legacy.home.join(".cc-switch/cc-switch.db"), b"same");
+        write(fixture.legacy.webview.join("profile"), b"browser");
+        let mut asked = false;
+        migrate_prompted(
+            &fixture.targets,
+            &fixture.legacy,
+            prepare_fixture_dir,
+            fixture_on_d,
+            false,
+            true,
+            |source, _| {
+                asked = true;
+                assert!(source.auxiliary_only);
+                Ok(MigrationDecision::StartFresh)
+            },
+        )
+        .unwrap();
+        assert!(asked);
+        migrate_prompted(
+            &fixture.targets,
+            &fixture.legacy,
+            prepare_fixture_dir,
+            fixture_on_d,
+            false,
+            true,
+            |_, _| panic!("already declined"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn in_place_custom_override_offers_known_device_and_auxiliary_data() {
+        for decision in [MigrationDecision::Migrate, MigrationDecision::StartFresh] {
+            let mut fixture = Fixture::new();
+            let custom = fixture.legacy.home.join("custom");
+            let device = fixture.legacy.home.join(".cc-switch");
+            fixture.targets = Targets {
+                app: custom.clone(),
+                device: custom.clone(),
+                tauri: custom.join("tauri"),
+                webview: custom.join("webview2"),
+                cache: custom.join("cache"),
+            };
+            write(custom.join("cc-switch.db"), b"current database");
+            write(device.join("cc-switch.db"), b"unrelated old database");
+            write(device.join("settings.json"), b"device settings");
+            write(device.join("unknown/keep"), b"old only");
+            write(fixture.legacy.webview.join("profile"), b"browser");
+            fixture.store(serde_json::json!({"app_config_dir_override":"~/custom", "other":true}));
+            let mut asked = 0;
+            migrate_prompted(
+                &fixture.targets,
+                &fixture.legacy,
+                prepare_fixture_dir,
+                fixture_on_d,
+                true,
+                true,
+                |source, _| {
+                    asked += 1;
+                    assert!(source.auxiliary_only);
+                    assert_eq!(source.device, device);
+                    Ok(decision)
+                },
+            )
+            .unwrap();
+            assert_eq!(asked, 1);
+            assert_eq!(
+                fs::read(custom.join("cc-switch.db")).unwrap(),
+                b"current database"
+            );
+            assert_eq!(
+                fs::read(device.join("cc-switch.db")).unwrap(),
+                b"unrelated old database"
+            );
+            assert_eq!(fs::read(device.join("unknown/keep")).unwrap(), b"old only");
+            assert!(!custom.join("unknown/keep").exists());
+            if decision == MigrationDecision::Migrate {
+                assert_eq!(
+                    fs::read(custom.join("settings.json")).unwrap(),
+                    b"device settings"
+                );
+                assert_eq!(
+                    fs::read(fixture.targets.webview.join("profile")).unwrap(),
+                    b"browser"
+                );
+                let store: Value = serde_json::from_slice(
+                    &fs::read(fixture.targets.tauri.join(STORE_FILE)).unwrap(),
+                )
+                .unwrap();
+                assert!(store.get("app_config_dir_override").is_none());
+                assert_eq!(store["other"], true);
+            } else {
+                assert!(!custom.join("settings.json").exists());
+            }
+            migrate_prompted(
+                &fixture.targets,
+                &fixture.legacy,
+                prepare_fixture_dir,
+                fixture_on_d,
+                true,
+                true,
+                |_, _| panic!("already decided"),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn custom_override_must_match_and_device_conflicts_leave_no_pending_state() {
+        for conflict in [false, true] {
+            let mut fixture = Fixture::new();
+            let custom = fixture.legacy.home.join("custom");
+            let device = fixture.legacy.home.join(".cc-switch");
+            fixture.targets = Targets {
+                app: custom.clone(),
+                device: custom.clone(),
+                tauri: custom.join("tauri"),
+                webview: custom.join("webview2"),
+                cache: custom.join("cache"),
+            };
+            write(custom.join("cc-switch.db"), b"current");
+            write(device.join("cc-switch.db"), b"different");
+            write(device.join("settings.json"), b"old settings");
+            if conflict {
+                write(custom.join("settings.json"), b"current settings");
+            }
+            fixture.store(serde_json::json!({"app_config_dir_override":if conflict { "~/custom" } else { "~/other" }}));
+            let mut asked = 0;
+            let result = migrate_prompted(
+                &fixture.targets,
+                &fixture.legacy,
+                prepare_fixture_dir,
+                fixture_on_d,
+                true,
+                true,
+                |_, _| {
+                    asked += 1;
+                    Ok(MigrationDecision::Migrate)
+                },
+            );
+            if conflict {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+                assert_eq!(asked, 1);
+                assert_eq!(
+                    fs::read(custom.join("settings.json")).unwrap(),
+                    b"current settings"
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(asked, 0);
+            }
+            assert!(!fixture.marker().exists());
+            assert_eq!(fs::read(custom.join("cc-switch.db")).unwrap(), b"current");
+            assert_eq!(
+                fs::read(device.join("settings.json")).unwrap(),
+                b"old settings"
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_source_stops_before_recording_in_progress() {
+        let mut fixture = Fixture::new();
+        let old = fixture.legacy.home.join(".cc-switch");
+        write(old.join("cc-switch.db"), b"old");
+        let nested = old.join("new-install");
+        fixture.targets = portable_targets(&nested);
+        assert!(prompted(&fixture, |_, _| Ok(MigrationDecision::Migrate)).is_err());
+        assert!(!fixture.marker().exists());
+        assert_eq!(fs::read(old.join("cc-switch.db")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn matching_marker_and_explicit_data_ignore_stale_store_override() {
+        let fixture = Fixture::new();
+        write(fixture.legacy.home.join(".cc-switch/cc-switch.db"), b"data");
+        fixture.run().unwrap();
+        let bytes = br#"{"app_config_dir_override":"Z:\\unavailable"}"#;
+        write(fixture.targets.tauri.join(STORE_FILE), bytes);
+        migrate_prompted(
+            &fixture.targets,
+            &fixture.legacy,
+            prepare_fixture_dir,
+            fixture_on_d,
+            true,
+            true,
+            |_, _| panic!("matching marker"),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(fixture.targets.tauri.join(STORE_FILE)).unwrap(),
+            bytes
+        );
+        write(fixture.targets.tauri.join(STORE_FILE), b"invalid json");
+        migrate_prompted(
+            &fixture.targets,
+            &fixture.legacy,
+            prepare_fixture_dir,
+            fixture_on_d,
+            true,
+            true,
+            |_, _| panic!("matching marker"),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(fixture.targets.tauri.join(STORE_FILE)).unwrap(),
+            b"invalid json"
+        );
+        fs::remove_file(fixture.targets.tauri.join(STORE_FILE)).unwrap();
+        migrate_prompted(
+            &fixture.targets,
+            &fixture.legacy,
+            prepare_fixture_dir,
+            fixture_on_d,
+            true,
+            true,
+            |_, _| panic!("matching marker"),
+        )
+        .unwrap();
+        assert!(!fixture.targets.tauri.join(STORE_FILE).exists());
+    }
+
+    #[test]
+    fn multiple_sources_require_selection_and_never_mix_or_copy_cache() {
+        for choose_local in [true, false] {
+            let mut fixture = Fixture::new();
+            let local = portable_targets(&fixture._root.path().join("old-d"));
+            write(local.app.join("cc-switch.db"), b"local database");
+            write(local.tauri.join(STORE_FILE), b"{}");
+            write(
+                local.tauri.join(MARKER_FILE),
+                completion_bytes(&local, None).unwrap(),
+            );
+            write(local.cache.join("tmp/unrelated"), b"do not copy");
+            write(
+                fixture.legacy.home.join(".cc-switch/cc-switch.db"),
+                b"official database",
+            );
+            fixture.legacy.local_d = Some(local.clone());
+            let mut prompted_paths = Vec::new();
+            prompted(&fixture, |source, _| {
+                prompted_paths.push(source.app.clone());
+                Ok(if choose_local || prompted_paths.len() > 1 {
+                    MigrationDecision::Migrate
+                } else {
+                    MigrationDecision::StartFresh
+                })
+            })
+            .unwrap();
+            assert_eq!(prompted_paths.len(), if choose_local { 1 } else { 2 });
+            assert_eq!(
+                fs::read(fixture.targets.app.join("cc-switch.db")).unwrap(),
+                if choose_local {
+                    b"local database".as_slice()
+                } else {
+                    b"official database".as_slice()
+                }
+            );
+            assert!(!fixture.targets.cache.join("tmp/unrelated").exists());
+            assert!(local.cache.join("tmp/unrelated").exists());
+        }
+    }
+
+    #[test]
+    fn completed_marker_allows_cache_change_without_copying_data() {
+        let mut fixture = Fixture::new();
+        write(fixture.legacy.home.join(".cc-switch/cc-switch.db"), b"old");
+        fixture.run().unwrap();
+        fixture.targets.cache = fixture._root.path().join("new-cache");
+        prompted(&fixture, |_, _| panic!("cache change must not prompt")).unwrap();
+        let marker: Completion =
+            serde_json::from_slice(&fs::read(fixture.marker()).unwrap()).unwrap();
+        assert_eq!(marker.targets, fixture.targets);
+        assert_eq!(
+            fs::read(fixture.targets.app.join("cc-switch.db")).unwrap(),
+            b"old"
+        );
+    }
+
+    #[test]
+    fn moving_complete_portable_layout_rebases_marker() {
+        let fixture = Fixture::new();
+        let old_base = fixture._root.path().join("old-install");
+        let new_base = fixture._root.path().join("moved-install");
+        let old = portable_targets(&old_base);
+        write(old.app.join("cc-switch.db"), b"data");
+        for dir in [&old.device, &old.tauri, &old.webview, &old.cache] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        write(old.tauri.join(STORE_FILE), b"{}");
+        write(
+            old.tauri.join(MARKER_FILE),
+            completion_bytes(&old, None).unwrap(),
+        );
+        fs::rename(&old_base, &new_base).unwrap();
+        let moved = portable_targets(&new_base);
+        migrate_prompted(
+            &moved,
+            &fixture.legacy,
+            prepare_fixture_dir,
+            fixture_on_d,
+            false,
+            true,
+            |_, _| panic!("moved profile"),
+        )
+        .unwrap();
+        let marker: Completion =
+            serde_json::from_slice(&fs::read(moved.tauri.join(MARKER_FILE)).unwrap()).unwrap();
+        assert_eq!(marker.targets, moved);
+        assert_eq!(fs::read(moved.app.join("cc-switch.db")).unwrap(), b"data");
+    }
+
+    #[test]
+    fn changed_source_after_prompt_stops_before_copying() {
+        let fixture = Fixture::new();
+        write(fixture.legacy.home.join("first/cc-switch.db"), b"first");
+        write(fixture.legacy.home.join("second/cc-switch.db"), b"second");
+        fixture.store(serde_json::json!({"app_config_dir_override":"~/first"}));
+        let result = prompted(&fixture, |_, _| {
+            fixture.store(serde_json::json!({"app_config_dir_override":"~/second"}));
+            Ok(MigrationDecision::Migrate)
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert!(!fixture.marker().exists());
+        assert!(!fixture.targets.app.join("cc-switch.db").exists());
+    }
+
+    #[test]
+    fn moving_direct_layout_without_store_rebases_and_restarts() {
+        let fixture = Fixture::new();
+        let old_base = fixture._root.path().join("direct-old");
+        let new_base = fixture._root.path().join("direct-moved");
+        let data = old_base.join("data");
+        let old = Targets {
+            app: data.clone(),
+            device: data.clone(),
+            tauri: data.join("tauri"),
+            webview: data.join("webview2"),
+            cache: old_base.join("cache"),
+        };
+        write(old.app.join("cc-switch.db"), b"data");
+        for dir in [&old.tauri, &old.webview, &old.cache] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        write(
+            old.tauri.join(MARKER_FILE),
+            completion_bytes(&old, None).unwrap(),
+        );
+        fs::rename(&old_base, &new_base).unwrap();
+        let data = new_base.join("data");
+        let moved = Targets {
+            app: data.clone(),
+            device: data.clone(),
+            tauri: data.join("tauri"),
+            webview: data.join("webview2"),
+            cache: new_base.join("cache"),
+        };
+        for _ in 0..2 {
+            migrate_prompted(
+                &moved,
+                &fixture.legacy,
+                prepare_fixture_dir,
+                fixture_on_d,
+                false,
+                true,
+                |_, _| panic!("moved profile"),
+            )
+            .unwrap();
+        }
+        let marker: Completion =
+            serde_json::from_slice(&fs::read(moved.tauri.join(MARKER_FILE)).unwrap()).unwrap();
+        assert_eq!(marker.targets, moved);
+        assert_eq!(fs::read(moved.app.join("cc-switch.db")).unwrap(), b"data");
+        assert!(!moved.tauri.join(STORE_FILE).exists());
+    }
+
+    #[test]
+    fn separate_override_migrates_known_device_data_without_copying_unknowns() {
+        let mut fixture = Fixture::new();
+        let target = fixture._root.path().join("direct/data");
+        fixture.targets = Targets {
+            app: target.clone(),
+            device: target.clone(),
+            tauri: target.join("tauri"),
+            webview: target.join("webview2"),
+            cache: target.join("cache"),
+        };
+        let app = fixture.legacy.home.join("custom-app");
+        let device = fixture.legacy.home.join(".cc-switch");
+        write(app.join("cc-switch.db"), b"chosen database");
+        write(device.join("cc-switch.db"), b"other database");
+        write(device.join("settings.json"), b"device settings");
+        write(device.join("codex-login-stash.json"), b"device state");
+        write(
+            device.join("backups/live-first-write/state"),
+            b"known backup",
+        );
+        write(device.join("unknown/keep"), b"old only");
+        fixture.store(serde_json::json!({"app_config_dir_override":"~/custom-app"}));
+        prompted(&fixture, |_, _| Ok(MigrationDecision::Migrate)).unwrap();
+        assert_eq!(
+            fs::read(target.join("cc-switch.db")).unwrap(),
+            b"chosen database"
+        );
+        assert_eq!(
+            fs::read(target.join("settings.json")).unwrap(),
+            b"device settings"
+        );
+        assert_eq!(
+            fs::read(target.join("codex-login-stash.json")).unwrap(),
+            b"device state"
+        );
+        assert_eq!(
+            fs::read(target.join("backups/live-first-write/state")).unwrap(),
+            b"known backup"
+        );
+        assert!(!target.join("unknown/keep").exists());
+        assert_eq!(fs::read(device.join("unknown/keep")).unwrap(), b"old only");
     }
 
     #[test]
@@ -875,9 +2470,10 @@ mod tests {
             fs::read(old.join("settings.json")).unwrap()
         );
         assert_eq!(
-            fs::read(fixture.targets.device.join("unknown/nested.bin")).unwrap(),
+            fs::read(fixture.targets.app.join("unknown/nested.bin")).unwrap(),
             [255, 0, 7]
         );
+        assert!(!fixture.targets.device.join("unknown/nested.bin").exists());
         assert_eq!(
             fs::read(fixture.targets.tauri.join(".window-state.json")).unwrap(),
             b"window state"
@@ -897,7 +2493,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_non_d_override_and_preserves_other_store_values() {
+    fn migrates_custom_override_and_preserves_other_store_values() {
         let fixture = Fixture::new();
         let custom = fixture.legacy.home.join("custom-c");
         write(custom.join("cc-switch.db"), b"custom db");
@@ -910,10 +2506,7 @@ mod tests {
         let store: Value =
             serde_json::from_slice(&fs::read(fixture.targets.tauri.join(STORE_FILE)).unwrap())
                 .unwrap();
-        assert_eq!(
-            store["app_config_dir_override"],
-            fixture.targets.app.to_str().unwrap()
-        );
+        assert!(store.get("app_config_dir_override").is_none());
         assert_eq!(store["other"], serde_json::json!([1, 2, 3]));
         assert_eq!(
             fs::read(fixture.targets.app.join("cc-switch.db")).unwrap(),
@@ -926,7 +2519,7 @@ mod tests {
     }
 
     #[test]
-    fn retains_valid_d_custom_directory_and_store_bytes() {
+    fn migrates_old_d_custom_directory_without_deleting_source() {
         let fixture = Fixture::new();
         let custom = fixture.legacy.home.join("custom-d");
         write(custom.join("cc-switch.db"), b"existing D db");
@@ -934,15 +2527,23 @@ mod tests {
         let original = fs::read(fixture.legacy.tauri.join(STORE_FILE)).unwrap();
 
         fixture.run().unwrap();
+        let store: Value =
+            serde_json::from_slice(&fs::read(fixture.targets.tauri.join(STORE_FILE)).unwrap())
+                .unwrap();
+        assert!(store.get("app_config_dir_override").is_none());
+        assert_eq!(store["other"], 42);
         assert_eq!(
-            fs::read(fixture.targets.tauri.join(STORE_FILE)).unwrap(),
+            fs::read(fixture.legacy.tauri.join(STORE_FILE)).unwrap(),
             original
         );
         assert_eq!(
             fs::read(custom.join("cc-switch.db")).unwrap(),
             b"existing D db"
         );
-        assert!(!fixture.targets.app.join("cc-switch.db").exists());
+        assert_eq!(
+            fs::read(fixture.targets.app.join("cc-switch.db")).unwrap(),
+            b"existing D db"
+        );
     }
 
     #[test]
@@ -991,7 +2592,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_copy_retries_identical_files_and_rejects_conflicts() {
+    fn interrupted_copy_keeps_both_sides_and_requires_manual_review() {
         let fixture = Fixture::new();
         let old = fixture.legacy.home.join(".cc-switch");
         write(old.join("one"), b"same");
@@ -1002,14 +2603,22 @@ mod tests {
             fixture.run().unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
-        assert!(!fixture.marker().exists());
+        fixture.assert_pending();
         assert_eq!(
             fs::read(fixture.targets.app.join("two")).unwrap(),
             b"different"
         );
         write(fixture.targets.app.join("two"), b"source");
-        fixture.run().unwrap();
-        assert!(fixture.marker().is_file());
+        assert_eq!(
+            fixture.run().unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        fixture.assert_pending();
+        assert_eq!(fs::read(old.join("two")).unwrap(), b"source");
+        assert_eq!(
+            fs::read(fixture.targets.app.join("two")).unwrap(),
+            b"source"
+        );
     }
 
     #[test]
@@ -1195,10 +2804,7 @@ mod tests {
                 absolute_link_target(&target_link).unwrap(),
                 absolute_link_target(&source_link).unwrap()
             );
-            assert_eq!(
-                absolute_link_target(&fixture.targets.device.join(relative)).unwrap(),
-                absolute_link_target(&source_link).unwrap()
-            );
+            assert!(!fixture.targets.device.join(relative).exists());
             copy_tree(&source, &fixture.targets.app, None, true).unwrap();
             fixture.run().unwrap();
 
@@ -1251,7 +2857,7 @@ mod tests {
         assert_eq!(absolute_link_target(&existing).unwrap(), before);
         assert_eq!(fs::read(external.join("keep")).unwrap(), b"source target");
         assert_eq!(fs::read(other.join("keep")).unwrap(), b"existing target");
-        assert!(!fixture.marker().exists());
+        fixture.assert_pending();
     }
 
     #[test]
@@ -1268,7 +2874,7 @@ mod tests {
             create_shared_link(&fixture.legacy.home.join(".cc-switch"), relative, &external);
             assert!(fixture.run().is_err());
             assert_eq!(fs::read(external.join("keep")).unwrap(), b"external");
-            assert!(!fixture.marker().exists());
+            fixture.assert_pending();
         }
     }
 

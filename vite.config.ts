@@ -34,5 +34,6 @@ export default defineConfig(({ command }) => ({
     },
   },
   clearScreen: false,
-  envPrefix: ["VITE_", "TAURI_"],
+  // Tauri's build environment also contains updater signing secrets.
+  envPrefix: ["VITE_"],
 }));

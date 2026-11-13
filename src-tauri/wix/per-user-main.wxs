@@ -130,16 +130,30 @@
         {{#if homepage}}
         <Property Id="ARPURLINFOABOUT" Value="{{homepage}}"/>
         <Property Id="ARPHELPLINK" Value="{{homepage}}"/>
-        <Property Id="ARPURLUPDATEINFO" Value="{{homepage}}"/>
         {{/if}}
+        <Property Id="ARPURLUPDATEINFO" Value="https://github.com/WQMYH/multi-compat-cc/releases"/>
 
-        <Property Id="INSTALLDIR">
-          <!-- First attempt: Search for "InstallDir" -->
+        <!-- Search into separate properties: AppSearch does not guarantee the
+             ordering of multiple registry searches for the same property. -->
+        <Property Id="CCOWNMSIINSTALLDIR">
+          <RegistrySearch Id="OwnMsiInstallDir" Root="HKCU" Key="Software\WQMYH\MultiCompatCC\Installer" Name="InstallDir" Type="raw" />
+        </Property>
+        <Property Id="CCPREVMSIINSTALLDIR">
           <RegistrySearch Id="PrevInstallDirWithName" Root="HKCU" Key="Software\\{{manufacturer}}\\{{product_name}}" Name="InstallDir" Type="raw" />
-
-          <!-- Second attempt: If the first fails, search for the default key value (this is how the nsis installer currently stores the path) -->
+        </Property>
+        <Property Id="CCPREVNSISINSTALLDIR">
           <RegistrySearch Id="PrevInstallDirNoName" Root="HKCU" Key="Software\\{{manufacturer}}\\{{product_name}}" Type="raw" />
         </Property>
+
+        <!-- Respect an explicit INSTALLDIR, then this fork's MSI registration,
+             then older MSI/NSIS registrations. Otherwise the Directory table
+             selects the current user's Programs folder. -->
+        <SetProperty Id="INSTALLDIR" Action="SetOwnMsiInstallDir" Value="[CCOWNMSIINSTALLDIR]"
+                     After="AppSearch" Sequence="first">NOT INSTALLDIR AND CCOWNMSIINSTALLDIR</SetProperty>
+        <SetProperty Id="INSTALLDIR" Action="SetPreviousMsiInstallDir" Value="[CCPREVMSIINSTALLDIR]"
+                     After="SetOwnMsiInstallDir" Sequence="first">NOT INSTALLDIR AND CCPREVMSIINSTALLDIR</SetProperty>
+        <SetProperty Id="INSTALLDIR" Action="SetPreviousNsisInstallDir" Value="[CCPREVNSISINSTALLDIR]"
+                     After="SetPreviousMsiInstallDir" Sequence="first">NOT INSTALLDIR AND CCPREVNSISINSTALLDIR</SetProperty>
 
         <!-- launch app checkbox -->
         <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="!(loc.LaunchApp)" />
@@ -215,12 +229,13 @@
 
         <DirectoryRef Id="INSTALLDIR">
             <Component Id="RegistryEntries" Guid="*">
-                <!-- An MSI install can reuse a directory previously used by the portable build.
-                     Remove its marker so the installed app can use the in-app updater. -->
-                <RemoveFile Id="RemovePortableMarker" Directory="INSTALLDIR" Name="portable.ini" On="install" />
                 <RegistryKey Root="HKCU" Key="Software\\{{manufacturer}}\\{{product_name}}">
                     <RegistryValue Name="InstallDir" Type="string" Value="[INSTALLDIR]" KeyPath="yes" />
                 </RegistryKey>
+                <!-- The updater trusts this fork-specific registration only when it
+                     resolves to the running EXE directory and portable.ini is absent. -->
+                <RegistryValue Root="HKCU" Key="Software\WQMYH\MultiCompatCC\Installer"
+                               Name="InstallDir" Type="string" Value="[INSTALLDIR]" />
                 <!-- Change the Root to HKCU for perUser installations -->
                 {{#each deep_link_protocols as |protocol| ~}}
                 <RegistryKey Root="HKCU" Key="Software\Classes\\{{protocol}}">
@@ -272,9 +287,6 @@
 						  Description="Uninstalls {{product_name}}"
 						  Target="[System64Folder]msiexec.exe"
 						  Arguments="/x [ProductCode]" />
-
-                <RemoveFile Id="RemoveUserProgramsFiles" Directory="TauriLocalAppDataPrograms" Name="*" On="uninstall" />
-                <RemoveFolder Id="RemoveUserProgramsFolder" Directory="TauriLocalAppDataPrograms" On="uninstall" />
 
 				<RemoveFolder Id="INSTALLDIR"
 							  On="uninstall" />

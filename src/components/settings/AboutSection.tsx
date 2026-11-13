@@ -4,7 +4,6 @@ import {
   ExternalLink,
   Github,
   Globe,
-  Info,
   Loader2,
   RefreshCw,
   Sparkles,
@@ -17,7 +16,6 @@ import { toast } from "@/lib/toast";
 import { getVersion } from "@tauri-apps/api/app";
 import { settingsApi } from "@/lib/api";
 import { useUpdate } from "@/contexts/UpdateContext";
-import { Badge } from "@/components/ui/badge";
 import { WhatsNewDialog } from "@/components/WhatsNewDialog";
 import { WHATS_NEW_ENTRIES, entriesUpTo } from "@/lib/whatsNew";
 import ccswitchLogo from "@/assets/icons/logo.svg";
@@ -104,13 +102,13 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
 
       if (!displayVersion) {
         await settingsApi.openExternal(
-          "https://github.com/farion1231/cc-switch/releases",
+          "https://github.com/WQMYH/multi-compat-cc/releases",
         );
         return;
       }
 
       await settingsApi.openExternal(
-        `https://github.com/farion1231/cc-switch/releases/tag/${displayVersion}`,
+        `https://github.com/WQMYH/multi-compat-cc/releases/tag/${displayVersion}`,
       );
     } catch (error) {
       console.error("[AboutSection] Failed to open release notes", error);
@@ -211,15 +209,6 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
             ) : (
               <span className="tabular-nums">{`${t("common.version")} v${displayVersion}`}</span>
             )}
-            {isPortable && (
-              <Badge
-                variant="secondary"
-                className="gap-1 px-1.5 py-0 text-badge"
-              >
-                <Info className="h-3 w-3" />
-                {t("settings.portableMode")}
-              </Badge>
-            )}
           </div>
         </div>
         <Button
@@ -236,10 +225,16 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
             </>
           ) : hasUpdate ? (
             <>
-              <Download className="h-3.5 w-3.5" />
-              {t("settings.updateTo", {
-                version: updateInfo?.availableVersion ?? "",
-              })}
+              {isPortable ? (
+                <ExternalLink className="h-3.5 w-3.5" />
+              ) : (
+                <Download className="h-3.5 w-3.5" />
+              )}
+              {isPortable
+                ? t("dbUpgrade.openReleases")
+                : t("settings.updateTo", {
+                    version: updateInfo?.availableVersion ?? "",
+                  })}
             </>
           ) : isChecking ? (
             <>
@@ -264,9 +259,6 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
           </p>
           {updateInfo.notes && (
             <p className="line-clamp-3 text-fg-2">{updateInfo.notes}</p>
-          )}
-          {isPortable && (
-            <p className="text-fg-2">{t("settings.portableUpdateHint")}</p>
           )}
         </div>
       )}
@@ -314,8 +306,7 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
         )}
       </div>
 
-      {/* 下载与更新都走 ccswitch.io，用户不再经过仓库页，邀 Star 单独占一行；按钮即 GitHub 入口。
-          关掉后链接行补回 GitHub 按钮 */}
+      {/* 保留上游项目归属链接；关闭提示后链接行补回 GitHub 按钮。 */}
       {!starPromptDismissed && (
         <div className="flex flex-wrap items-center gap-x-4 gap-y-3 bg-action-soft py-3.5 ps-5 pe-3">
           <div className="flex min-w-0 flex-1 items-center gap-3">

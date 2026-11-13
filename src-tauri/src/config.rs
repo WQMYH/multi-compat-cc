@@ -311,6 +311,11 @@ pub fn get_claude_settings_path() -> PathBuf {
 
 /// 获取应用配置目录路径 (~/.cc-switch)
 pub fn get_app_config_dir() -> PathBuf {
+    // A launch-time root is an explicit choice for all CC Switch data.
+    // Do not let an older app-only store override silently redirect the DB.
+    if crate::data_paths::has_explicit_data_dir() {
+        return crate::data_paths::app_dir();
+    }
     if let Some(custom) = crate::app_store::get_app_config_dir_override() {
         return custom;
     }

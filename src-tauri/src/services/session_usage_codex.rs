@@ -27,12 +27,14 @@ use crate::services::session_usage::{
 };
 use crate::services::sql_helpers::INPUT_TOKEN_SEMANTICS_TOTAL;
 use crate::services::usage_stats::{
-    find_model_pricing, has_suspected_codex_session_duplicate, should_skip_session_insert, DedupKey,
+    effective_usage_log_filter, find_model_pricing, has_suspected_codex_session_duplicate,
+    should_skip_session_insert, DedupKey,
 };
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::BufRead;
 #[cfg(unix)]
@@ -789,6 +791,8 @@ struct CodexSyncPass {
     rollout_cursor_paths: HashMap<String, Vec<String>>,
     byte_offsets: HashMap<String, Option<i64>>,
     pricing: HashMap<String, Option<ModelPricing>>,
+    guardian_repairs: HashMap<PathBuf, GuardianRepair>,
+    guardian_repair_ids: HashSet<String>,
 }
 
 impl CodexSyncPass {
@@ -827,6 +831,8 @@ impl CodexSyncPass {
             rollout_cursor_paths,
             byte_offsets,
             pricing: HashMap::new(),
+            guardian_repairs: HashMap::new(),
+            guardian_repair_ids: HashSet::new(),
         })
     }
 }
@@ -1076,6 +1082,31 @@ pub(crate) fn sync_codex_usage_files(
 ) -> Result<SessionSyncResult, AppError> {
     let rollout_index = build_rollout_index(files);
     let mut pass = CodexSyncPass::load(db)?;
+    let repairs = collect_guardian_repairs(db, files, &rollout_index, &pass)?;
+    pass.guardian_repairs = repairs
+        .iter()
+        .map(|repair| (repair.path.clone(), repair.clone()))
+        .collect();
+    pass.guardian_repair_ids = repairs
+        .iter()
+        .map(|repair| repair.row.request_id.clone())
+        .collect();
+    // Import ordinary/source files first, then checkpoints in time order.
+    // A checkpoint is skipped only if its source is already accounted for in
+    // the insertion transaction; absent sources are retained as before.
+    let mut ordered_files = files.to_vec();
+    ordered_files.sort_by_key(|path| {
+        pass.guardian_repairs
+            .get(path)
+            .map(|repair| {
+                (
+                    1,
+                    repair.row.timestamp.timestamp(),
+                    repair.row.timestamp.timestamp_subsec_nanos(),
+                )
+            })
+            .unwrap_or((0, 0, 0))
+    });
 
     let mut result = SessionSyncResult {
         imported: 0,
@@ -1086,7 +1117,7 @@ pub(crate) fn sync_codex_usage_files(
         errors: vec![],
     };
 
-    for file_path in files {
+    for file_path in &ordered_files {
         match sync_single_codex_file(db, file_path, &rollout_index, &mut pass) {
             Ok(file_result) => {
                 result.imported = result.imported.saturating_add(file_result.imported);
@@ -1106,6 +1137,24 @@ pub(crate) fn sync_codex_usage_files(
         }
     }
 
+    // A Guardian checkpoint can re-emit the last accounted token snapshot
+    // from a sibling rollout. Correct only rows with an independently verified
+    // source after the whole pass, so the result does not depend on file order.
+    // The cursor and physical event indexes remain unchanged.
+    match reconcile_guardian_checkpoints(db, &repairs) {
+        Ok(corrected) if corrected > 0 => {
+            result.skipped = result.skipped.saturating_add(corrected as u32);
+            log::info!("[CODEX-SYNC] 已校正 {corrected} 条 Guardian 检查点重复用量");
+            crate::usage_events::notify_log_recorded();
+        }
+        Ok(_) => {}
+        Err(error) => {
+            let message = format!("Guardian 检查点用量核对失败: {error}");
+            log::warn!("[CODEX-SYNC] {message}");
+            result.errors.push(message);
+        }
+    }
+
     if result.imported > 0 || result.deferred_files > 0 {
         log::info!(
             "[CODEX-SYNC] 同步完成: 导入 {} 条, 跳过 {} 条, deferred {} 个, 扫描 {} 个文件",
@@ -1117,6 +1166,708 @@ pub(crate) fn sync_codex_usage_files(
     }
 
     Ok(result)
+}
+
+// A Guardian checkpoint is not a new request. Its compacted record names the
+// originating thread and carries the token usage copied into the following
+// token_count. This reconciliation deliberately requires both that evidence
+// and an existing, effective source row. Missing or malformed evidence leaves
+// the old row alone; no rollout or cursor is modified.
+#[derive(Debug, Clone)]
+struct GuardianMeta {
+    thread_id: String,
+    parent_id: String,
+    timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GuardianCounters {
+    input: u64,
+    cached_input: u64,
+    cache_write_input: u64,
+    output: u64,
+    reasoning_output: u64,
+    total: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GuardianSignature {
+    total: GuardianCounters,
+    last: GuardianCounters,
+}
+
+fn guardian_counters(value: &serde_json::Value) -> Option<GuardianCounters> {
+    Some(GuardianCounters {
+        input: value.get("input_tokens")?.as_u64()?,
+        cached_input: value.get("cached_input_tokens")?.as_u64()?,
+        cache_write_input: value.get("cache_write_input_tokens")?.as_u64()?,
+        output: value.get("output_tokens")?.as_u64()?,
+        reasoning_output: value.get("reasoning_output_tokens")?.as_u64()?,
+        total: value.get("total_tokens")?.as_u64()?,
+    })
+}
+
+fn guardian_signature(info: &serde_json::Value) -> Option<GuardianSignature> {
+    Some(GuardianSignature {
+        total: guardian_counters(info.get("total_token_usage")?)?,
+        last: guardian_counters(info.get("last_token_usage")?)?,
+    })
+}
+
+fn guardian_uuid(value: Option<&serde_json::Value>) -> Option<String> {
+    Some(
+        uuid::Uuid::parse_str(value?.as_str()?)
+            .ok()?
+            .hyphenated()
+            .to_string(),
+    )
+}
+
+fn guardian_meta(value: &serde_json::Value) -> Option<GuardianMeta> {
+    if value.get("type")?.as_str()? != "session_meta" {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    if payload.get("history_mode")?.as_str()? != "paginated"
+        || payload.pointer("/source/subagent/other")?.as_str()? != "guardian"
+    {
+        return None;
+    }
+    Some(GuardianMeta {
+        thread_id: guardian_uuid(payload.get("id"))?,
+        parent_id: guardian_uuid(payload.get("parent_thread_id"))?,
+        timestamp: parse_timestamp(value.get("timestamp"))?,
+    })
+}
+
+// Do not allocate the potentially huge replacement history. Deserializing it
+// as a sequence also proves that the actual payload field is an array, rather
+// than matching a nested string or a field with a different type.
+struct GuardianHistoryArray;
+
+impl<'de> Deserialize<'de> for GuardianHistoryArray {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct HistoryVisitor;
+        impl<'de> serde::de::Visitor<'de> for HistoryVisitor {
+            type Value = GuardianHistoryArray;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a replacement history array")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                while sequence.next_element::<IgnoredJsonValue>()?.is_some() {}
+                Ok(GuardianHistoryArray)
+            }
+        }
+        deserializer.deserialize_seq(HistoryVisitor)
+    }
+}
+
+#[derive(Deserialize)]
+struct GuardianLatestRecord {
+    thread_id: String,
+    response_id: String,
+    usage: serde_json::Value,
+    thread_token_usage: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct GuardianEnvelopePayload {
+    #[serde(rename = "type")]
+    event_type: Option<String>,
+    replacement_history: Option<GuardianHistoryArray>,
+    latest_token_usage_record: Option<GuardianLatestRecord>,
+}
+
+#[derive(Deserialize)]
+struct GuardianEnvelope {
+    #[serde(rename = "type")]
+    event_type: String,
+    payload: Option<GuardianEnvelopePayload>,
+}
+
+struct GuardianCheckpoint {
+    meta: GuardianMeta,
+    stamp: ParentFileStamp,
+    source_thread: String,
+    info: serde_json::Value,
+    prefix_hash: [u8; 32],
+    line_offset: i64,
+    timestamp: DateTime<Utc>,
+}
+
+fn guardian_file_unchanged(path: &Path, stamp: ParentFileStamp) -> bool {
+    fs::File::open(path)
+        .ok()
+        .and_then(|file| ParentFileStamp::from_file(&file))
+        == Some(stamp)
+}
+
+fn open_guardian_file(
+    path: &Path,
+) -> Option<(
+    GuardianMeta,
+    ParentFileStamp,
+    Box<dyn BufRead + Send>,
+    Sha256,
+)> {
+    let file = fs::File::open(path).ok()?;
+    let stamp = ParentFileStamp::from_file(&file)?;
+    let mut reader = codex_rollout_file::reader_from_file(path, file).ok()?;
+    let mut bytes = Vec::new();
+    if reader.read_until(b'\n', &mut bytes).ok()? == 0 || bytes.len() > 1024 * 1024 {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let mut prefix_hash = Sha256::new();
+    prefix_hash.update(&bytes);
+    Some((guardian_meta(&value)?, stamp, reader, prefix_hash))
+}
+
+fn read_guardian_checkpoint(path: &Path) -> Option<GuardianCheckpoint> {
+    let (meta, stamp, mut reader, mut prefix_hash) = open_guardian_file(path)?;
+    let mut record: Option<GuardianLatestRecord> = None;
+    let mut bytes = Vec::new();
+    // A checkpoint is emitted immediately after session_meta. Bound the
+    // number of records inspected before the first task or token event.
+    for line_offset in 2..=65 {
+        bytes.clear();
+        if reader.read_until(b'\n', &mut bytes).ok()? == 0 {
+            return None;
+        }
+        prefix_hash.update(&bytes);
+        let envelope: GuardianEnvelope = serde_json::from_slice(&bytes).ok()?;
+        match envelope.event_type.as_str() {
+            "compacted" => {
+                if record.is_some() {
+                    return None;
+                }
+                let payload = envelope.payload?;
+                payload.replacement_history?;
+                record = payload.latest_token_usage_record;
+                if record.is_none() {
+                    return None;
+                }
+            }
+            "event_msg" => {
+                let kind = envelope.payload?.event_type?;
+                if kind != "token_count" {
+                    // Any other event could be a real task or response in a
+                    // truncated/older rollout, not checkpoint initialization.
+                    return None;
+                }
+                let record = record?;
+                if record.response_id.trim().is_empty() {
+                    return None;
+                }
+                let source_thread = uuid::Uuid::parse_str(&record.thread_id)
+                    .ok()?
+                    .hyphenated()
+                    .to_string();
+                if source_thread == meta.thread_id {
+                    return None;
+                }
+                let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+                let payload = value.get("payload")?;
+                if !payload
+                    .get("rate_limits")
+                    .is_some_and(serde_json::Value::is_null)
+                {
+                    return None;
+                }
+                let info = payload.get("info")?;
+                let signature = guardian_signature(info)?;
+                if guardian_counters(&record.usage)? != signature.last
+                    || guardian_counters(&record.thread_token_usage)? != signature.total
+                {
+                    return None;
+                }
+                let timestamp = parse_timestamp(value.get("timestamp"))?;
+                if timestamp < meta.timestamp || !guardian_file_unchanged(path, stamp) {
+                    return None;
+                }
+                return Some(GuardianCheckpoint {
+                    meta,
+                    stamp,
+                    source_thread,
+                    info: info.clone(),
+                    prefix_hash: prefix_hash.finalize().into(),
+                    line_offset,
+                    timestamp,
+                });
+            }
+            "turn_context" | "world_state" => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
+// Hash the exact decoded JSONL prefix that established both the source
+// identity and its event. This catches same-size, same-mtime rewrites while a
+// Windows writer has the file open. Work chunk-by-chunk, including for zstd,
+// rather than allocating the potentially large preceding history lines.
+fn guardian_prefix_hash_and_line(path: &Path, line_offset: i64) -> Option<([u8; 32], Vec<u8>)> {
+    if line_offset <= 0 {
+        return None;
+    }
+    let file = fs::File::open(path).ok()?;
+    let mut reader = codex_rollout_file::reader_from_file(path, file).ok()?;
+    let mut hasher = Sha256::new();
+    let mut current_line = 1i64;
+    let mut final_line = Vec::new();
+    loop {
+        let chunk = reader.fill_buf().ok()?;
+        if chunk.is_empty() {
+            // An incomplete final line is retried after the writer finishes.
+            return None;
+        }
+        let count = chunk
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(chunk.len(), |position| position + 1);
+        let reached_newline = chunk[count - 1] == b'\n';
+        if current_line == line_offset {
+            if final_line.len().checked_add(count)? > 1024 * 1024 {
+                return None;
+            }
+            final_line.extend_from_slice(&chunk[..count]);
+        }
+        hasher.update(&chunk[..count]);
+        reader.consume(count);
+        if reached_newline {
+            if current_line == line_offset {
+                return Some((hasher.finalize().into(), final_line));
+            }
+            current_line += 1;
+        }
+    }
+}
+
+fn guardian_content_unchanged(
+    path: &Path,
+    stamp: ParentFileStamp,
+    line_offset: i64,
+    expected_hash: &[u8; 32],
+) -> bool {
+    guardian_file_unchanged(path, stamp)
+        && guardian_prefix_hash_and_line(path, line_offset)
+            .is_some_and(|(hash, _)| &hash == expected_hash)
+        && guardian_file_unchanged(path, stamp)
+}
+
+#[derive(Clone)]
+struct GuardianFileEvidence {
+    path: PathBuf,
+    stamp: ParentFileStamp,
+    line_offset: i64,
+    prefix_hash: [u8; 32],
+}
+
+// Verify all evidence actually used by a correction immediately before its
+// transaction commits. A source reused by several checkpoints is streamed
+// only once, with digest snapshots at the requested line boundaries.
+fn guardian_evidence_unchanged(evidence: &[GuardianFileEvidence]) -> bool {
+    let mut files: HashMap<&Path, Vec<&GuardianFileEvidence>> = HashMap::new();
+    for entry in evidence {
+        if entry.line_offset <= 0 {
+            return false;
+        }
+        files.entry(&entry.path).or_default().push(entry);
+    }
+    for (path, mut entries) in files {
+        entries.sort_by_key(|entry| entry.line_offset);
+        let Some(first) = entries.first() else {
+            continue;
+        };
+        if entries.iter().any(|entry| entry.stamp != first.stamp) {
+            return false;
+        }
+        let Ok(file) = fs::File::open(path) else {
+            return false;
+        };
+        if ParentFileStamp::from_file(&file) != Some(first.stamp) {
+            return false;
+        }
+        #[cfg(test)]
+        tests::record_guardian_evidence_read(path);
+        let Ok(mut reader) = codex_rollout_file::reader_from_file(path, file) else {
+            return false;
+        };
+        let mut hasher = Sha256::new();
+        let mut line = 1i64;
+        let mut expected_index = 0usize;
+        while expected_index < entries.len() {
+            let Ok(chunk) = reader.fill_buf() else {
+                return false;
+            };
+            if chunk.is_empty() {
+                return false;
+            }
+            let count = chunk
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(chunk.len(), |position| position + 1);
+            let reached_newline = chunk[count - 1] == b'\n';
+            hasher.update(&chunk[..count]);
+            reader.consume(count);
+            if reached_newline {
+                if line == entries[expected_index].line_offset {
+                    let hash: [u8; 32] = hasher.clone().finalize().into();
+                    while expected_index < entries.len()
+                        && entries[expected_index].line_offset == line
+                    {
+                        if entries[expected_index].prefix_hash != hash {
+                            return false;
+                        }
+                        expected_index += 1;
+                    }
+                }
+                line += 1;
+            }
+        }
+        if !guardian_file_unchanged(path, first.stamp) {
+            return false;
+        }
+    }
+    true
+}
+
+fn guardian_info_and_prefix_hash(
+    path: &Path,
+    line_offset: i64,
+) -> Option<(serde_json::Value, DateTime<Utc>, [u8; 32])> {
+    let (hash, bytes) = guardian_prefix_hash_and_line(path, line_offset)?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    if value.get("type")?.as_str()? != "event_msg"
+        || value.pointer("/payload/type")?.as_str()? != "token_count"
+    {
+        return None;
+    }
+    Some((
+        value.pointer("/payload/info")?.clone(),
+        parse_timestamp(value.get("timestamp"))?,
+        hash,
+    ))
+}
+
+struct GuardianSourceFile {
+    meta: GuardianMeta,
+    stamp: ParentFileStamp,
+    parsed: ParsedCodexFile,
+}
+
+fn read_guardian_source(path: &Path, index: &RolloutIndex) -> Option<GuardianSourceFile> {
+    let (meta, stamp, _, _) = open_guardian_file(path)?;
+    let parsed =
+        parse_codex_file_with_index(path, thread_id_from_filename(path), Some(index)).ok()?;
+    if parsed.meta_thread_id.as_deref() != Some(meta.thread_id.as_str())
+        || !guardian_file_unchanged(path, stamp)
+    {
+        return None;
+    }
+    Some(GuardianSourceFile {
+        meta,
+        stamp,
+        parsed,
+    })
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct GuardianUsageRow {
+    request_id: String,
+    session_id: String,
+    model: String,
+    input: u32,
+    cached_input: u32,
+    cache_write_input: u32,
+    output: u32,
+    timestamp: DateTime<Utc>,
+}
+
+fn guardian_usage_row(
+    parsed: &ParsedCodexFile,
+    event: &ParsedTokenEvent,
+) -> Option<GuardianUsageRow> {
+    let timestamp = DateTime::parse_from_rfc3339(event.timestamp.as_deref()?)
+        .ok()?
+        .with_timezone(&Utc);
+    Some(GuardianUsageRow {
+        request_id: format!(
+            "{CODEX_THREAD_REQUEST_ID_PREFIX}:{}:{}",
+            parsed.root_thread_id.as_deref()?,
+            event.event_index?
+        ),
+        session_id: parsed.meta_thread_id.clone()?,
+        model: event.model.clone(),
+        input: event.delta.input,
+        cached_input: event.delta.cached_input,
+        cache_write_input: event.delta.cache_write_input,
+        output: event.delta.output,
+        timestamp,
+    })
+}
+
+#[derive(Clone)]
+struct GuardianAnchor {
+    path: PathBuf,
+    stamp: ParentFileStamp,
+    line_offset: i64,
+    prefix_hash: [u8; 32],
+    row: GuardianUsageRow,
+}
+
+#[derive(Clone)]
+struct GuardianRepair {
+    path: PathBuf,
+    stamp: ParentFileStamp,
+    line_offset: i64,
+    prefix_hash: [u8; 32],
+    row: GuardianUsageRow,
+    anchors: Vec<GuardianAnchor>,
+}
+
+fn guardian_row_present(
+    conn: &rusqlite::Connection,
+    row: &GuardianUsageRow,
+    effective: bool,
+) -> Result<bool, AppError> {
+    let effective_clause = if effective {
+        effective_usage_log_filter("candidate")
+    } else {
+        "1 = 1".to_string()
+    };
+    let sql = format!(
+        "SELECT EXISTS(SELECT 1 FROM proxy_request_logs candidate
+         WHERE candidate.request_id = ?1 AND candidate.session_id = ?2
+           AND candidate.model = ?3 AND candidate.input_tokens = ?4
+           AND candidate.cache_read_tokens = ?5 AND candidate.cache_creation_tokens = ?6
+           AND candidate.output_tokens = ?7 AND candidate.created_at = ?8
+           AND candidate.provider_id = '_codex_session' AND candidate.app_type = 'codex'
+           AND candidate.provider_type = 'codex_session' AND candidate.data_source = 'codex_session'
+           AND candidate.status_code = 200 AND candidate.input_token_semantics = ?9
+           AND ({effective_clause}))"
+    );
+    conn.query_row(
+        &sql,
+        rusqlite::params![
+            row.request_id,
+            row.session_id,
+            row.model,
+            row.input,
+            row.cached_input,
+            row.cache_write_input,
+            row.output,
+            row.timestamp.timestamp(),
+            INPUT_TOKEN_SEMANTICS_TOTAL,
+        ],
+        |result| result.get(0),
+    )
+    .map_err(|error| AppError::Database(format!("校验 Guardian 用量明细失败: {error}")))
+}
+
+fn collect_guardian_repairs(
+    db: &Database,
+    files: &[PathBuf],
+    index: &RolloutIndex,
+    pass: &CodexSyncPass,
+) -> Result<Vec<GuardianRepair>, AppError> {
+    // Only a first, nonzero token_count can be a checkpoint candidate. Avoid
+    // reading any other rollout on subsequent unchanged syncs.
+    let possible_ids: HashSet<String> = {
+        let conn = lock_conn!(db.conn);
+        let mut statement = conn.prepare(
+            "SELECT request_id FROM proxy_request_logs
+             WHERE data_source = 'codex_session' AND provider_id = '_codex_session'
+               AND substr(request_id, -2) = ':1'",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<HashSet<_>, _>>()?
+    };
+    let mut sources: HashMap<PathBuf, Option<GuardianSourceFile>> = HashMap::new();
+    let mut source_info: HashMap<
+        (PathBuf, i64),
+        Option<(serde_json::Value, DateTime<Utc>, [u8; 32])>,
+    > = HashMap::new();
+    let mut repairs = Vec::new();
+    for path in files {
+        let Some(physical_id) = thread_id_from_filename(path) else {
+            continue;
+        };
+        let path_string = path.to_string_lossy().to_string();
+        let unchanged = fs::metadata(path).ok().is_some_and(|metadata| {
+            pass.cursors.get(&path_string).is_some_and(|(modified, _)| {
+                *modified == metadata_modified_nanos(&metadata)
+                    && pass.byte_offsets.get(&path_string).copied().flatten()
+                        == i64::try_from(metadata.len()).ok()
+            })
+        });
+        if unchanged
+            && !possible_ids.contains(&format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{physical_id}:1"))
+        {
+            continue;
+        }
+        let Some(checkpoint) = read_guardian_checkpoint(path) else {
+            continue;
+        };
+        let Some(source_paths) = index.get(&checkpoint.source_thread) else {
+            continue;
+        };
+        let Ok(parsed) = parse_codex_file_with_index(path, Some(physical_id), Some(index)) else {
+            continue;
+        };
+        let Some(event) = parsed.token_events.first() else {
+            continue;
+        };
+        if event.line_offset != checkpoint.line_offset
+            || event.event_index != Some(1)
+            || parsed.meta_thread_id.as_deref() != Some(checkpoint.meta.thread_id.as_str())
+            || !guardian_content_unchanged(
+                path,
+                checkpoint.stamp,
+                checkpoint.line_offset,
+                &checkpoint.prefix_hash,
+            )
+        {
+            continue;
+        }
+        let Some(row) = guardian_usage_row(&parsed, event) else {
+            continue;
+        };
+        if row.timestamp != checkpoint.timestamp {
+            continue;
+        }
+        let mut anchors = Vec::new();
+        for source_path in source_paths {
+            if source_path == path {
+                continue;
+            }
+            let source = sources
+                .entry(source_path.clone())
+                .or_insert_with(|| read_guardian_source(source_path, index));
+            let Some(source) = source.as_ref() else {
+                continue;
+            };
+            if source.meta.thread_id != checkpoint.source_thread
+                || source.meta.parent_id != checkpoint.meta.parent_id
+            {
+                continue;
+            }
+            for source_event in &source.parsed.token_events {
+                let Some(anchor_row) = guardian_usage_row(&source.parsed, source_event) else {
+                    continue;
+                };
+                if anchor_row.timestamp < source.meta.timestamp
+                    || anchor_row.timestamp >= checkpoint.meta.timestamp
+                    || source_event.signature != event.signature
+                {
+                    continue;
+                }
+                let evidence = source_info
+                    .entry((source_path.clone(), source_event.line_offset))
+                    .or_insert_with(|| {
+                        guardian_info_and_prefix_hash(source_path, source_event.line_offset)
+                    });
+                let Some((info, timestamp, prefix_hash)) = evidence.as_ref() else {
+                    continue;
+                };
+                if info != &checkpoint.info
+                    || *timestamp != anchor_row.timestamp
+                    || !guardian_file_unchanged(source_path, source.stamp)
+                {
+                    continue;
+                }
+                anchors.push(GuardianAnchor {
+                    path: source_path.clone(),
+                    stamp: source.stamp,
+                    line_offset: source_event.line_offset,
+                    prefix_hash: *prefix_hash,
+                    row: anchor_row,
+                });
+            }
+        }
+        // A checkpoint without an unambiguous source is not a basis for
+        // changing accounting, even if several events share equal counters.
+        anchors.sort_by(|left, right| left.row.request_id.cmp(&right.row.request_id));
+        anchors.dedup_by(|left, right| left.row.request_id == right.row.request_id);
+        if anchors.len() == 1 {
+            repairs.push(GuardianRepair {
+                path: path.clone(),
+                stamp: checkpoint.stamp,
+                line_offset: checkpoint.line_offset,
+                prefix_hash: checkpoint.prefix_hash,
+                row,
+                anchors,
+            });
+        }
+    }
+    repairs.sort_by_key(|repair| repair.row.timestamp);
+    Ok(repairs)
+}
+
+fn reconcile_guardian_checkpoints(
+    db: &Database,
+    repairs: &[GuardianRepair],
+) -> Result<u64, AppError> {
+    if repairs.is_empty() {
+        return Ok(0);
+    }
+    let conn = lock_conn!(db.conn);
+    let transaction = conn.unchecked_transaction()?;
+    let mut retained_anchors = HashSet::new();
+    let mut deleted = HashSet::new();
+    let mut evidence = Vec::new();
+    let mut corrected = 0u64;
+    for repair in repairs {
+        if retained_anchors.contains(&repair.row.request_id)
+            || !guardian_file_unchanged(&repair.path, repair.stamp)
+            || !guardian_row_present(&transaction, &repair.row, false)?
+        {
+            continue;
+        }
+        for anchor in &repair.anchors {
+            if deleted.contains(&anchor.row.request_id)
+                || !guardian_file_unchanged(&anchor.path, anchor.stamp)
+                || !guardian_row_present(&transaction, &anchor.row, true)?
+            {
+                continue;
+            }
+            let changed = transaction.execute(
+                "DELETE FROM proxy_request_logs
+                 WHERE request_id = ?1 AND data_source = 'codex_session'",
+                [&repair.row.request_id],
+            )?;
+            if changed == 1 {
+                retained_anchors.insert(anchor.row.request_id.clone());
+                deleted.insert(repair.row.request_id.clone());
+                evidence.push(GuardianFileEvidence {
+                    path: repair.path.clone(),
+                    stamp: repair.stamp,
+                    line_offset: repair.line_offset,
+                    prefix_hash: repair.prefix_hash,
+                });
+                evidence.push(GuardianFileEvidence {
+                    path: anchor.path.clone(),
+                    stamp: anchor.stamp,
+                    line_offset: anchor.line_offset,
+                    prefix_hash: anchor.prefix_hash,
+                });
+                corrected += 1;
+            }
+            break;
+        }
+    }
+    if !guardian_evidence_unchanged(&evidence) {
+        return Err(AppError::Config(
+            "Guardian 会话证据在核对期间变化，请重试".to_string(),
+        ));
+    }
+    transaction.commit()?;
+    Ok(corrected)
 }
 
 /// 收集所有 Codex 会话 JSONL 文件
@@ -2631,6 +3382,38 @@ fn sync_single_codex_file(
         let mut batch_suspected = 0u32;
         for (event, suffix) in batch {
             let request_id = format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{root_thread_id}:{suffix}");
+            if let Some(repair) = pass.guardian_repairs.get(file_path) {
+                if guardian_usage_row(&parsed, event).as_ref() == Some(&repair.row)
+                    && guardian_content_unchanged(
+                        &repair.path,
+                        repair.stamp,
+                        repair.line_offset,
+                        &repair.prefix_hash,
+                    )
+                {
+                    let mut accounted = false;
+                    for anchor in &repair.anchors {
+                        if !pass.guardian_repair_ids.contains(&anchor.row.request_id)
+                            && guardian_content_unchanged(
+                                &anchor.path,
+                                anchor.stamp,
+                                anchor.line_offset,
+                                &anchor.prefix_hash,
+                            )
+                            && guardian_row_present(&tx, &anchor.row, true)?
+                        {
+                            accounted = true;
+                            break;
+                        }
+                    }
+                    if accounted {
+                        // Keep the parsed event/index and cumulative baseline;
+                        // only its duplicate derived row is not inserted.
+                        batch_skipped += 1;
+                        continue;
+                    }
+                }
+            }
             match insert_codex_session_entry_on_conn(
                 &tx,
                 &request_id,
@@ -3007,10 +3790,18 @@ mod tests {
     thread_local! {
         static CODEX_PARSE_COUNTS: std::cell::RefCell<HashMap<PathBuf, usize>> =
             std::cell::RefCell::new(HashMap::new());
+        static GUARDIAN_EVIDENCE_READS: std::cell::RefCell<HashMap<PathBuf, usize>> =
+            std::cell::RefCell::new(HashMap::new());
     }
 
     pub(super) fn record_codex_parse(path: &Path) {
         CODEX_PARSE_COUNTS.with(|counts| {
+            *counts.borrow_mut().entry(path.to_path_buf()).or_default() += 1;
+        });
+    }
+
+    pub(super) fn record_guardian_evidence_read(path: &Path) {
+        GUARDIAN_EVIDENCE_READS.with(|counts| {
             *counts.borrow_mut().entry(path.to_path_buf()).or_default() += 1;
         });
     }
@@ -3263,6 +4054,713 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| AppError::Database(error.to_string()))?;
         Ok(rows)
+    }
+
+    fn guardian_test_meta(id: &str, parent: &str, timestamp: &str) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "session_meta",
+            "payload": {
+                "id": id,
+                "parent_thread_id": parent,
+                "history_mode": "paginated",
+                "source": { "subagent": { "other": "guardian" } }
+            }
+        })
+    }
+
+    fn guardian_test_counters(input: u64, cached: u64, output: u64) -> serde_json::Value {
+        serde_json::json!({
+            "input_tokens": input,
+            "cached_input_tokens": cached,
+            "cache_write_input_tokens": 0,
+            "output_tokens": output,
+            "reasoning_output_tokens": 0,
+            "total_tokens": input + output
+        })
+    }
+
+    fn guardian_test_token(
+        total: &serde_json::Value,
+        last: &serde_json::Value,
+        timestamp: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": total, "last_token_usage": last},
+                "rate_limits": null
+            }
+        })
+    }
+
+    fn guardian_test_compaction(
+        source_thread: &str,
+        total: &serde_json::Value,
+        last: &serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "type": "compacted",
+            "payload": {
+                "replacement_history": [{"type": "message", "text": "synthetic fixture"}],
+                "latest_token_usage_record": {
+                    "thread_id": source_thread,
+                    "response_id": "synthetic-response",
+                    "usage": last,
+                    "thread_token_usage": total
+                }
+            }
+        })
+    }
+
+    fn guardian_test_task(timestamp: &str) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": {"type": "task_started"}
+        })
+    }
+
+    fn guardian_test_files(
+        dir: &Path,
+    ) -> (
+        PathBuf,
+        PathBuf,
+        Vec<serde_json::Value>,
+        Vec<serde_json::Value>,
+    ) {
+        let source = rollout_path(dir, CHILD_A_ID);
+        let target = rollout_path(dir, CHILD_B_ID);
+        let total = guardian_test_counters(1000, 100, 100);
+        let last = guardian_test_counters(200, 20, 20);
+        let source_events = vec![
+            guardian_test_meta(CHILD_A_ID, PARENT_ID, "2026-07-10T03:00:00Z"),
+            turn_context_for_model_at("gpt-5", "2026-07-10T03:00:00Z"),
+            guardian_test_task("2026-07-10T03:00:00Z"),
+            guardian_test_token(&total, &last, "2026-07-10T03:00:01Z"),
+        ];
+        let target_events = vec![
+            guardian_test_meta(CHILD_B_ID, PARENT_ID, "2026-07-10T03:20:00Z"),
+            guardian_test_compaction(CHILD_A_ID, &total, &last),
+            serde_json::json!({"type": "world_state", "payload": {}}),
+            turn_context_for_model_at("gpt-5", "2026-07-10T03:20:00Z"),
+            guardian_test_token(&total, &last, "2026-07-10T03:20:01Z"),
+            guardian_test_task("2026-07-10T03:20:02Z"),
+            guardian_test_token(
+                &guardian_test_counters(1300, 130, 130),
+                &guardian_test_counters(300, 30, 30),
+                "2026-07-10T03:20:03Z",
+            ),
+        ];
+        (source, target, source_events, target_events)
+    }
+
+    fn guardian_seed_old_usage(db: &Database, files: &[PathBuf]) -> Result<(), AppError> {
+        let index = build_rollout_index(files);
+        let mut pass = CodexSyncPass::load(db)?;
+        for path in files {
+            sync_single_codex_file(db, path, &index, &mut pass)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn guardian_prefix_hash_covers_same_size_rewrites_and_compressed_streams() {
+        let dir = tempdir().unwrap();
+        let (_, target, _, mut events) = guardian_test_files(dir.path());
+        write_jsonl(&target, &events);
+        let original_size = fs::metadata(&target).unwrap().len();
+        let (original, _) = guardian_prefix_hash_and_line(&target, 5).unwrap();
+        let compressed = compress_rollout(&target);
+        let (compressed_hash, _) = guardian_prefix_hash_and_line(&compressed, 5).unwrap();
+        assert_eq!(
+            original, compressed_hash,
+            "hash the same decoded JSONL bytes"
+        );
+        events[1]["payload"]["replacement_history"][0]["text"] = "synthetic fixturE".into();
+        write_jsonl(&target, &events);
+        assert_eq!(fs::metadata(&target).unwrap().len(), original_size);
+        let (rewritten, _) = guardian_prefix_hash_and_line(&target, 5).unwrap();
+        assert_ne!(
+            original, rewritten,
+            "same-size history rewrites must change the evidence hash"
+        );
+    }
+
+    #[test]
+    fn guardian_evidence_streams_shared_source_once_for_multiple_offsets() {
+        let dir = tempdir().unwrap();
+        let (_, target, _, mut events) = guardian_test_files(dir.path());
+        events[1]["payload"]["replacement_history"][0]["text"] = "x".repeat(1024 * 1024).into();
+        write_jsonl(&target, &events);
+        let compressed = compress_rollout(&target);
+        let stamp = ParentFileStamp::from_file(&fs::File::open(&compressed).unwrap()).unwrap();
+        let (first, _) = guardian_prefix_hash_and_line(&compressed, 5).unwrap();
+        let (second, _) = guardian_prefix_hash_and_line(&compressed, 7).unwrap();
+        let mut evidence = vec![
+            GuardianFileEvidence {
+                path: compressed.clone(),
+                stamp,
+                line_offset: 7,
+                prefix_hash: second,
+            },
+            GuardianFileEvidence {
+                path: compressed.clone(),
+                stamp,
+                line_offset: 5,
+                prefix_hash: first,
+            },
+            GuardianFileEvidence {
+                path: compressed.clone(),
+                stamp,
+                line_offset: 5,
+                prefix_hash: first,
+            },
+        ];
+        GUARDIAN_EVIDENCE_READS.with(|counts| {
+            counts.borrow_mut().remove(&compressed);
+        });
+        assert!(guardian_evidence_unchanged(&evidence));
+        let reads =
+            GUARDIAN_EVIDENCE_READS.with(|counts| counts.borrow().get(&compressed).copied());
+        assert_eq!(
+            reads,
+            Some(1),
+            "one zstd stream for all requested prefix boundaries"
+        );
+        evidence[0].prefix_hash[0] ^= 1;
+        assert!(
+            !guardian_evidence_unchanged(&evidence),
+            "any mismatched boundary invalidates the batch"
+        );
+    }
+
+    // Deliberately opt-in: this diagnostic opens an existing database in
+    // read-only mode, reads session files, and prints aggregate counts only.
+    // It never calls the importer, reconciliation, backup, or schema code.
+    #[test]
+    #[ignore = "requires explicitly provided read-only diagnostic paths"]
+    fn guardian_checkpoint_readonly_diagnostic() -> Result<(), AppError> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let fail = || AppError::Message("Guardian 只读预演无法完成".to_string());
+        let db_path = std::env::var_os("CC_SWITCH_GUARDIAN_AUDIT_DB").ok_or_else(fail)?;
+        let codex_root =
+            std::env::var_os("CC_SWITCH_GUARDIAN_AUDIT_CODEX_HOME").ok_or_else(fail)?;
+        // Opening a WAL database read-only can require a -shm sidecar. Refuse
+        // it up front so even that incidental filesystem write is impossible.
+        let mut header = [0u8; 20];
+        fs::File::open(&db_path)
+            .and_then(|mut file| file.read_exact(&mut header))
+            .map_err(|_| fail())?;
+        if &header[..16] != b"SQLite format 3\0" || header[18] != 1 || header[19] != 1 {
+            return Err(fail());
+        }
+        let connection = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|_| fail())?;
+        if !connection
+            .is_readonly(rusqlite::DatabaseName::Main)
+            .map_err(|_| fail())?
+        {
+            return Err(fail());
+        }
+        // query_only changes this connection's setting only, not the file.
+        connection
+            .execute_batch("PRAGMA query_only = ON")
+            .map_err(|_| fail())?;
+        let db = Database {
+            conn: Mutex::new(connection),
+            log_count_cache: Mutex::new(None),
+        };
+        let files =
+            collect_codex_session_files_strict(Path::new(&codex_root)).map_err(|_| fail())?;
+        let index = build_rollout_index(&files);
+        let pass = CodexSyncPass::load(&db).map_err(|_| fail())?;
+        let repairs = collect_guardian_repairs(&db, &files, &index, &pass).map_err(|_| fail())?;
+
+        let mut warning_ids = HashSet::new();
+        let warning_log = std::env::var_os("CC_SWITCH_GUARDIAN_AUDIT_LOG");
+        if let Some(path) = warning_log.as_ref() {
+            let start = std::env::var("CC_SWITCH_GUARDIAN_AUDIT_LOG_START")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(fail)?;
+            let mut file = fs::File::open(path).map_err(|_| fail())?;
+            let file_len = file.metadata().map_err(|_| fail())?.len();
+            let end = match std::env::var("CC_SWITCH_GUARDIAN_AUDIT_LOG_END") {
+                Ok(value) => value.parse::<u64>().map_err(|_| fail())?,
+                Err(_) => file_len,
+            };
+            if start > end || end > file_len {
+                return Err(fail());
+            }
+            file.seek(SeekFrom::Start(start)).map_err(|_| fail())?;
+            let reader = std::io::BufReader::new(file.take(end - start));
+            for line in reader.lines() {
+                let line = line.map_err(|_| fail())?;
+                if !line.contains("[CODEX-SYNC] 疑似重复会话用量:") {
+                    continue;
+                }
+                let Some((_, suffix)) = line.split_once("request_id=") else {
+                    continue;
+                };
+                let id = suffix.split(',').next().unwrap_or("").trim();
+                if id.starts_with(CODEX_THREAD_REQUEST_ID_PREFIX) {
+                    warning_ids.insert(id.to_string());
+                }
+            }
+        }
+
+        let mut retained_anchors = HashSet::new();
+        let mut selected = HashSet::new();
+        let mut evidence = Vec::new();
+        let mut existing = 0usize;
+        let mut effective_targets = 0usize;
+        {
+            let conn = lock_conn!(db.conn);
+            for repair in &repairs {
+                if !guardian_row_present(&conn, &repair.row, false).map_err(|_| fail())? {
+                    continue;
+                }
+                existing += 1;
+                if guardian_row_present(&conn, &repair.row, true).map_err(|_| fail())? {
+                    effective_targets += 1;
+                }
+                if retained_anchors.contains(&repair.row.request_id)
+                    || !guardian_file_unchanged(&repair.path, repair.stamp)
+                {
+                    continue;
+                }
+                for anchor in &repair.anchors {
+                    if selected.contains(&anchor.row.request_id)
+                        || !guardian_file_unchanged(&anchor.path, anchor.stamp)
+                        || !guardian_row_present(&conn, &anchor.row, true).map_err(|_| fail())?
+                    {
+                        continue;
+                    }
+                    selected.insert(repair.row.request_id.clone());
+                    retained_anchors.insert(anchor.row.request_id.clone());
+                    evidence.push(GuardianFileEvidence {
+                        path: repair.path.clone(),
+                        stamp: repair.stamp,
+                        line_offset: repair.line_offset,
+                        prefix_hash: repair.prefix_hash,
+                    });
+                    evidence.push(GuardianFileEvidence {
+                        path: anchor.path.clone(),
+                        stamp: anchor.stamp,
+                        line_offset: anchor.line_offset,
+                        prefix_hash: anchor.prefix_hash,
+                    });
+                    break;
+                }
+            }
+        }
+        if !guardian_evidence_unchanged(&evidence) {
+            return Err(fail());
+        }
+        let warning_covered = selected.intersection(&warning_ids).count();
+        println!(
+            "{}",
+            serde_json::json!({
+                "files_scanned": files.len(),
+                "proof_candidates": repairs.len(),
+                "existing_target_rows": existing,
+                "effective_target_rows": effective_targets,
+                "would_correct": selected.len(),
+                "warning_log_supplied": warning_log.is_some(),
+                "warning_unique": warning_ids.len(),
+                "warning_covered": warning_covered,
+                "additional_rows": selected.len().saturating_sub(warning_covered),
+                "evidence_verified": true
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn guardian_checkpoint_is_never_inserted_when_source_is_accounted() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let dir = tempdir().unwrap();
+        let (source, target, source_events, target_events) = guardian_test_files(dir.path());
+        write_jsonl(&source, &source_events);
+        write_jsonl(&target, &target_events);
+        let duplicate = format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{CHILD_B_ID}:1");
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute_batch(&format!(
+                "CREATE TEMP TABLE guardian_inserts (request_id TEXT);
+                 CREATE TEMP TRIGGER guardian_count_insert AFTER INSERT ON main.proxy_request_logs
+                 WHEN NEW.request_id = '{duplicate}'
+                 BEGIN INSERT INTO guardian_inserts VALUES (NEW.request_id); END;"
+            ))?;
+        }
+        // Input order is intentionally reversed. This is observable by the
+        // trigger even if a later reconciliation would delete the row.
+        let files = vec![target, source];
+        let result = sync_codex_usage_files(&db, &files)?;
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.imported, 2);
+        let conn = lock_conn!(db.conn);
+        let inserts: i64 = conn.query_row("SELECT COUNT(*) FROM guardian_inserts", [], |row| {
+            row.get(0)
+        })?;
+        assert_eq!(inserts, 0, "checkpoint must never be visible to rollup");
+        drop(conn);
+        let rows = codex_usage_rows(&db)?;
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| row.0
+            == format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{CHILD_B_ID}:2")
+            && (row.1, row.2) == (300, 30)));
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn guardian_checkpoint_does_not_depend_on_an_anchor_being_repaired() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let dir = tempdir().unwrap();
+        let (source, middle, source_events, middle_events) = guardian_test_files(dir.path());
+        let last = rollout_path(dir.path(), PARENT_PAGE_ID);
+        let mut last_events = middle_events.clone();
+        last_events[0]["payload"]["id"] = PARENT_PAGE_ID.into();
+        last_events[0]["timestamp"] = "2026-07-10T03:40:00Z".into();
+        last_events[1]["payload"]["latest_token_usage_record"]["thread_id"] = CHILD_B_ID.into();
+        last_events[3]["timestamp"] = "2026-07-10T03:40:00Z".into();
+        last_events[4]["timestamp"] = "2026-07-10T03:40:01Z".into();
+        last_events[5]["timestamp"] = "2026-07-10T03:40:02Z".into();
+        last_events[6]["timestamp"] = "2026-07-10T03:40:03Z".into();
+        write_jsonl(&source, &source_events);
+        write_jsonl(&middle, &middle_events);
+        write_jsonl(&last, &last_events);
+        guardian_seed_old_usage(&db, &[source.clone(), middle.clone()])?;
+        let result = sync_codex_usage_files(&db, &[last, middle, source])?;
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let rows = codex_usage_rows(&db)?;
+        assert!(!rows
+            .iter()
+            .any(|row| row.0 == format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{CHILD_B_ID}:1")));
+        assert!(
+            rows.iter()
+                .any(|row| row.0 == format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{PARENT_PAGE_ID}:1")),
+            "the last snapshot is retained if its direct anchor is being removed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn guardian_checkpoint_repair_rolls_back_all_rows_on_delete_error() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let dir = tempdir().unwrap();
+        let (source, first, source_events, first_events) = guardian_test_files(dir.path());
+        let second = rollout_path(dir.path(), PARENT_PAGE_ID);
+        let mut second_events = first_events.clone();
+        second_events[0]["payload"]["id"] = PARENT_PAGE_ID.into();
+        second_events[0]["timestamp"] = "2026-07-10T03:40:00Z".into();
+        second_events[3]["timestamp"] = "2026-07-10T03:40:00Z".into();
+        second_events[4]["timestamp"] = "2026-07-10T03:40:01Z".into();
+        second_events[5]["timestamp"] = "2026-07-10T03:40:02Z".into();
+        second_events[6]["timestamp"] = "2026-07-10T03:40:03Z".into();
+        write_jsonl(&source, &source_events);
+        write_jsonl(&first, &first_events);
+        write_jsonl(&second, &second_events);
+        let files = vec![second, first, source];
+        guardian_seed_old_usage(&db, &files)?;
+        let before = codex_usage_rows(&db)?;
+        let fail_id = format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{PARENT_PAGE_ID}:1");
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute_batch(&format!(
+                "CREATE TEMP TRIGGER guardian_abort_delete BEFORE DELETE ON main.proxy_request_logs
+                 WHEN OLD.request_id = '{fail_id}'
+                 BEGIN SELECT RAISE(ABORT, 'synthetic repair failure'); END;"
+            ))?;
+        }
+        let result = sync_codex_usage_files(&db, &files)?;
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(
+            codex_usage_rows(&db)?,
+            before,
+            "the whole correction transaction must roll back"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn guardian_checkpoint_repair_rolls_back_all_rows_on_evidence_change() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let dir = tempdir().unwrap();
+        let (source, first, source_events, first_events) = guardian_test_files(dir.path());
+        let second = rollout_path(dir.path(), PARENT_PAGE_ID);
+        let mut second_events = first_events.clone();
+        second_events[0]["payload"]["id"] = PARENT_PAGE_ID.into();
+        second_events[0]["timestamp"] = "2026-07-10T03:40:00Z".into();
+        second_events[3]["timestamp"] = "2026-07-10T03:40:00Z".into();
+        second_events[4]["timestamp"] = "2026-07-10T03:40:01Z".into();
+        second_events[5]["timestamp"] = "2026-07-10T03:40:02Z".into();
+        second_events[6]["timestamp"] = "2026-07-10T03:40:03Z".into();
+        write_jsonl(&source, &source_events);
+        write_jsonl(&first, &first_events);
+        write_jsonl(&second, &second_events);
+        let files = vec![second, first, source];
+        guardian_seed_old_usage(&db, &files)?;
+        let before_rows = codex_usage_rows(&db)?;
+        let before_cursor = {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO usage_daily_rollups (date, app_type, provider_id, model, request_count, input_tokens) VALUES ('2026-06-01', 'codex', '_codex_session', 'synthetic-model', 7, 700)",
+                [],
+            )?;
+            conn.query_row(
+                "SELECT COUNT(*), SUM(last_line_offset) FROM session_log_sync",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )?
+        };
+        let index = build_rollout_index(&files);
+        let pass = CodexSyncPass::load(&db)?;
+        let mut repairs = collect_guardian_repairs(&db, &files, &index, &pass)?;
+        assert_eq!(repairs.len(), 2);
+        repairs[1].prefix_hash[0] ^= 1;
+        assert!(reconcile_guardian_checkpoints(&db, &repairs).is_err());
+        assert_eq!(
+            codex_usage_rows(&db)?,
+            before_rows,
+            "all tentative deletes must roll back"
+        );
+        let conn = lock_conn!(db.conn);
+        let after_cursor: (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), SUM(last_line_offset) FROM session_log_sync",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(after_cursor, before_cursor);
+        let rollup: (i64, i64) = conn.query_row(
+            "SELECT request_count, input_tokens FROM usage_daily_rollups WHERE date = '2026-06-01'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(rollup, (7, 700));
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn guardian_checkpoint_repairs_old_rows_without_changing_cursors_or_indexes(
+    ) -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let dir = tempdir().unwrap();
+        let (source, target, source_events, target_events) = guardian_test_files(dir.path());
+        write_jsonl(&source, &source_events);
+        write_jsonl(&target, &target_events);
+        let source_bytes = fs::read(&source).unwrap();
+        let target_bytes = fs::read(&target).unwrap();
+        // Deliberately scan the child before its source, and first emulate the
+        // old release that already imported the duplicate and advanced cursors.
+        let files = vec![target.clone(), source.clone()];
+        guardian_seed_old_usage(&db, &files)?;
+        assert_eq!(codex_usage_rows(&db)?.len(), 3);
+        let before = {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO usage_daily_rollups (date, app_type, provider_id, model, request_count, input_tokens) VALUES ('2026-06-01', 'codex', '_codex_session', 'synthetic-model', 7, 700)",
+                [],
+            )?;
+            conn.execute(
+                "CREATE TEMP TABLE guardian_other_snapshot AS SELECT * FROM proxy_request_logs WHERE request_id = ?1",
+                [format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{CHILD_A_ID}:1")],
+            )?;
+            conn.execute_batch(
+                "UPDATE guardian_other_snapshot SET request_id = 'synthetic-other', data_source = 'dsh_session', app_type = 'dsh', provider_id = '_dsh_session';
+                 INSERT INTO proxy_request_logs SELECT * FROM guardian_other_snapshot;
+                 CREATE TEMP TABLE guardian_rollup_snapshot AS SELECT * FROM usage_daily_rollups;",
+            )?;
+            conn.query_row(
+                "SELECT last_line_offset FROM session_log_sync WHERE file_path = ?1",
+                [target.to_string_lossy().as_ref()],
+                |row| row.get::<_, i64>(0),
+            )?
+        };
+        let result = sync_codex_usage_files(&db, &files)?;
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let rows = codex_usage_rows(&db)?;
+        assert_eq!(rows.len(), 2);
+        assert!(rows
+            .iter()
+            .any(|row| row.0 == format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{CHILD_A_ID}:1")));
+        assert!(rows.iter().any(|row| row.0
+            == format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{CHILD_B_ID}:2")
+            && (row.1, row.2) == (300, 30)));
+        let after = {
+            let conn = lock_conn!(db.conn);
+            let changed: i64 = conn.query_row(
+                "SELECT
+                  (SELECT COUNT(*) FROM (SELECT * FROM proxy_request_logs WHERE request_id = 'synthetic-other' EXCEPT SELECT * FROM guardian_other_snapshot)) +
+                  (SELECT COUNT(*) FROM (SELECT * FROM guardian_other_snapshot EXCEPT SELECT * FROM proxy_request_logs WHERE request_id = 'synthetic-other')) +
+                  (SELECT COUNT(*) FROM (SELECT * FROM usage_daily_rollups EXCEPT SELECT * FROM guardian_rollup_snapshot)) +
+                  (SELECT COUNT(*) FROM (SELECT * FROM guardian_rollup_snapshot EXCEPT SELECT * FROM usage_daily_rollups))",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(
+                changed, 0,
+                "other apps and rollups must remain byte-for-byte equivalent"
+            );
+            conn.query_row(
+                "SELECT last_line_offset FROM session_log_sync WHERE file_path = ?1",
+                [target.to_string_lossy().as_ref()],
+                |row| row.get::<_, i64>(0),
+            )?
+        };
+        assert_eq!(before, after);
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert_eq!(fs::read(&target).unwrap(), target_bytes);
+        let again = sync_codex_usage_files(&db, &files)?;
+        assert!(again.errors.is_empty(), "{:?}", again.errors);
+        assert_eq!(codex_usage_rows(&db)?, rows);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn guardian_checkpoint_requires_complete_unambiguous_source_evidence() -> Result<(), AppError> {
+        for case in [
+            "not_guardian",
+            "different_parent",
+            "history_not_array",
+            "task_first",
+            "response_first",
+            "missing_limits",
+            "missing_counter",
+            "different_source_signature",
+            "different_full_info",
+            "ambiguous_source",
+            "source_late",
+            "source_after_target_meta",
+            "source_before_own_meta",
+            "target_before_meta",
+            "invalid_meta_timestamp",
+            "incomplete_source_line",
+            "missing_source_row",
+            "different_target_row",
+            "ineffective_source",
+        ] {
+            clear_codex_replay_caches();
+            let db = Database::memory()?;
+            let dir = tempdir().unwrap();
+            let (source, target, mut source_events, mut target_events) =
+                guardian_test_files(dir.path());
+            match case {
+                "not_guardian" => {
+                    target_events[0]["payload"]["source"]["subagent"]["other"] = "other".into()
+                }
+                "different_parent" => {
+                    source_events[0]["payload"]["parent_thread_id"] = CHILD_B_ID.into()
+                }
+                "history_not_array" => {
+                    target_events[1]["payload"]["replacement_history"] =
+                        serde_json::json!({"not": "an array"})
+                }
+                "task_first" => target_events.insert(4, guardian_test_task("2026-07-10T03:20:00Z")),
+                "response_first" => target_events.insert(
+                    4,
+                    serde_json::json!({"type":"response_item", "payload":{"type":"message"}}),
+                ),
+                "missing_limits" => {
+                    target_events[4]["payload"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("rate_limits");
+                }
+                "missing_counter" => {
+                    target_events[4]["payload"]["info"]["total_token_usage"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("cache_write_input_tokens");
+                }
+                "different_source_signature" => {
+                    source_events[3]["payload"]["info"]["total_token_usage"]
+                        ["reasoning_output_tokens"] = 1.into()
+                }
+                "different_full_info" => {
+                    source_events[3]["payload"]["info"]["model_context_window"] = 16384.into()
+                }
+                "ambiguous_source" => {
+                    source_events.push(guardian_test_token(
+                        &guardian_test_counters(1100, 110, 110),
+                        &guardian_test_counters(100, 10, 10),
+                        "2026-07-10T03:00:02Z",
+                    ));
+                    source_events.push(guardian_test_token(
+                        &guardian_test_counters(1000, 100, 100),
+                        &guardian_test_counters(200, 20, 20),
+                        "2026-07-10T03:00:03Z",
+                    ));
+                }
+                "source_late" => source_events[3]["timestamp"] = "2026-07-10T03:21:00Z".into(),
+                "source_after_target_meta" => {
+                    source_events[3]["timestamp"] = "2026-07-10T03:20:00.500Z".into()
+                }
+                "source_before_own_meta" => {
+                    source_events[3]["timestamp"] = "2026-07-10T02:59:59Z".into()
+                }
+                "target_before_meta" => {
+                    target_events[4]["timestamp"] = "2026-07-10T03:19:59Z".into()
+                }
+                "invalid_meta_timestamp" => target_events[0]["timestamp"] = "not-a-time".into(),
+                _ => {}
+            }
+            write_jsonl(&source, &source_events);
+            write_jsonl(&target, &target_events);
+            if case == "incomplete_source_line" {
+                let mut bytes = fs::read(&source).unwrap();
+                assert_eq!(bytes.pop(), Some(b'\n'));
+                fs::write(&source, bytes).unwrap();
+            }
+            let files = vec![target.clone(), source.clone()];
+            guardian_seed_old_usage(&db, &files)?;
+            {
+                let conn = lock_conn!(db.conn);
+                if case == "missing_source_row" {
+                    conn.execute(
+                        "DELETE FROM proxy_request_logs WHERE request_id = ?1",
+                        [format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{CHILD_A_ID}:1")],
+                    )?;
+                }
+                if case == "different_target_row" {
+                    conn.execute("UPDATE proxy_request_logs SET input_tokens = input_tokens + 1 WHERE request_id = ?1", [format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{CHILD_B_ID}:1")])?;
+                }
+                if case == "ineffective_source" {
+                    conn.execute_batch("CREATE TEMP TABLE guardian_proxy_fixture AS SELECT * FROM proxy_request_logs WHERE 0")?;
+                    conn.execute("INSERT INTO guardian_proxy_fixture SELECT * FROM proxy_request_logs WHERE request_id = ?1", [format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{CHILD_A_ID}:1")])?;
+                    conn.execute_batch("UPDATE guardian_proxy_fixture SET request_id = 'synthetic-proxy', data_source = 'proxy', provider_id = 'synthetic'; INSERT INTO proxy_request_logs SELECT * FROM guardian_proxy_fixture; DROP TABLE guardian_proxy_fixture;")?;
+                }
+            }
+            let before = codex_usage_rows(&db)?;
+            let result = sync_codex_usage_files(&db, &files)?;
+            assert!(result.errors.is_empty(), "{case}: {:?}", result.errors);
+            assert_eq!(codex_usage_rows(&db)?, before, "{case}");
+            assert!(
+                before
+                    .iter()
+                    .any(|row| row.0 == format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{CHILD_B_ID}:1")),
+                "{case}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

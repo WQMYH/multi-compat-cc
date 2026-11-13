@@ -10,6 +10,7 @@ permissions:
 jobs:
   close:
     if: |
+      github.repository == 'farion1231/cc-switch' &&
       github.event.pull_request.author_association != 'OWNER' &&
       github.event.pull_request.author_association != 'COLLABORATOR'
     runs-on: ubuntu-latest

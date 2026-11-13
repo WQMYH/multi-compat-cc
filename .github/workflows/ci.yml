@@ -23,6 +23,7 @@ env:
 
 jobs:
   changes:
+    if: github.repository == 'farion1231/cc-switch'
     name: Detect changed areas
     runs-on: ubuntu-latest
     permissions:
