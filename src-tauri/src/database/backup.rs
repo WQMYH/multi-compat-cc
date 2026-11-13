@@ -9,12 +9,71 @@ use chrono::{Local, Utc};
 use rusqlite::backup::{Backup, StepResult};
 use rusqlite::types::ValueRef;
 use rusqlite::Connection;
+use std::ffi::OsStr;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
+use std::time::SystemTime;
 use tempfile::{Builder, NamedTempFile};
 
 const CC_SWITCH_SQL_EXPORT_HEADER: &str = "-- CC Switch SQLite 导出";
+const DATABASE_BACKUP_RETAIN_COUNT: usize = 1;
+const REQUIRED_DATABASE_TABLES: &[&str] = &[
+    "providers",
+    "provider_endpoints",
+    "mcp_servers",
+    "prompts",
+    "skills",
+    "skill_repos",
+    "settings",
+];
+// Keep large snapshots instead of risking an out-of-memory failure during the
+// in-memory restore rehearsal required before deleting any other snapshot.
+const MAX_RETENTION_RESTORE_CHECK_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Debug)]
+struct PublishedDatabaseBackup {
+    path: PathBuf,
+    collision_paths: Vec<PathBuf>,
+    operation_completed: bool,
+}
+
+impl Drop for PublishedDatabaseBackup {
+    fn drop(&mut self) {
+        if !self.operation_completed {
+            // Do not let a subsequent periodic task erase the recovery points
+            // of an operation that failed after its safety copy was made.
+            BACKUP_RETENTION_SUSPENDED.store(true, Ordering::Release);
+            log::warn!("Database backup retention suspended after an incomplete operation");
+        }
+    }
+}
+
+/// Keeps backup-file operations serialized while a protected database change
+/// runs. Dropping this guard after a failure never prunes existing snapshots.
+pub(crate) struct PendingDatabaseBackup {
+    // Drop the backup before unlocking, so a failed operation suspends
+    // retention before another maintenance task can acquire the lock.
+    backup: Option<PublishedDatabaseBackup>,
+    guard: BackupFileOperationGuard,
+}
+
+impl PendingDatabaseBackup {
+    pub(crate) fn complete(mut self) {
+        if let Some(backup) = &mut self.backup {
+            Database::cleanup_after_published_backup(&self.guard, backup, &[]);
+        }
+    }
+}
+
+struct ManagedDatabaseBackup {
+    path: PathBuf,
+    modified: SystemTime,
+    size: u64,
+    generated_at: chrono::NaiveDateTime,
+    sequence: u64,
+}
 
 /// Bound combined INSERT batches while still amortizing statement parsing.
 /// A row larger than this cap is emitted alone because it cannot be split.
@@ -24,12 +83,185 @@ const INSERT_BATCH_MAX_BYTES: usize = 1024 * 1024;
 /// Serialize every operation that observes or mutates the database-backup
 /// directory. Always acquire this guard before `Database.conn`.
 static BACKUP_FILE_OPERATION_LOCK: Mutex<()> = Mutex::new(());
+// An incomplete safety operation holds retention for the rest of this process.
+// A later startup may retry normal validation and retention.
+static BACKUP_RETENTION_SUSPENDED: AtomicBool = AtomicBool::new(false);
 type BackupFileOperationGuard = MutexGuard<'static, ()>;
 
 fn lock_backup_file_operations() -> Result<BackupFileOperationGuard, AppError> {
     BACKUP_FILE_OPERATION_LOCK
         .lock()
         .map_err(|e| AppError::Database(format!("Backup file operation lock failed: {e}")))
+}
+
+fn suspend_retention_on_backup_error(error: AppError) -> AppError {
+    BACKUP_RETENTION_SUSPENDED.store(true, Ordering::Release);
+    error
+}
+
+/// Only names produced by CC Switch's snapshot publisher are eligible for
+/// automatic retention. Renamed or otherwise unknown files are left alone.
+fn managed_database_backup_key(name: &OsStr) -> Option<(chrono::NaiveDateTime, u64)> {
+    let stem = name
+        .to_str()?
+        .strip_prefix("db_backup_")?
+        .strip_suffix(".db")?;
+    let mut parts = stem.split('_');
+    let date = parts.next()?;
+    let time = parts.next()?;
+    if date.len() != 8
+        || time.len() != 6
+        || !date.bytes().all(|b| b.is_ascii_digit())
+        || !time.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let sequence = match parts.next() {
+        None => 0,
+        Some(value) => {
+            let parsed = value.parse::<u64>().ok()?;
+            if parsed == 0 || parsed.to_string() != value {
+                return None;
+            }
+            parsed
+        }
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    let generated_at =
+        chrono::NaiveDateTime::parse_from_str(&format!("{date}_{time}"), "%Y%m%d_%H%M%S").ok()?;
+    Some((generated_at, sequence))
+}
+
+fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Do not traverse an unexpected link while publishing or pruning snapshots.
+fn ensure_safe_backup_directory_tree(dir: &Path) -> Result<(), AppError> {
+    if !existing_safe_backup_directory_tree(dir)? {
+        return Err(AppError::io(
+            dir,
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+        ));
+    }
+    Ok(())
+}
+
+fn existing_safe_backup_directory_tree(dir: &Path) -> Result<bool, AppError> {
+    if !dir.is_absolute() {
+        return Err(AppError::Config(format!(
+            "数据库备份目录不是绝对路径: {}",
+            dir.display()
+        )));
+    }
+    let ancestors: Vec<_> = dir.ancestors().collect();
+    for component in ancestors.into_iter().rev() {
+        let metadata = match fs::symlink_metadata(component) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(AppError::io(component, error)),
+        };
+        if !metadata.is_dir() || is_reparse_or_symlink(&metadata) {
+            return Err(AppError::Config(format!(
+                "数据库备份目录包含不安全的路径: {}",
+                component.display()
+            )));
+        }
+    }
+    Ok(true)
+}
+
+/// A snapshot with SQLite sidecars may be open or not fully checkpointed.
+/// Never treat its main file as an immutable completed backup.
+fn ensure_no_backup_sidecars(path: &Path) -> Result<(), AppError> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        let sidecar = PathBuf::from(name);
+        match fs::symlink_metadata(&sidecar) {
+            Ok(_) => {
+                return Err(AppError::Config(format!(
+                    "数据库备份可能正在使用，暂缓清理: {}",
+                    sidecar.display()
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(AppError::io(&sidecar, error)),
+        }
+    }
+    Ok(())
+}
+
+fn validate_backup_filename(filename: &str) -> Result<(), AppError> {
+    let stem = filename.strip_suffix(".db").unwrap_or("");
+    let mut components = Path::new(filename).components();
+    let normal =
+        matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
+    let invalid_character = filename
+        .chars()
+        .any(|c| c.is_control() || "<>:\"/\\|?*".contains(c));
+    let device_name = stem
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(&[' ', '.'][..])
+        .to_ascii_uppercase();
+    let is_device = matches!(device_name.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ["COM", "LPT"].iter().any(|prefix| {
+            device_name.strip_prefix(prefix).is_some_and(|suffix| {
+                matches!(
+                    suffix,
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            })
+        });
+    if stem.is_empty()
+        || !normal
+        || filename.contains("..")
+        || invalid_character
+        || stem.ends_with(' ')
+        || stem.ends_with('.')
+        || is_device
+    {
+        return Err(AppError::InvalidInput(
+            "Invalid backup filename".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn safe_existing_backup_file(dir: &Path, filename: &str) -> Result<PathBuf, AppError> {
+    validate_backup_filename(filename)?;
+    ensure_safe_backup_directory_tree(dir)?;
+    let path = dir.join(filename);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(AppError::InvalidInput(format!(
+                "Backup file not found: {filename}"
+            )))
+        }
+        Err(error) => return Err(AppError::io(&path, error)),
+    };
+    if !metadata.is_file() || is_reparse_or_symlink(&metadata) {
+        return Err(AppError::InvalidInput("Unsafe backup file".to_string()));
+    }
+    ensure_no_backup_sidecars(&path)?;
+    Ok(path)
 }
 
 /// `dump_sql` 会写出的 PRAGMA。其余 PRAGMA 一律拒绝——`temp_store_directory`
@@ -232,21 +464,36 @@ impl Database {
         // Keep one main-DB guard across the safety snapshot, local-table read,
         // and final replacement so neither the rollback point nor preserved
         // device-local rows can miss writes that arrived during staging.
-        let backup_path = {
+        let mut published_backup = {
             let mut main_conn = lock_conn!(self.conn);
-            let backup_path =
-                Self::backup_database_file_from_conn(&backup_file_guard, &main_conn, &[])?;
+            let published_backup = Self::backup_database_file_from_conn_with_hook(
+                &backup_file_guard,
+                &main_conn,
+                |_, _| Ok(()),
+            )
+            .map_err(suspend_retention_on_backup_error)?;
             if !preserve_tables.is_empty() {
                 Self::restore_tables(&main_conn, &temp_conn, preserve_tables)?;
             }
             let backup = Backup::new(&temp_conn, &mut main_conn)
                 .map_err(|e| AppError::Database(e.to_string()))?;
             Self::complete_backup(&backup, "替换主数据库")?;
-            backup_path
+            published_backup
         };
 
-        let backup_id = backup_path
-            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+        // Retention happens only after the imported database has been applied.
+        // A failed import keeps every pre-existing snapshot and the safety copy.
+        if let Some(backup) = &mut published_backup {
+            Self::cleanup_after_published_backup(&backup_file_guard, backup, &[]);
+        }
+        let backup_id = published_backup
+            .as_ref()
+            .and_then(|backup| {
+                backup
+                    .path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+            })
             .unwrap_or_default();
 
         Ok(backup_id)
@@ -415,28 +662,88 @@ impl Database {
 
     /// Create a backup if the latest one is older than the configured interval.
     fn backup_if_needed(&self) -> Result<(), AppError> {
+        let app_dir = get_app_config_dir();
+        if !existing_safe_backup_directory_tree(&app_dir)? {
+            return Ok(());
+        }
+        let db_path = app_dir.join("cc-switch.db");
+        match fs::symlink_metadata(&db_path) {
+            Ok(metadata) if metadata.is_file() && !is_reparse_or_symlink(&metadata) => {}
+            Ok(_) => {
+                return Err(AppError::Config(format!(
+                    "数据库路径不安全，跳过备份清理: {}",
+                    db_path.display()
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(AppError::io(&db_path, error)),
+        }
+        let backup_file_guard = lock_backup_file_operations()?;
+        let backup_dir = app_dir.join("backups");
+        let backup_dir_exists = match fs::symlink_metadata(&backup_dir) {
+            Ok(_) => {
+                ensure_safe_backup_directory_tree(&backup_dir)?;
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(AppError::io(&backup_dir, error)),
+        };
         let interval_hours = crate::settings::effective_backup_interval_hours();
         if interval_hours > 0 {
-            let backup_file_guard = lock_backup_file_operations()?;
-            let backup_dir = get_app_config_dir().join("backups");
-            if !backup_dir.exists() {
+            if !backup_dir_exists {
                 self.backup_database_file_locked(&backup_file_guard)?;
+                return Ok(());
             } else {
-                let latest = fs::read_dir(&backup_dir).ok().and_then(|entries| {
-                    entries
-                        .filter_map(|e| e.ok())
-                        .filter(|e| e.path().extension().map(|ext| ext == "db").unwrap_or(false))
-                        .filter_map(|e| e.metadata().ok().and_then(|m| m.modified().ok()))
-                        .max()
-                });
+                let mut latest = None;
+                for entry in fs::read_dir(&backup_dir).map_err(|e| AppError::io(&backup_dir, e))? {
+                    let entry = entry.map_err(|e| AppError::io(&backup_dir, e))?;
+                    if managed_database_backup_key(&entry.file_name()).is_none() {
+                        continue;
+                    }
+                    let path = entry.path();
+                    let metadata =
+                        fs::symlink_metadata(&path).map_err(|e| AppError::io(&path, e))?;
+                    if !metadata.is_file() || is_reparse_or_symlink(&metadata) {
+                        continue;
+                    }
+                    let modified = metadata.modified().map_err(|e| AppError::io(&path, e))?;
+                    if modified
+                        .duration_since(SystemTime::now())
+                        .is_ok_and(|ahead| ahead > std::time::Duration::from_secs(300))
+                    {
+                        log::warn!("数据库备份时间异常，暂不用于计划任务: {}", path.display());
+                        continue;
+                    }
+                    if let Err(error) = ensure_no_backup_sidecars(&path)
+                        .and_then(|()| Self::validate_completed_database_backup(&path))
+                        .and_then(|()| ensure_no_backup_sidecars(&path))
+                    {
+                        log::warn!("数据库备份无法验证，暂不用于计划任务: {error}");
+                        continue;
+                    }
+                    let after = fs::symlink_metadata(&path).map_err(|e| AppError::io(&path, e))?;
+                    if !after.is_file()
+                        || is_reparse_or_symlink(&after)
+                        || after.len() != metadata.len()
+                        || after.modified().map_err(|e| AppError::io(&path, e))? != modified
+                    {
+                        return Err(AppError::Config(format!(
+                            "数据库备份在检查期间发生变化: {}",
+                            path.display()
+                        )));
+                    }
+                    latest = Some(
+                        latest.map_or(modified, |previous: SystemTime| previous.max(modified)),
+                    );
+                }
 
                 let interval_secs = u64::from(interval_hours) * 3600;
                 let needs_backup = match latest {
                     None => true,
-                    Some(last_modified) => {
-                        last_modified.elapsed().unwrap_or_default()
-                            > std::time::Duration::from_secs(interval_secs)
-                    }
+                    Some(last_modified) => last_modified
+                        .elapsed()
+                        .map(|elapsed| elapsed > std::time::Duration::from_secs(interval_secs))
+                        .unwrap_or(true),
                 };
 
                 if needs_backup {
@@ -444,11 +751,13 @@ impl Database {
                         "Periodic backup: latest backup is older than {interval_hours} hours, creating new backup"
                     );
                     self.backup_database_file_locked(&backup_file_guard)?;
+                    return Ok(());
                 }
             }
         }
-
-        Ok(())
+        // Even when no new snapshot is due (or automatic backups are disabled),
+        // converge existing completed snapshots after startup recovery.
+        Self::cleanup_db_backups(&backup_file_guard, &backup_dir, &[])
     }
 
     /// Startup/daily maintenance. Cleanup also runs when backup is disabled or
@@ -478,6 +787,18 @@ impl Database {
         self.backup_database_file_locked(&backup_file_guard)
     }
 
+    /// Publish a safety snapshot without pruning until the caller completes its
+    /// database operation. The caller must not start another backup while held.
+    pub(crate) fn begin_safety_backup(&self) -> Result<PendingDatabaseBackup, AppError> {
+        let guard = lock_backup_file_operations()?;
+        let backup = {
+            let conn = lock_conn!(self.conn);
+            Self::backup_database_file_from_conn_with_hook(&guard, &conn, |_, _| Ok(()))
+                .map_err(suspend_retention_on_backup_error)?
+        };
+        Ok(PendingDatabaseBackup { guard, backup })
+    }
+
     fn backup_database_file_locked(
         &self,
         backup_file_guard: &BackupFileOperationGuard,
@@ -493,26 +814,48 @@ impl Database {
         source_conn: &Connection,
         protected_paths: &[&Path],
     ) -> Result<Option<PathBuf>, AppError> {
-        Self::backup_database_file_from_conn_with_hook(
+        let mut published = Self::backup_database_file_from_conn_with_hook(
             backup_file_guard,
             source_conn,
-            protected_paths,
             |_, _| Ok(()),
         )
+        .map_err(suspend_retention_on_backup_error)?;
+        if let Some(backup) = &mut published {
+            Self::cleanup_after_published_backup(backup_file_guard, backup, protected_paths);
+        }
+        Ok(published.as_ref().map(|backup| backup.path.clone()))
     }
 
     fn backup_database_file_from_conn_with_hook<F>(
         _backup_file_guard: &BackupFileOperationGuard,
         source_conn: &Connection,
-        protected_paths: &[&Path],
         before_publish: F,
-    ) -> Result<Option<PathBuf>, AppError>
+    ) -> Result<Option<PublishedDatabaseBackup>, AppError>
     where
         F: FnOnce(&Path, &Path) -> Result<(), AppError>,
     {
+        let connected_path = match source_conn.path() {
+            Some("") => return Ok(None),
+            Some(path) => Path::new(path),
+            None => return Err(AppError::Config("无法确认当前数据库路径".to_string())),
+        };
         let db_path = get_app_config_dir().join("cc-switch.db");
-        if !db_path.exists() {
-            return Ok(None);
+        let db_parent = db_path
+            .parent()
+            .ok_or_else(|| AppError::Config("无效的数据库路径".to_string()))?;
+        ensure_safe_backup_directory_tree(db_parent)?;
+        let metadata = fs::symlink_metadata(&db_path).map_err(|e| AppError::io(&db_path, e))?;
+        if !metadata.is_file() || is_reparse_or_symlink(&metadata) {
+            return Err(AppError::Config(format!(
+                "数据库路径不安全，无法创建备份: {}",
+                db_path.display()
+            )));
+        }
+        let actual =
+            fs::canonicalize(connected_path).map_err(|e| AppError::io(connected_path, e))?;
+        let expected = fs::canonicalize(&db_path).map_err(|e| AppError::io(&db_path, e))?;
+        if actual != expected {
+            return Err(AppError::Config("数据库连接与备份路径不一致".to_string()));
         }
 
         let backup_dir = db_path
@@ -520,12 +863,15 @@ impl Database {
             .ok_or_else(|| AppError::Config("无效的数据库路径".to_string()))?
             .join("backups");
 
+        ensure_safe_backup_directory_tree(db_parent)?;
         fs::create_dir_all(&backup_dir).map_err(|e| AppError::io(&backup_dir, e))?;
+        ensure_safe_backup_directory_tree(&backup_dir)?;
 
         let base_id = format!("db_backup_{}", Local::now().format("%Y%m%d_%H%M%S"));
         let mut next_suffix = 0;
         let mut backup_path =
             Self::next_available_backup_path(&backup_dir, &base_id, &mut next_suffix);
+        let mut collision_paths = Vec::new();
 
         // Build and validate the backup under a non-.db temporary name. Backup
         // discovery and retention only see the final path after the complete
@@ -554,6 +900,7 @@ impl Database {
                 Ok(()) => break,
                 Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
                     temp_path = error.path;
+                    collision_paths.push(backup_path);
                     backup_path =
                         Self::next_available_backup_path(&backup_dir, &base_id, &mut next_suffix);
                 }
@@ -561,15 +908,33 @@ impl Database {
             }
         }
 
-        // The newly created safety backup must never be the cleanup victim.
-        // During restore, the selected source is protected as well. If the
-        // configured retention is too small to keep both, temporarily exceed
-        // it instead of deleting either side of the recovery operation.
-        let mut cleanup_protected = Vec::with_capacity(protected_paths.len() + 1);
-        cleanup_protected.push(backup_path.as_path());
-        cleanup_protected.extend_from_slice(protected_paths);
-        Self::cleanup_db_backups(&backup_dir, &cleanup_protected)?;
-        Ok(Some(backup_path))
+        Ok(Some(PublishedDatabaseBackup {
+            path: backup_path,
+            collision_paths,
+            operation_completed: false,
+        }))
+    }
+
+    fn cleanup_after_published_backup(
+        backup_file_guard: &BackupFileOperationGuard,
+        backup: &mut PublishedDatabaseBackup,
+        protected_paths: &[&Path],
+    ) {
+        backup.operation_completed = true;
+        let Some(backup_dir) = backup.path.parent() else {
+            log::warn!("Database backup has no parent; retention was skipped");
+            return;
+        };
+        let mut protected =
+            Vec::with_capacity(1 + protected_paths.len() + backup.collision_paths.len());
+        protected.push(backup.path.as_path());
+        protected.extend_from_slice(protected_paths);
+        protected.extend(backup.collision_paths.iter().map(PathBuf::as_path));
+        if let Err(error) = Self::cleanup_db_backups(backup_file_guard, backup_dir, &protected) {
+            // The new backup was already published successfully. Do not report
+            // backup/import/restore as failed solely because retention failed.
+            log::warn!("Database backup retention was deferred: {error}");
+        }
     }
 
     fn next_available_backup_path(
@@ -598,48 +963,220 @@ impl Database {
         }
     }
 
-    /// 清理旧的数据库备份，保留最新的 N 个
-    fn cleanup_db_backups(dir: &Path, protected_paths: &[&Path]) -> Result<(), AppError> {
-        let retain = crate::settings::effective_backup_retain_count();
-        let entries = match fs::read_dir(dir) {
-            Ok(iter) => iter
-                .filter_map(|entry| entry.ok())
-                .filter(|entry| {
-                    entry
-                        .path()
-                        .extension()
-                        .map(|ext| ext == "db")
-                        .unwrap_or(false)
-                })
-                .collect::<Vec<_>>(),
-            Err(_) => return Ok(()),
-        };
-
-        if entries.len() <= retain {
+    /// Keep the latest completed CC Switch snapshot. Unknown files and every
+    /// path needed by an in-progress operation are deliberately preserved.
+    fn cleanup_db_backups(
+        _backup_file_guard: &BackupFileOperationGuard,
+        dir: &Path,
+        protected_paths: &[&Path],
+    ) -> Result<(), AppError> {
+        if BACKUP_RETENTION_SUSPENDED.load(Ordering::Acquire) {
+            log::warn!("Database backup retention remains suspended after an incomplete operation");
             return Ok(());
         }
+        match fs::symlink_metadata(dir) {
+            Ok(_) => ensure_safe_backup_directory_tree(dir)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(AppError::io(dir, error)),
+        }
 
-        let remove_count = entries.len().saturating_sub(retain);
-        let mut sorted = entries;
-        sorted.sort_by_key(|entry| entry.metadata().and_then(|m| m.modified()).ok());
-
-        let mut removed = 0;
-        for entry in sorted {
-            if removed >= remove_count {
-                break;
-            }
+        let mut backups = Vec::new();
+        for entry in fs::read_dir(dir).map_err(|error| AppError::io(dir, error))? {
+            let entry = entry.map_err(|error| AppError::io(dir, error))?;
             let path = entry.path();
-            if protected_paths
+            let Some((generated_at, sequence)) = managed_database_backup_key(&entry.file_name())
+            else {
+                if path.extension().is_some_and(|extension| extension == "db") {
+                    log::warn!("保留名称无法识别的数据库备份: {}", path.display());
+                }
+                continue;
+            };
+            let metadata =
+                fs::symlink_metadata(&path).map_err(|error| AppError::io(&path, error))?;
+            if !metadata.is_file() || is_reparse_or_symlink(&metadata) {
+                log::warn!("保留不安全或无法识别的数据库备份: {}", path.display());
+                continue;
+            }
+            let modified = metadata
+                .modified()
+                .map_err(|error| AppError::io(&path, error))?;
+            if modified
+                .duration_since(SystemTime::now())
+                .is_ok_and(|ahead| ahead > std::time::Duration::from_secs(300))
+            {
+                return Err(AppError::Config(format!(
+                    "数据库备份时间异常，暂缓清理: {}",
+                    path.display()
+                )));
+            }
+            backups.push(ManagedDatabaseBackup {
+                path,
+                modified,
+                size: metadata.len(),
+                generated_at,
+                sequence,
+            });
+        }
+
+        if backups.len() <= DATABASE_BACKUP_RETAIN_COUNT {
+            return Ok(());
+        }
+        backups.sort_by(|left, right| {
+            left.modified
+                .cmp(&right.modified)
+                .then_with(|| left.generated_at.cmp(&right.generated_at))
+                .then_with(|| left.sequence.cmp(&right.sequence))
+        });
+
+        // Validate every candidate before deleting any of them. If an entry is
+        // corrupt, unreadable or changes during validation, retain everything.
+        let unchanged = |backup: &ManagedDatabaseBackup| -> Result<(), AppError> {
+            let metadata = fs::symlink_metadata(&backup.path)
+                .map_err(|error| AppError::io(&backup.path, error))?;
+            if !metadata.is_file()
+                || is_reparse_or_symlink(&metadata)
+                || metadata.len() != backup.size
+                || metadata
+                    .modified()
+                    .map_err(|error| AppError::io(&backup.path, error))?
+                    != backup.modified
+            {
+                return Err(AppError::Config(format!(
+                    "数据库备份在检查期间发生变化: {}",
+                    backup.path.display()
+                )));
+            }
+            Ok(())
+        };
+        for backup in &backups {
+            unchanged(backup)?;
+            ensure_no_backup_sidecars(&backup.path)?;
+            Self::validate_completed_database_backup(&backup.path)?;
+            ensure_no_backup_sidecars(&backup.path)?;
+            unchanged(backup)?;
+        }
+
+        // A just-published snapshot is the first protected path and is the
+        // authoritative newest backup for that operation.
+        let keeper = match protected_paths.first() {
+            Some(protected) => backups
                 .iter()
-                .any(|protected| Self::same_existing_backup_path(&path, protected))
+                .find(|backup| Self::same_existing_backup_path(&backup.path, protected))
+                .ok_or_else(|| {
+                    AppError::Config("新数据库备份已变化，暂缓清理旧备份".to_string())
+                })?,
+            None => &backups[backups.len() - 1],
+        };
+        Self::validate_backup_restore_in_memory(&keeper.path, keeper.size)?;
+        unchanged(keeper)?;
+        ensure_no_backup_sidecars(&keeper.path)?;
+        for backup in &backups {
+            if Self::same_existing_backup_path(&backup.path, &keeper.path)
+                || protected_paths
+                    .iter()
+                    .any(|protected| Self::same_existing_backup_path(&backup.path, protected))
             {
                 continue;
             }
+            unchanged(keeper)?;
+            ensure_no_backup_sidecars(&keeper.path)?;
+            unchanged(backup)?;
+            ensure_no_backup_sidecars(&backup.path)?;
+            if let Err(error) = fs::remove_file(&backup.path) {
+                log::warn!("删除旧数据库备份失败 {}: {}", backup.path.display(), error);
+                return Err(AppError::io(&backup.path, error));
+            }
+        }
+        Ok(())
+    }
 
-            if let Err(err) = fs::remove_file(&path) {
-                log::warn!("删除旧数据库备份失败 {}: {}", path.display(), err);
-            } else {
-                removed += 1;
+    fn validate_completed_database_backup(path: &Path) -> Result<(), AppError> {
+        let connection = Self::open_immutable_backup(path)?;
+        Self::validate_sqlite_integrity(&connection)?;
+        Self::validate_imported_schema(&connection)?;
+        let version = Self::get_user_version(&connection)?;
+        if version > super::SCHEMA_VERSION {
+            return Err(AppError::Config(format!(
+                "数据库备份版本过新，暂缓清理: {} (v{version})",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn open_immutable_backup(path: &Path) -> Result<Connection, AppError> {
+        let mut uri = url::Url::from_file_path(path)
+            .map_err(|_| AppError::Config(format!("无效的数据库备份路径: {}", path.display())))?;
+        uri.query_pairs_mut().append_pair("immutable", "1");
+        Connection::open_with_flags(
+            uri.as_str(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| {
+            AppError::Database(format!("无法检查数据库备份 {}: {error}", path.display()))
+        })
+    }
+
+    /// Exercise the restore staging and schema checks in memory only.
+    fn validate_backup_restore_in_memory(path: &Path, size: u64) -> Result<(), AppError> {
+        if size > MAX_RETENTION_RESTORE_CHECK_BYTES {
+            return Err(AppError::Config(format!(
+                "数据库备份过大，暂缓自动清理: {}",
+                path.display()
+            )));
+        }
+        let source = Self::open_immutable_backup(path)?;
+        let mut staging = Connection::open_in_memory()
+            .map_err(|error| AppError::Database(format!("无法暂存数据库备份检查: {error}")))?;
+        // VACUUM and index construction must not spill this rehearsal to the
+        // host's default temporary directory on another drive.
+        staging
+            .pragma_update(None, "temp_store", "MEMORY")
+            .map_err(|error| AppError::Database(format!("无法设置内存暂存: {error}")))?;
+        {
+            let backup = Backup::new(&source, &mut staging)
+                .map_err(|error| AppError::Database(error.to_string()))?;
+            Self::complete_backup(&backup, "验证数据库备份可恢复性")?;
+        }
+        Self::validate_sqlite_integrity(&staging)?;
+        Self::validate_imported_schema(&staging)?;
+        Self::ensure_incremental_auto_vacuum_on_conn(&staging)?;
+        Self::create_tables_on_conn(&staging)?;
+        Self::apply_schema_migrations_on_conn(&staging)?;
+        Self::ensure_model_pricing_seeded_on_conn(&staging)?;
+        Self::validate_restored_schema_columns(&staging)?;
+        Self::validate_sqlite_integrity(&staging)
+    }
+
+    /// Table names alone do not prove an imported database is usable: SQLite
+    /// leaves an existing table unchanged even if it is missing required
+    /// columns. Compare the migrated staging database to a fresh current schema.
+    fn validate_restored_schema_columns(staging: &Connection) -> Result<(), AppError> {
+        let reference = Connection::open_in_memory()
+            .map_err(|error| AppError::Database(format!("无法检查数据库结构: {error}")))?;
+        reference
+            .pragma_update(None, "temp_store", "MEMORY")
+            .map_err(|error| AppError::Database(format!("无法设置内存暂存: {error}")))?;
+        Self::create_tables_on_conn(&reference)?;
+        Self::apply_schema_migrations_on_conn(&reference)?;
+        for table in REQUIRED_DATABASE_TABLES {
+            let expected = Self::get_table_columns(&reference, table)?;
+            let actual = Self::get_table_columns(staging, table)?;
+            let missing: Vec<_> = expected
+                .iter()
+                .filter(|column| !actual.contains(column))
+                .collect();
+            if !missing.is_empty() {
+                return Err(AppError::Config(format!(
+                    "数据库备份缺少恢复所需字段，暂缓清理: {table} ({})",
+                    missing
+                        .iter()
+                        .map(|column| column.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
             }
         }
         Ok(())
@@ -676,18 +1213,8 @@ impl Database {
     /// from being completed by `create_tables_on_conn`, while allowing a valid
     /// backup whose user-owned configuration tables happen to contain no rows.
     fn validate_imported_schema(conn: &Connection) -> Result<(), AppError> {
-        const REQUIRED_TABLES: &[&str] = &[
-            "providers",
-            "provider_endpoints",
-            "mcp_servers",
-            "prompts",
-            "skills",
-            "skill_repos",
-            "settings",
-        ];
-
         let mut missing = Vec::new();
-        for table in REQUIRED_TABLES {
+        for table in REQUIRED_DATABASE_TABLES {
             if !Self::table_exists(conn, table)? {
                 missing.push(*table);
             }
@@ -1011,26 +1538,9 @@ impl Database {
     where
         F: FnOnce(Option<&Path>) -> Result<(), AppError>,
     {
-        // Security: validate filename to prevent path traversal
-        if filename.contains("..")
-            || filename.contains('/')
-            || filename.contains('\\')
-            || !filename.ends_with(".db")
-        {
-            return Err(AppError::InvalidInput(
-                "Invalid backup filename".to_string(),
-            ));
-        }
-
         let backup_file_guard = lock_backup_file_operations()?;
         let backup_dir = get_app_config_dir().join("backups");
-        let backup_path = backup_dir.join(filename);
-
-        if !backup_path.exists() {
-            return Err(AppError::InvalidInput(format!(
-                "Backup file not found: {filename}"
-            )));
-        }
+        let backup_path = safe_existing_backup_file(&backup_dir, filename)?;
 
         // Open read-only before creating the safety backup. `Connection::open`
         // would recreate a source removed by retention cleanup as an empty DB.
@@ -1068,21 +1578,33 @@ impl Database {
 
         // Keep one main-DB guard across the safety snapshot and final apply so
         // the safety file exactly represents the state being replaced.
-        let safety_backup = {
+        let mut safety_backup = {
             let mut main_conn = lock_conn!(self.conn);
-            let safety_backup = Self::backup_database_file_from_conn(
+            let safety_backup = Self::backup_database_file_from_conn_with_hook(
                 &backup_file_guard,
                 &main_conn,
-                &[backup_path.as_path()],
-            )?;
-            before_replace(safety_backup.as_deref())?;
+                |_, _| Ok(()),
+            )
+            .map_err(suspend_retention_on_backup_error)?;
+            before_replace(safety_backup.as_ref().map(|backup| backup.path.as_path()))?;
             let backup = Backup::new(&staging_conn, &mut main_conn)
                 .map_err(|e| AppError::Database(e.to_string()))?;
             Self::complete_backup(&backup, "恢复主数据库")?;
             safety_backup
         };
+        // The source and safety snapshots remain untouched until replacement
+        // succeeds; after that only the new safety snapshot needs protection.
+        if let Some(backup) = &mut safety_backup {
+            Self::cleanup_after_published_backup(&backup_file_guard, backup, &[]);
+        }
         let safety_id = safety_backup
-            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+            .as_ref()
+            .and_then(|backup| {
+                backup
+                    .path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+            })
             .unwrap_or_default();
 
         log::info!("Database restored from backup: {filename}, safety backup: {safety_id}");
@@ -1091,16 +1613,7 @@ impl Database {
 
     /// Rename a backup file. Returns the new filename.
     pub fn rename_backup(old_filename: &str, new_name: &str) -> Result<String, AppError> {
-        // Validate old filename (path traversal + .db suffix)
-        if old_filename.contains("..")
-            || old_filename.contains('/')
-            || old_filename.contains('\\')
-            || !old_filename.ends_with(".db")
-        {
-            return Err(AppError::InvalidInput(
-                "Invalid backup filename".to_string(),
-            ));
-        }
+        validate_backup_filename(old_filename)?;
 
         // Clean new name
         let trimmed = new_name.trim();
@@ -1118,34 +1631,27 @@ impl Database {
             ));
         }
 
-        // Prevent path traversal in new name
-        if name_part.contains("..")
-            || name_part.contains('/')
-            || name_part.contains('\\')
-            || name_part.contains('\0')
-        {
+        let new_filename = format!("{name_part}.db");
+        validate_backup_filename(&new_filename)?;
+        if managed_database_backup_key(OsStr::new(&new_filename)).is_some() {
             return Err(AppError::InvalidInput(
-                "Invalid characters in new name".to_string(),
+                "The automatic backup naming format is reserved".to_string(),
             ));
         }
 
-        let new_filename = format!("{name_part}.db");
-
         let _backup_file_guard = lock_backup_file_operations()?;
         let backup_dir = get_app_config_dir().join("backups");
-        let old_path = backup_dir.join(old_filename);
+        let old_path = safe_existing_backup_file(&backup_dir, old_filename)?;
         let new_path = backup_dir.join(&new_filename);
 
-        if !old_path.exists() {
-            return Err(AppError::InvalidInput(format!(
-                "Backup file not found: {old_filename}"
-            )));
-        }
-
-        if new_path.exists() {
-            return Err(AppError::InvalidInput(format!(
-                "A backup named '{new_filename}' already exists"
-            )));
+        match fs::symlink_metadata(&new_path) {
+            Ok(_) => {
+                return Err(AppError::InvalidInput(format!(
+                    "A backup named '{new_filename}' already exists"
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(AppError::io(&new_path, error)),
         }
 
         fs::rename(&old_path, &new_path).map_err(|e| AppError::io(&old_path, e))?;
@@ -1155,24 +1661,9 @@ impl Database {
 
     /// Delete a backup file permanently.
     pub fn delete_backup(filename: &str) -> Result<(), AppError> {
-        // Validate filename (path traversal + .db suffix)
-        if filename.contains("..")
-            || filename.contains('/')
-            || filename.contains('\\')
-            || !filename.ends_with(".db")
-        {
-            return Err(AppError::InvalidInput(
-                "Invalid backup filename".to_string(),
-            ));
-        }
-
         let _backup_file_guard = lock_backup_file_operations()?;
-        let backup_path = get_app_config_dir().join("backups").join(filename);
-        if !backup_path.exists() {
-            return Err(AppError::InvalidInput(format!(
-                "Backup file not found: {filename}"
-            )));
-        }
+        let backup_dir = get_app_config_dir().join("backups");
+        let backup_path = safe_existing_backup_file(&backup_dir, filename)?;
 
         fs::remove_file(&backup_path).map_err(|e| AppError::io(&backup_path, e))?;
         log::info!("Deleted backup: {filename}");
@@ -1182,11 +1673,13 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use super::{lock_backup_file_operations, Database};
+    use super::{lock_backup_file_operations, Database, BACKUP_RETENTION_SUSPENDED};
     use crate::error::AppError;
     use crate::settings::{get_settings, update_settings, AppSettings};
     use rusqlite::Connection;
     use serial_test::serial;
+    use std::path::Path;
+    use std::sync::atomic::Ordering;
 
     struct TestHomeGuard {
         previous_test_home: Option<std::ffi::OsString>,
@@ -1195,6 +1688,7 @@ mod tests {
 
     impl TestHomeGuard {
         fn new() -> Self {
+            BACKUP_RETENTION_SUSPENDED.store(false, Ordering::Release);
             let temp_dir = tempfile::tempdir().expect("create isolated test home");
             let previous_test_home = std::env::var_os("CC_SWITCH_TEST_HOME");
             std::env::set_var("CC_SWITCH_TEST_HOME", temp_dir.path());
@@ -1225,6 +1719,7 @@ mod tests {
 
     impl Drop for TestHomeGuard {
         fn drop(&mut self) {
+            BACKUP_RETENTION_SUSPENDED.store(false, Ordering::Release);
             match self.previous_test_home.as_ref() {
                 Some(previous) => std::env::set_var("CC_SWITCH_TEST_HOME", previous),
                 None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
@@ -1250,6 +1745,17 @@ mod tests {
         fn drop(&mut self) {
             let _ = update_settings(self.previous.clone());
         }
+    }
+
+    fn set_backup_modified(path: &std::path::Path, seconds: u64) -> Result<(), AppError> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|error| AppError::io(path, error))?;
+        file.set_times(std::fs::FileTimes::new().set_modified(
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+        ))
+        .map_err(|error| AppError::io(path, error))
     }
 
     #[test]
@@ -2414,6 +2920,10 @@ mod tests {
         let db = Database::init()?;
         let backup_dir = crate::config::get_app_config_dir().join("backups");
         std::fs::create_dir_all(&backup_dir).map_err(|e| AppError::io(&backup_dir, e))?;
+        let previous = db
+            .backup_database_file()?
+            .expect("existing database should have a completed snapshot");
+        let previous_bytes = std::fs::read(&previous).map_err(|e| AppError::io(&previous, e))?;
         let mut files_before = std::fs::read_dir(&backup_dir)
             .map_err(|e| AppError::io(&backup_dir, e))?
             .filter_map(|entry| entry.ok())
@@ -2432,7 +2942,6 @@ mod tests {
             Database::backup_database_file_from_conn_with_hook(
                 &backup_file_guard,
                 &conn,
-                &[],
                 |temp_path, target_path| {
                     assert!(
                         temp_path.exists(),
@@ -2456,6 +2965,11 @@ mod tests {
             .collect::<Vec<_>>();
         visible_after.sort();
         assert_eq!(visible_after, visible_before);
+        assert_eq!(
+            std::fs::read(&previous).map_err(|e| AppError::io(&previous, e))?,
+            previous_bytes,
+            "a failed new snapshot must preserve the prior completed backup"
+        );
         let mut files_after = std::fs::read_dir(&backup_dir)
             .map_err(|e| AppError::io(&backup_dir, e))?
             .filter_map(|entry| entry.ok())
@@ -2470,6 +2984,282 @@ mod tests {
     }
 
     #[test]
+    fn managed_database_backup_names_exclude_renamed_or_invalid_files() {
+        for name in [
+            "db_backup_20261112_231915.db",
+            "db_backup_20261112_231915_12.db",
+        ] {
+            assert!(super::managed_database_backup_key(std::ffi::OsStr::new(name)).is_some());
+        }
+        for name in [
+            "renamed.db",
+            "db_backup_20261312_231915.db",
+            "db_backup_20261112_231915_0.db",
+            "db_backup_20261112_231915_01.db",
+            "db_backup_20261112_231915.db.tmp",
+        ] {
+            assert!(super::managed_database_backup_key(std::ffi::OsStr::new(name)).is_none());
+        }
+    }
+
+    #[test]
+    fn backup_filenames_reject_path_escape_and_windows_device_names() {
+        for name in [
+            "../escape.db",
+            "C:escape.db",
+            "safe.db:stream.db",
+            "CON.db",
+            "lpt1.db",
+            "bad?.db",
+        ] {
+            assert!(super::validate_backup_filename(name).is_err(), "{name}");
+        }
+        for name in ["my-backup.db", "自定义 备份.db"] {
+            assert!(super::validate_backup_filename(name).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn backup_rename_cannot_enter_automatic_namespace() -> Result<(), AppError> {
+        let _test_home = TestHomeGuard::new();
+        let db = Database::init()?;
+        let path = db
+            .backup_database_file()?
+            .expect("file-backed database should create a backup");
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(Database::rename_backup(&name, "db_backup_20990101_000000").is_err());
+        assert!(path.exists());
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn periodic_retention_keeps_one_managed_backup_and_preserves_unknowns() -> Result<(), AppError>
+    {
+        let _test_home = TestHomeGuard::new();
+        let _settings = SettingsGuard::with_backup_retain_count(10);
+        let mut settings = get_settings();
+        settings.backup_interval_hours = Some(0);
+        update_settings(settings).expect("disable periodic snapshot creation");
+        let db = Database::init()?;
+        let latest = db
+            .backup_database_file()?
+            .expect("file-backed database should create a backup");
+        let dir = latest.parent().unwrap();
+        let older = dir.join("db_backup_20000101_000000.db");
+        let middle = dir.join("db_backup_20010101_000000.db");
+        for (path, timestamp) in [(&older, 946_684_800), (&middle, 978_307_200)] {
+            std::fs::copy(&latest, path).map_err(|e| AppError::io(path, e))?;
+            set_backup_modified(path, timestamp)?;
+        }
+        let renamed = dir.join("my-renamed-backup.db");
+        std::fs::write(&renamed, b"user-owned").map_err(|e| AppError::io(&renamed, e))?;
+        let directory = dir.join("db_backup_20020101_000000.db");
+        std::fs::create_dir(&directory).map_err(|e| AppError::io(&directory, e))?;
+
+        db.periodic_backup_if_needed()?;
+
+        assert!(latest.exists());
+        assert!(!older.exists());
+        assert!(!middle.exists());
+        assert_eq!(
+            std::fs::read(&renamed).map_err(|e| AppError::io(&renamed, e))?,
+            b"user-owned"
+        );
+        assert!(directory.is_dir());
+        assert_eq!(get_settings().backup_retain_count, Some(10));
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn corrupt_managed_backup_defers_retention_without_deleting_anything() -> Result<(), AppError> {
+        let _test_home = TestHomeGuard::new();
+        let db = Database::init()?;
+        let completed = db
+            .backup_database_file()?
+            .expect("file-backed database should create a backup");
+        let dir = completed.parent().unwrap();
+        let older = dir.join("db_backup_20000101_000000.db");
+        std::fs::copy(&completed, &older).map_err(|e| AppError::io(&older, e))?;
+        set_backup_modified(&older, 946_684_800)?;
+        let corrupt = dir.join("db_backup_20990101_000000.db");
+        std::fs::write(&corrupt, b"not a sqlite database")
+            .map_err(|e| AppError::io(&corrupt, e))?;
+
+        let guard = lock_backup_file_operations()?;
+        assert!(Database::cleanup_db_backups(&guard, dir, &[]).is_err());
+        assert!(completed.exists());
+        assert!(older.exists());
+        assert!(corrupt.exists());
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn safety_backup_prunes_only_after_the_protected_operation_succeeds() -> Result<(), AppError> {
+        let _test_home = TestHomeGuard::new();
+        let db = Database::init()?;
+        let previous = db
+            .backup_database_file()?
+            .expect("file-backed database should create a backup");
+        let older = previous
+            .parent()
+            .unwrap()
+            .join("db_backup_20000101_000000.db");
+        std::fs::copy(&previous, &older).map_err(|error| AppError::io(&older, error))?;
+        set_backup_modified(&older, 946_684_800)?;
+
+        let pending = db.begin_safety_backup()?;
+        let failed_operation_safety = pending.backup.as_ref().unwrap().path.clone();
+        assert!(previous.exists());
+        assert!(older.exists());
+        drop(pending);
+        assert!(previous.exists());
+        assert!(older.exists());
+        assert!(failed_operation_safety.exists());
+
+        let pending = db.begin_safety_backup()?;
+        let successful_operation_safety = pending.backup.as_ref().unwrap().path.clone();
+        assert!(previous.exists());
+        assert!(older.exists());
+        pending.complete();
+        assert!(previous.exists());
+        assert!(older.exists());
+        assert!(failed_operation_safety.exists());
+        assert!(successful_operation_safety.exists());
+
+        // A restart clears the in-process hold, then normal validation may
+        // converge the completed snapshots to the latest one.
+        BACKUP_RETENTION_SUSPENDED.store(false, Ordering::Release);
+        let guard = lock_backup_file_operations()?;
+        Database::cleanup_db_backups(&guard, successful_operation_safety.parent().unwrap(), &[])?;
+        assert!(!previous.exists());
+        assert!(!older.exists());
+        assert!(!failed_operation_safety.exists());
+        assert!(successful_operation_safety.exists());
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn retention_defers_for_sqlite_sidecars_or_future_schema() -> Result<(), AppError> {
+        let _test_home = TestHomeGuard::new();
+        let db = Database::init()?;
+        let completed = db
+            .backup_database_file()?
+            .expect("file-backed database should create a backup");
+        let dir = completed.parent().unwrap();
+        let older = dir.join("db_backup_20000101_000000.db");
+        std::fs::copy(&completed, &older).map_err(|e| AppError::io(&older, e))?;
+        set_backup_modified(&older, 946_684_800)?;
+
+        let mut sidecar_name = completed.as_os_str().to_os_string();
+        sidecar_name.push("-wal");
+        let sidecar = std::path::PathBuf::from(sidecar_name);
+        std::fs::write(&sidecar, b"in use").map_err(|e| AppError::io(&sidecar, e))?;
+        {
+            let guard = lock_backup_file_operations()?;
+            let error = Database::cleanup_db_backups(&guard, dir, &[])
+                .expect_err("an in-use sidecar must defer retention");
+            assert!(error.to_string().contains("正在使用"), "{error}");
+        }
+        assert!(completed.exists());
+        assert!(older.exists());
+        assert!(sidecar.exists());
+        std::fs::remove_file(&sidecar).map_err(|e| AppError::io(&sidecar, e))?;
+
+        let future = dir.join("db_backup_20990101_000000.db");
+        std::fs::copy(&completed, &future).map_err(|e| AppError::io(&future, e))?;
+        {
+            let conn = Connection::open(&future)?;
+            Database::set_user_version(&conn, crate::database::SCHEMA_VERSION + 1)?;
+        }
+        let guard = lock_backup_file_operations()?;
+        let error = Database::cleanup_db_backups(&guard, dir, &[])
+            .expect_err("a future-schema snapshot must defer retention");
+        assert!(error.to_string().contains("版本过新"), "{error}");
+        assert!(completed.exists());
+        assert!(older.exists());
+        assert!(future.exists());
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn retention_keeps_older_backups_when_newest_cannot_be_restored() -> Result<(), AppError> {
+        let _test_home = TestHomeGuard::new();
+        let db = Database::init()?;
+        let completed = db
+            .backup_database_file()?
+            .expect("file-backed database should create a backup");
+        let dir = completed.parent().unwrap();
+        let malformed = dir.join("db_backup_20990101_000000.db");
+        std::fs::copy(&completed, &malformed).map_err(|e| AppError::io(&malformed, e))?;
+        {
+            let conn = Connection::open(&malformed)?;
+            conn.execute_batch("DROP TABLE providers; CREATE TABLE providers (id TEXT);")?;
+        }
+        let next_second = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 1;
+        set_backup_modified(&malformed, next_second)?;
+        Database::validate_completed_database_backup(&malformed)?;
+
+        let guard = lock_backup_file_operations()?;
+        assert!(Database::cleanup_db_backups(&guard, dir, &[]).is_err());
+        assert!(
+            completed.exists(),
+            "the previous restorable snapshot must remain"
+        );
+        assert!(
+            malformed.exists(),
+            "the suspect snapshot must not be deleted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn retention_accepts_a_restorable_v25_backup_without_modifying_it() -> Result<(), AppError> {
+        let _test_home = TestHomeGuard::new();
+        let db = Database::init()?;
+        let older = db
+            .backup_database_file()?
+            .expect("file-backed database should create a backup");
+        let dir = older.parent().unwrap();
+        let v25 = dir.join("db_backup_20990101_000000.db");
+        std::fs::copy(&older, &v25).map_err(|error| AppError::io(&v25, error))?;
+        {
+            let conn = Connection::open(&v25)?;
+            conn.execute_batch(
+                "ALTER TABLE mcp_servers DROP COLUMN enabled_workbuddy;
+                 ALTER TABLE skills DROP COLUMN enabled_workbuddy;
+                 PRAGMA user_version = 25;",
+            )?;
+        }
+        let next_second = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 1;
+        set_backup_modified(&v25, next_second)?;
+        let guard = lock_backup_file_operations()?;
+        Database::cleanup_db_backups(&guard, dir, &[])?;
+        assert!(!older.exists());
+        assert!(v25.exists());
+        let conn = Connection::open_with_flags(&v25, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        assert_eq!(Database::get_user_version(&conn)?, 25);
+        assert!(!Database::get_table_columns(&conn, "mcp_servers")?
+            .iter()
+            .any(|column| column == "enabled_workbuddy"));
+        Ok(())
+    }
+
+    #[test]
     #[serial]
     fn backup_publish_retries_a_noclobber_name_collision() -> Result<(), AppError> {
         let _test_home = TestHomeGuard::new();
@@ -2480,25 +3270,39 @@ mod tests {
         let published_path = {
             let backup_file_guard = lock_backup_file_operations()?;
             let conn = crate::database::lock_conn!(db.conn);
-            Database::backup_database_file_from_conn_with_hook(
+            let mut published = Database::backup_database_file_from_conn_with_hook(
                 &backup_file_guard,
                 &conn,
-                &[],
-                |_, target_path| {
+                |temp_path, target_path| {
                     claimed_path = Some(target_path.to_path_buf());
-                    std::fs::write(target_path, b"claimed by another process")
+                    std::fs::copy(temp_path, target_path)
                         .map_err(|e| AppError::io(target_path, e))?;
+                    let claimed = Connection::open(target_path)?;
+                    claimed.execute(
+                        "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                         VALUES ('claimed', 'claude', 'Claimed', '{}', '{}')",
+                        [],
+                    )?;
                     Ok(())
                 },
             )?
-            .expect("file-backed database should create a backup")
+            .expect("file-backed database should create a backup");
+            Database::cleanup_after_published_backup(&backup_file_guard, &mut published, &[]);
+            published.path.clone()
         };
 
         let claimed_path = claimed_path.expect("publish hook should receive the first target");
         assert_ne!(published_path, claimed_path);
+        let claimed_conn =
+            Connection::open_with_flags(&claimed_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let claimed_count: i64 = claimed_conn.query_row(
+            "SELECT COUNT(*) FROM providers WHERE id = 'claimed'",
+            [],
+            |row| row.get(0),
+        )?;
         assert_eq!(
-            std::fs::read(&claimed_path).map_err(|e| AppError::io(&claimed_path, e))?,
-            b"claimed by another process"
+            claimed_count, 1,
+            "the concurrently claimed file must remain untouched"
         );
         let published_conn = Connection::open_with_flags(
             &published_path,
@@ -2544,13 +3348,13 @@ mod tests {
             let source_path = db
                 .backup_database_file()?
                 .expect("file-backed database should create a backup");
-            source_filenames.push(
-                source_path
-                    .file_name()
-                    .expect("backup should have a filename")
-                    .to_string_lossy()
-                    .into_owned(),
-            );
+            let generated_name = source_path
+                .file_name()
+                .expect("backup should have a filename")
+                .to_string_lossy()
+                .into_owned();
+            // Renamed snapshots are intentionally outside automatic retention.
+            source_filenames.push(Database::rename_backup(&generated_name, provider_id)?);
         }
 
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
@@ -2766,7 +3570,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn restore_with_retain_one_keeps_source_and_exact_safety_snapshot() -> Result<(), AppError> {
+    fn restore_keeps_both_until_success_then_retains_the_safety_snapshot() -> Result<(), AppError> {
         let _test_home = TestHomeGuard::new();
         let _settings = SettingsGuard::with_backup_retain_count(1);
         let db = Database::init()?;
@@ -2789,8 +3593,13 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         let backup_dir = crate::config::get_app_config_dir().join("backups");
-        let stale_path = backup_dir.join("stale-unprotected.db");
-        std::fs::write(&stale_path, b"stale").map_err(|e| AppError::io(&stale_path, e))?;
+        let stale_path = backup_dir.join("db_backup_20000101_000000.db");
+        std::fs::copy(&source_path, &stale_path).map_err(|e| AppError::io(&stale_path, e))?;
+        for path in [&source_path, &stale_path] {
+            set_backup_modified(path, 946_684_800)?;
+        }
+        let unknown_path = backup_dir.join("user-renamed.db");
+        std::fs::write(&unknown_path, b"user file").map_err(|e| AppError::io(&unknown_path, e))?;
 
         {
             let conn = crate::database::lock_conn!(db.conn);
@@ -2802,11 +3611,19 @@ mod tests {
             )?;
         }
 
-        let safety_id = db.restore_from_backup(&source_filename)?;
+        let safety_id = db.restore_from_backup_with_hook(&source_filename, |safety_path| {
+            assert!(source_path.exists(), "restore source must remain in use");
+            assert!(stale_path.exists(), "retention must wait for replacement");
+            assert!(
+                safety_path.is_some_and(Path::exists),
+                "safety snapshot must exist"
+            );
+            Ok(())
+        })?;
         let safety_path = backup_dir.join(format!("{safety_id}.db"));
         assert!(
-            source_path.exists(),
-            "selected restore source must be retained"
+            !source_path.exists(),
+            "older managed restore source is removed only after success"
         );
         assert!(
             safety_path.exists(),
@@ -2816,6 +3633,11 @@ mod tests {
             !stale_path.exists(),
             "retention should still remove an unprotected stale backup"
         );
+        assert_eq!(
+            std::fs::read(&unknown_path).map_err(|e| AppError::io(&unknown_path, e))?,
+            b"user file",
+            "unrecognized user files must not be removed"
+        );
 
         let backup_count = std::fs::read_dir(&backup_dir)
             .map_err(|e| AppError::io(&backup_dir, e))?
@@ -2824,7 +3646,7 @@ mod tests {
             .count();
         assert_eq!(
             backup_count, 2,
-            "retain=1 may be exceeded temporarily to protect both recovery endpoints"
+            "one managed snapshot and the unrecognized user file remain"
         );
 
         let live_provider: String = {
@@ -2840,6 +3662,54 @@ mod tests {
         assert_eq!(
             safety_provider, "live-before-restore",
             "safety backup must exactly represent the live state being replaced"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn failed_restore_keeps_source_safety_and_older_snapshots() -> Result<(), AppError> {
+        let _test_home = TestHomeGuard::new();
+        let db = Database::init()?;
+        let source = db
+            .backup_database_file()?
+            .expect("file-backed database should create a backup");
+        let source_name = source.file_name().unwrap().to_string_lossy().into_owned();
+        let older = source
+            .parent()
+            .unwrap()
+            .join("db_backup_20000101_000000.db");
+        std::fs::copy(&source, &older).map_err(|e| AppError::io(&older, e))?;
+        set_backup_modified(&older, 946_684_800)?;
+        {
+            let conn = crate::database::lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                 VALUES ('live-before-failure', 'claude', 'Live', '{}', '{}')",
+                [],
+            )?;
+        }
+
+        let mut safety = None;
+        let result = db.restore_from_backup_with_hook(&source_name, |path| {
+            safety = path.map(Path::to_path_buf);
+            Err(AppError::Config(
+                "simulated replacement failure".to_string(),
+            ))
+        });
+        assert!(result.is_err());
+        assert!(source.exists());
+        assert!(older.exists());
+        assert!(safety.as_ref().is_some_and(|path| path.exists()));
+        let conn = crate::database::lock_conn!(db.conn);
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM providers WHERE id = 'live-before-failure'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            count, 1,
+            "failed replacement must not change the live database"
         );
         Ok(())
     }
@@ -2867,11 +3737,20 @@ mod tests {
                 .to_ascii_uppercase()
         );
 
-        db.restore_from_backup(&case_variant)?;
-        assert!(
-            source_path.exists(),
-            "retention must recognize a case-variant path as the selected source"
-        );
+        let safety_id = db.restore_from_backup_with_hook(&case_variant, |safety_path| {
+            assert!(
+                source_path.exists(),
+                "the case-variant source must remain throughout replacement"
+            );
+            assert!(safety_path.is_some_and(Path::exists));
+            Ok(())
+        })?;
+        assert!(!source_path.exists());
+        assert!(source_path
+            .parent()
+            .unwrap()
+            .join(format!("{safety_id}.db"))
+            .exists());
         Ok(())
     }
 

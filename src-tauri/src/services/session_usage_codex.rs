@@ -1067,7 +1067,14 @@ pub(crate) fn sync_codex_usage_in(
     codex_dir: &Path,
 ) -> Result<SessionSyncResult, AppError> {
     let files = collect_codex_session_files(codex_dir);
-    let rollout_index = build_rollout_index(&files);
+    sync_codex_usage_files(db, &files)
+}
+
+pub(crate) fn sync_codex_usage_files(
+    db: &Database,
+    files: &[PathBuf],
+) -> Result<SessionSyncResult, AppError> {
+    let rollout_index = build_rollout_index(files);
     let mut pass = CodexSyncPass::load(db)?;
 
     let mut result = SessionSyncResult {
@@ -1079,7 +1086,7 @@ pub(crate) fn sync_codex_usage_in(
         errors: vec![],
     };
 
-    for file_path in &files {
+    for file_path in files {
         match sync_single_codex_file(db, file_path, &rollout_index, &mut pass) {
             Ok(file_result) => {
                 result.imported = result.imported.saturating_add(file_result.imported);
@@ -1119,7 +1126,7 @@ fn collect_codex_session_files(codex_dir: &Path) -> Vec<PathBuf> {
     // 1. 扫描 sessions/YYYY/MM/DD/*.jsonl（日期分区目录）
     let sessions_dir = codex_dir.join("sessions");
     if sessions_dir.is_dir() {
-        collect_jsonl_recursive(&sessions_dir, &mut files, 0, 3);
+        collect_jsonl_recursive(&sessions_dir, &mut files, 0, SESSION_DIRECTORY_DEPTH);
     }
 
     // 2. 扫描 archived_sessions/*.jsonl（扁平归档目录）
@@ -1135,6 +1142,71 @@ fn collect_codex_session_files(codex_dir: &Path) -> Vec<PathBuf> {
         }
     }
 
+    sort_and_dedupe_rollouts(files)
+}
+
+const SESSION_DIRECTORY_DEPTH: u32 = 3;
+
+/// Collect the full list before a rebuild can clear any usage rows.
+pub(crate) fn collect_codex_session_files_strict(
+    codex_dir: &Path,
+) -> Result<Vec<PathBuf>, AppError> {
+    let mut files = Vec::new();
+    for (name, depth) in [
+        ("sessions", SESSION_DIRECTORY_DEPTH),
+        ("archived_sessions", 0),
+    ] {
+        let dir = codex_dir.join(name);
+        // An absent root is optional. A dangling link, or a root that becomes
+        // unreadable after this check, must still make the preflight fail.
+        match fs::symlink_metadata(&dir) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(AppError::io(&dir, error)),
+        }
+        let metadata = fs::metadata(&dir).map_err(|error| AppError::io(&dir, error))?;
+        if !metadata.is_dir() {
+            return Err(AppError::io(
+                &dir,
+                std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    "expected a Codex session directory",
+                ),
+            ));
+        }
+        collect_rollouts_strict(&dir, &mut files, depth)?;
+    }
+    Ok(sort_and_dedupe_rollouts(files))
+}
+
+fn collect_rollouts_strict(
+    dir: &Path,
+    files: &mut Vec<PathBuf>,
+    remaining_depth: u32,
+) -> Result<(), AppError> {
+    let entries = fs::read_dir(dir).map_err(|error| AppError::io(dir, error))?;
+    for entry in entries {
+        let path = entry.map_err(|error| AppError::io(dir, error))?.path();
+        let metadata = fs::metadata(&path).map_err(|error| AppError::io(&path, error))?;
+        if metadata.is_dir() && remaining_depth > 0 {
+            collect_rollouts_strict(&path, files, remaining_depth - 1)?;
+        } else if codex_rollout_file::is_rollout_file(&path) {
+            if !metadata.is_file() {
+                return Err(AppError::io(
+                    &path,
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "expected a Codex rollout file",
+                    ),
+                ));
+            }
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn sort_and_dedupe_rollouts(mut files: Vec<PathBuf>) -> Vec<PathBuf> {
     files.sort();
     // 压缩 / 解压的瞬间两种形态并存时只读普通形态，避免同一线程出现两个候选
     codex_rollout_file::dedupe_siblings(files)
@@ -4772,6 +4844,60 @@ mod tests {
     fn test_collect_codex_session_files_nonexistent() {
         let files = collect_codex_session_files(Path::new("/nonexistent/path"));
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn strict_codex_collection_respects_depth_and_deduplicates_rollouts() {
+        let root = tempdir().unwrap();
+        assert!(collect_codex_session_files_strict(root.path())
+            .unwrap()
+            .is_empty());
+
+        let sessions = root
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("10");
+        fs::create_dir_all(sessions.join("too-deep")).unwrap();
+        let plain = sessions.join("active.jsonl");
+        fs::write(&plain, []).unwrap();
+        fs::write(sessions.join("active.jsonl.zst"), []).unwrap();
+        fs::write(sessions.join("too-deep").join("ignored.jsonl"), []).unwrap();
+        assert_eq!(
+            collect_codex_session_files_strict(root.path()).unwrap(),
+            [plain.clone()]
+        );
+
+        let archives = root.path().join("archived_sessions");
+        fs::create_dir_all(archives.join("nested")).unwrap();
+        let compressed = archives.join("archived.jsonl.zst");
+        fs::write(&compressed, []).unwrap();
+        fs::write(archives.join("nested").join("ignored.jsonl"), []).unwrap();
+        let mut expected = vec![plain, compressed];
+        expected.sort();
+        assert_eq!(
+            collect_codex_session_files_strict(root.path()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn strict_codex_collection_rejects_a_non_directory_root_after_a_valid_root() {
+        let root = tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        let file = sessions.join("active.jsonl");
+        fs::write(&file, []).unwrap();
+        let archives = root.path().join("archived_sessions");
+        fs::write(&archives, []).unwrap();
+
+        let error = collect_codex_session_files_strict(root.path()).unwrap_err();
+        assert!(
+            matches!(error, AppError::Io { path, source } if path == archives.display().to_string()
+                && source.kind() == std::io::ErrorKind::NotADirectory)
+        );
+        assert_eq!(collect_codex_session_files(root.path()), [file]);
     }
 
     #[test]

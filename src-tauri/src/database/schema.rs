@@ -20,6 +20,20 @@ impl Database {
         Self::create_tables_on_conn(&conn)
     }
 
+    /// Keep startup compatibility changes and schema migration in one outer
+    /// transaction, so a failed migration also rolls back earlier DDL.
+    pub(crate) fn initialize_schema(&self) -> Result<(), AppError> {
+        let conn = lock_conn!(self.conn);
+        Self::initialize_schema_on_conn(&conn)
+    }
+
+    fn initialize_schema_on_conn(conn: &Connection) -> Result<(), AppError> {
+        Self::in_savepoint(conn, "startup_schema", || {
+            Self::create_tables_on_conn(conn)?;
+            Self::apply_schema_migrations_on_conn(conn)
+        })
+    }
+
     /// 在指定连接上创建表（供迁移和测试使用）
     pub(crate) fn create_tables_on_conn(conn: &Connection) -> Result<(), AppError> {
         Self::in_savepoint(conn, "create_tables", || {
@@ -4377,6 +4391,189 @@ mod tests {
         assert_eq!(skill, (0, 0, 1));
         Database::apply_schema_migrations_on_conn(&conn)?;
         assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn v25_startup_migrates_without_a_pre_migration_backup() -> Result<(), AppError> {
+        const FIXTURE_ENV: &str = "CC_SWITCH_TEST_V25_STARTUP_FIXTURE";
+        if let Some(fixture) = std::env::var_os(FIXTURE_ENV).map(std::path::PathBuf::from) {
+            let app_dir = fixture.join(".cc-switch");
+            assert_eq!(crate::config::get_app_config_dir(), app_dir);
+            assert_eq!(SCHEMA_VERSION, 26);
+            let db = Database::init()?;
+            let conn = lock_conn!(db.conn);
+            assert_eq!(Database::get_user_version(&conn)?, 26);
+            let row = conn.query_row(
+                "SELECT id, name, server_config, enabled_copilot, enabled_workbuddy
+                 FROM mcp_servers",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i32>(3)?,
+                        row.get::<_, i32>(4)?,
+                    ))
+                },
+            )?;
+            assert_eq!(row, ("v25-mcp".into(), "V25 MCP".into(), "{}".into(), 1, 0));
+            assert!(!app_dir.join("backups").exists());
+            return Ok(());
+        }
+
+        let fixture = tempfile::tempdir().unwrap();
+        let app_dir = fixture.path().join(".cc-switch");
+        std::fs::create_dir(&app_dir).unwrap();
+        let conn = Connection::open(app_dir.join("cc-switch.db"))?;
+        // Start in INCREMENTAL mode so this test isolates the pre-migration backup.
+        conn.execute_batch(
+            "PRAGMA auto_vacuum = INCREMENTAL;
+             CREATE TABLE mcp_servers (
+                 id TEXT PRIMARY KEY, name TEXT NOT NULL, server_config TEXT NOT NULL,
+                 enabled_copilot BOOLEAN NOT NULL DEFAULT 0
+             );
+             INSERT INTO mcp_servers VALUES ('v25-mcp', 'V25 MCP', '{}', 1);",
+        )?;
+        Database::set_user_version(&conn, 25)?;
+        drop(conn);
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "database::schema::tests::v25_startup_migrates_without_a_pre_migration_backup",
+                "--nocapture",
+            ])
+            .env(FIXTURE_ENV, fixture.path())
+            .env("CC_SWITCH_TEST_HOME", fixture.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("1 passed"), "{stdout}");
+        Ok(())
+    }
+
+    #[test]
+    fn v25_startup_failure_rolls_back_earlier_compatibility_changes() -> Result<(), AppError> {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO settings VALUES ('current_profile_id', 'saved-profile');
+             CREATE TABLE mcp_servers (
+                 id TEXT PRIMARY KEY, name TEXT NOT NULL, server_config TEXT NOT NULL,
+                 enabled_copilot BOOLEAN NOT NULL DEFAULT 0
+             );
+             CREATE TABLE failover_queue (id TEXT PRIMARY KEY);
+             INSERT INTO failover_queue VALUES ('preserve-me');",
+        )?;
+        Database::set_user_version(&conn, 25)?;
+        let attempted_version = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&attempted_version);
+        conn.authorizer(Some(move |context: AuthContext<'_>| match context.action {
+            AuthAction::Pragma {
+                pragma_name: "user_version",
+                pragma_value: Some("26"),
+            } => {
+                observed.store(true, Ordering::Relaxed);
+                Authorization::Deny
+            }
+            _ => Authorization::Allow,
+        }));
+        let result = Database::initialize_schema_on_conn(&conn);
+        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+        assert!(result.is_err());
+        assert!(
+            attempted_version.load(Ordering::Relaxed),
+            "failure must occur after compatibility changes"
+        );
+        assert!(conn.is_autocommit());
+        assert_eq!(Database::get_user_version(&conn)?, 25);
+        let profile: String = conn.query_row(
+            "SELECT value FROM settings WHERE key = 'current_profile_id'",
+            [],
+            |row| row.get(0),
+        )?;
+        let queue: String =
+            conn.query_row("SELECT id FROM failover_queue", [], |row| row.get(0))?;
+        assert_eq!(profile, "saved-profile");
+        assert_eq!(queue, "preserve-me");
+        Ok(())
+    }
+
+    #[test]
+    fn v25_migration_failure_rolls_back_added_columns_and_version() -> Result<(), AppError> {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE mcp_servers (id TEXT PRIMARY KEY, enabled_copilot BOOLEAN);
+             INSERT INTO mcp_servers VALUES ('m', 1);
+             CREATE TABLE skills (id TEXT PRIMARY KEY, enabled_zcode BOOLEAN);
+             INSERT INTO skills VALUES ('s', 1);",
+        )?;
+        Database::set_user_version(&conn, 25)?;
+
+        let version_26_written = Arc::new(AtomicBool::new(false));
+        let observed_version = Arc::clone(&version_26_written);
+        conn.authorizer(Some(move |context: AuthContext<'_>| match context.action {
+            AuthAction::Pragma {
+                pragma_name: "user_version",
+                pragma_value: Some("26"),
+            } => {
+                observed_version.store(true, Ordering::Relaxed);
+                Authorization::Allow
+            }
+            // Deny the additive repair that runs after setting user_version to 26.
+            AuthAction::AlterTable { .. } if observed_version.load(Ordering::Relaxed) => {
+                Authorization::Deny
+            }
+            _ => Authorization::Allow,
+        }));
+        let error = Database::apply_schema_migrations_on_conn(&conn)
+            .expect_err("the post-version repair must fail");
+        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+
+        assert!(version_26_written.load(Ordering::Relaxed));
+        assert!(error.to_string().contains("enabled_kimi"), "{error}");
+        assert!(conn.is_autocommit(), "the migration savepoint was released");
+        assert_eq!(Database::get_user_version(&conn)?, 25);
+        for table in ["mcp_servers", "skills"] {
+            assert!(!Database::has_column(&conn, table, "enabled_workbuddy")?);
+            assert!(!Database::has_column(&conn, table, "enabled_dsh")?);
+        }
+        let mcp: (String, i32) =
+            conn.query_row("SELECT id, enabled_copilot FROM mcp_servers", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+        let skill: (String, i32) =
+            conn.query_row("SELECT id, enabled_zcode FROM skills", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+        assert_eq!(mcp, ("m".into(), 1));
+        assert_eq!(skill, ("s".into(), 1));
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+        assert_eq!(Database::get_user_version(&conn)?, 26);
+        assert!(Database::has_column(
+            &conn,
+            "mcp_servers",
+            "enabled_workbuddy"
+        )?);
+        assert!(Database::has_column(&conn, "skills", "enabled_workbuddy")?);
         Ok(())
     }
 

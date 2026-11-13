@@ -135,30 +135,46 @@ impl Database {
             conn: Mutex::new(conn),
             log_count_cache: Mutex::new(None),
         };
-        db.create_tables()?;
-
-        // Pre-migration backup: only when upgrading from an existing database
-        {
+        // Skip the extra snapshot for the additive v25 → v26 migration.
+        let pending_migration_backup = {
             let conn = lock_conn!(db.conn);
             let version = Self::get_user_version(&conn)?;
             drop(conn);
-            if version > 0 && version < SCHEMA_VERSION {
+            if version > 0 && version < SCHEMA_VERSION && (version, SCHEMA_VERSION) != (25, 26) {
                 log::info!(
                     "Creating pre-migration database backup (v{version} → v{SCHEMA_VERSION})"
                 );
-                if let Err(e) = db.backup_database_file() {
-                    log::warn!("Pre-migration backup failed, continuing migration: {e}");
+                match db.begin_safety_backup() {
+                    Ok(backup) => Some(backup),
+                    Err(e) => {
+                        log::warn!("Pre-migration backup failed, continuing migration: {e}");
+                        None
+                    }
                 }
+            } else {
+                None
             }
-        }
+        };
 
-        db.apply_schema_migrations()?;
-        if let Err(e) = db.ensure_incremental_auto_vacuum() {
-            log::warn!("Failed to ensure incremental auto-vacuum: {e}");
-        }
+        db.initialize_schema()?;
+        // A pre-migration safety snapshot also protects a following VACUUM;
+        // do not replace or prune it between the two startup operations.
+        let auto_vacuum_ready =
+            match db.ensure_incremental_auto_vacuum_inner(pending_migration_backup.is_some()) {
+                Ok(_) => true,
+                Err(e) => {
+                    log::warn!("Failed to ensure incremental auto-vacuum: {e}");
+                    false
+                }
+            };
         db.ensure_model_pricing_seeded()?;
         if let Err(e) = crate::services::model_pricing::sync_local_model_pricing(&db) {
             log::warn!("Failed to sync local model pricing file: {e}");
+        }
+        if auto_vacuum_ready {
+            if let Some(backup) = pending_migration_backup {
+                backup.complete();
+            }
         }
 
         // Log rollup/pruning and vacuum run in periodic_backup_if_needed after
@@ -262,6 +278,13 @@ impl Database {
     }
 
     pub(crate) fn ensure_incremental_auto_vacuum(&self) -> Result<bool, AppError> {
+        self.ensure_incremental_auto_vacuum_inner(false)
+    }
+
+    fn ensure_incremental_auto_vacuum_inner(
+        &self,
+        safety_backup_already_held: bool,
+    ) -> Result<bool, AppError> {
         let mode = {
             let conn = lock_conn!(self.conn);
             Self::get_auto_vacuum_mode(&conn)?
@@ -274,17 +297,22 @@ impl Database {
             let conn = lock_conn!(self.conn);
             Self::has_user_tables(&conn)?
         };
-        if has_tables {
+        let pending_backup = if has_tables && !safety_backup_already_held {
             log::info!(
                 "Detected auto_vacuum={mode}, rebuilding database to enable incremental vacuum"
             );
-            self.backup_database_file()?;
-        }
+            Some(self.begin_safety_backup()?)
+        } else {
+            None
+        };
 
         let rebuilt = {
             let conn = lock_conn!(self.conn);
             Self::ensure_incremental_auto_vacuum_on_conn(&conn)?
         };
+        if let Some(backup) = pending_backup {
+            backup.complete();
+        }
 
         if rebuilt {
             log::info!("Incremental auto-vacuum enabled after database rebuild");

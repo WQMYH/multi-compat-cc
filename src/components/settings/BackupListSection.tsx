@@ -173,11 +173,11 @@ export function BackupListSection({
   return (
     <div className="space-y-4">
       {/* Backup policy settings */}
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid gap-4 sm:grid-cols-2">
         <div className="space-y-2">
-          <Label className="text-sm">
+          <Label htmlFor="database-backup-interval" className="text-sm">
             {t("settings.backupManager.intervalLabel", {
-              defaultValue: "Auto-backup Interval",
+              defaultValue: "Automatic database backup interval",
             })}
           </Label>
           <Select
@@ -186,7 +186,7 @@ export function BackupListSection({
               onSettingsChange({ backupIntervalHours: Number(v) })
             }
           >
-            <SelectTrigger className="h-9">
+            <SelectTrigger id="database-backup-interval" className="h-9">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -230,9 +230,9 @@ export function BackupListSection({
         </div>
 
         <div className="space-y-2">
-          <Label className="text-sm">
+          <Label htmlFor="tool-config-backup-retention" className="text-sm">
             {t("settings.backupManager.retainLabel", {
-              defaultValue: "Backup Retention",
+              defaultValue: "Hermes and OpenClaw configuration backups to keep",
             })}
           </Label>
           <Select
@@ -241,7 +241,7 @@ export function BackupListSection({
               onSettingsChange({ backupRetainCount: Number(v) })
             }
           >
-            <SelectTrigger className="h-9">
+            <SelectTrigger id="tool-config-backup-retention" className="h-9">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -296,6 +296,13 @@ export function BackupListSection({
                 })}
           </Button>
         </div>
+
+        <p className="mb-2 text-sm text-fg-2">
+          {t("settings.backupManager.description", {
+            defaultValue:
+              "CC Switch keeps only the latest database backup it creates. Renamed or unrecognized files are kept during automatic cleanup.",
+          })}
+        </p>
 
         {isLoading ? (
           <div className="text-sm text-fg-2 py-2">Loading...</div>

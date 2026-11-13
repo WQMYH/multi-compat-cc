@@ -378,6 +378,27 @@ fn finish_codex_rebuild(
     result
 }
 
+fn codex_rebuild_completed_for_retention(
+    summary: &crate::services::session_usage::SessionSyncResult,
+) -> bool {
+    summary.files_scanned > 0
+        && summary.imported > 0
+        && summary.deferred_files == 0
+        && summary.suspected_duplicates == 0
+        && summary.errors.is_empty()
+}
+
+fn codex_rebuild_files(codex_dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>, AppError> {
+    let files =
+        crate::services::session_usage_codex::collect_codex_session_files_strict(codex_dir)?;
+    if files.is_empty() {
+        return Err(AppError::Message(
+            "未找到 Codex 会话日志，现有用量未重建。".to_string(),
+        ));
+    }
+    Ok(files)
+}
+
 /// 备份数据库后，仅重建 Codex session 用量。锁覆盖 backup → reset → import
 /// 整个序列，避免后台同步在清理和重导之间插入数据。
 #[tauri::command]
@@ -390,9 +411,18 @@ pub async fn rebuild_codex_usage(
         .await;
     tauri::async_runtime::spawn_blocking(move || {
         let codex_dir = crate::codex_config::get_codex_session_dir();
-        db.backup_database_file()?;
+        // Fail before resetting existing usage if any session directory is
+        // unreadable or no rollout files are present.
+        let files = codex_rebuild_files(&codex_dir)?;
+        let backup = db.begin_safety_backup()?;
         db.reset_codex_usage_in(&codex_dir)?;
-        let result = crate::services::session_usage_codex::sync_codex_usage_in(&db, &codex_dir);
+        let result = crate::services::session_usage_codex::sync_codex_usage_files(&db, &files);
+        if result
+            .as_ref()
+            .is_ok_and(codex_rebuild_completed_for_retention)
+        {
+            backup.complete();
+        }
         finish_codex_rebuild(result)
     })
     .await
@@ -424,6 +454,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn codex_rebuild_refuses_an_empty_session_directory() {
+        let root = tempfile::tempdir().expect("create isolated session root");
+        let error = codex_rebuild_files(root.path()).expect_err("empty root must not be reset");
+        assert!(error.to_string().contains("未找到 Codex 会话日志"));
+    }
+
+    #[test]
     fn codex_rebuild_notifies_when_reimport_is_empty() {
         crate::usage_events::take_test_notify_count();
 
@@ -446,5 +483,40 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(crate::usage_events::take_test_notify_count(), 1);
+    }
+
+    #[test]
+    fn codex_rebuild_defers_retention_for_empty_or_incomplete_imports() {
+        use crate::services::session_usage::SessionSyncResult;
+
+        let complete = SessionSyncResult {
+            files_scanned: 1,
+            imported: 1,
+            ..SessionSyncResult::default()
+        };
+        assert!(codex_rebuild_completed_for_retention(&complete));
+        assert!(!codex_rebuild_completed_for_retention(
+            &SessionSyncResult::default()
+        ));
+        for incomplete in [
+            SessionSyncResult {
+                imported: 0,
+                ..complete.clone()
+            },
+            SessionSyncResult {
+                deferred_files: 1,
+                ..complete.clone()
+            },
+            SessionSyncResult {
+                suspected_duplicates: 1,
+                ..complete.clone()
+            },
+            SessionSyncResult {
+                errors: vec!["synthetic failure".into()],
+                ..complete.clone()
+            },
+        ] {
+            assert!(!codex_rebuild_completed_for_retention(&incomplete));
+        }
     }
 }
