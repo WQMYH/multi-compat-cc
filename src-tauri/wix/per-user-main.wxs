@@ -146,14 +146,16 @@
         </Property>
 
         <!-- Respect an explicit INSTALLDIR, then this fork's MSI registration,
-             then older MSI/NSIS registrations. Otherwise the Directory table
-             selects the current user's Programs folder. -->
+             then older MSI/NSIS registrations. The final fallback uses the
+             current user's Programs folder without claiming that shared folder. -->
         <SetProperty Id="INSTALLDIR" Action="SetOwnMsiInstallDir" Value="[CCOWNMSIINSTALLDIR]"
                      After="AppSearch" Sequence="first">NOT INSTALLDIR AND CCOWNMSIINSTALLDIR</SetProperty>
         <SetProperty Id="INSTALLDIR" Action="SetPreviousMsiInstallDir" Value="[CCPREVMSIINSTALLDIR]"
                      After="SetOwnMsiInstallDir" Sequence="first">NOT INSTALLDIR AND CCPREVMSIINSTALLDIR</SetProperty>
         <SetProperty Id="INSTALLDIR" Action="SetPreviousNsisInstallDir" Value="[CCPREVNSISINSTALLDIR]"
                      After="SetPreviousMsiInstallDir" Sequence="first">NOT INSTALLDIR AND CCPREVNSISINSTALLDIR</SetProperty>
+        <SetProperty Id="INSTALLDIR" Action="SetDefaultInstallDir" Value="[LocalAppDataFolder]Programs\{{product_name}}"
+                     After="SetPreviousNsisInstallDir" Sequence="first">NOT INSTALLDIR</SetProperty>
 
         <!-- launch app checkbox -->
         <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="!(loc.LaunchApp)" />
@@ -218,9 +220,7 @@
                  The directory keeps [DesktopFolder] available to AppSearch and to those actions. -->
             <Directory Id="DesktopFolder" Name="Desktop" />
             <Directory Id="LocalAppDataFolder">
-                <Directory Id="TauriLocalAppDataPrograms" Name="Programs">
-                    <Directory Id="INSTALLDIR" Name="{{product_name}}"/>
-                </Directory>
+                <Directory Id="INSTALLDIR" Name="{{product_name}}"/>
             </Directory>
             <Directory Id="ProgramMenuFolder">
                 <Directory Id="ApplicationProgramsFolder" Name="{{product_name}}"/>

@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { resolve, win32 } from "node:path";
+import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
 const root = resolve(import.meta.dirname, "../..");
@@ -26,6 +26,7 @@ type InstallationScenario = {
 function simulateInstallationDirectory(scenario: InstallationScenario): string {
   const properties: Record<string, string | undefined> = {
     INSTALLDIR: scenario.selected,
+    LocalAppDataFolder: `${scenario.localAppData}\\`,
     CCOWNMSIINSTALLDIR: scenario.ownMsi,
     CCPREVMSIINSTALLDIR: scenario.previousMsi,
     CCPREVNSISINSTALLDIR: scenario.previousNsis,
@@ -38,37 +39,42 @@ function simulateInstallationDirectory(scenario: InstallationScenario): string {
       return Boolean(properties[term]);
     });
     if (matches) {
-      const value = setter.getAttribute("Value")?.match(/^\[([A-Z]+)\]$/);
+      const value = setter.getAttribute("Value");
       if (!value) throw new Error("Unexpected INSTALLDIR assignment");
-      properties.INSTALLDIR = properties[value[1]];
+      properties.INSTALLDIR = value
+        .replace(/\[([A-Za-z]+)\]/g, (_, property: string) => {
+          const resolved = properties[property];
+          if (!resolved) throw new Error(`Missing property ${property}`);
+          return resolved;
+        })
+        .replace("{{product_name}}", "CC Switch");
     }
   }
   if (properties.INSTALLDIR) return properties.INSTALLDIR;
 
-  const installDir = document.querySelector('Directory[Id="INSTALLDIR"]');
-  const programsDir = installDir?.parentElement;
-  const localDir = programsDir?.parentElement;
-  if (
-    localDir?.getAttribute("Id") !== "LocalAppDataFolder" ||
-    !programsDir?.getAttribute("Name") ||
-    installDir?.getAttribute("Name") !== "{{product_name}}"
-  ) {
-    throw new Error("Unexpected default directory hierarchy");
-  }
-  return win32.join(
-    scenario.localAppData,
-    programsDir.getAttribute("Name")!,
-    "CC Switch",
-  );
+  throw new Error("No installation directory was selected");
 }
 
 describe("Windows installer update policy", () => {
   it("defaults to the current user's Programs directory without requiring D", () => {
     expect(document.querySelector("parsererror")).toBeNull();
     expect(source).not.toMatch(/CCSWITCHDAVAILABLE|CCSwitchDriveSearch|D:\\/i);
-    expect(
-      document.querySelector('SetProperty[Action="SetDefaultInstallDir"]'),
-    ).toBeNull();
+    const defaultSetter = document.querySelector(
+      'SetProperty[Action="SetDefaultInstallDir"]',
+    );
+    expect(defaultSetter?.getAttribute("Value")).toBe(
+      "[LocalAppDataFolder]Programs\\{{product_name}}",
+    );
+    expect(defaultSetter?.getAttribute("After")).toBe(
+      "SetPreviousNsisInstallDir",
+    );
+    expect(defaultSetter?.getAttribute("Sequence")).toBe("first");
+    expect(defaultSetter?.textContent?.trim()).toBe("NOT INSTALLDIR");
+    const installDir = document.querySelector('Directory[Id="INSTALLDIR"]');
+    expect(installDir?.parentElement?.getAttribute("Id")).toBe(
+      "LocalAppDataFolder",
+    );
+    expect(installDir?.getAttribute("Name")).toBe("{{product_name}}");
     expect(
       simulateInstallationDirectory({
         localAppData: "C:\\Users\\Example\\AppData\\Local",
@@ -139,6 +145,7 @@ describe("Windows installer update policy", () => {
       expect(set?.getAttribute("Id")).toBe("INSTALLDIR");
       expect(set?.getAttribute("Value")).toBe(`[${property}]`);
       expect(set?.getAttribute("After")).toBe(after);
+      expect(set?.getAttribute("Sequence")).toBe("first");
       expect(set?.textContent?.trim()).toBe(`NOT INSTALLDIR AND ${property}`);
     }
     const localAppData = "C:\\Users\\Example\\AppData\\Local";
