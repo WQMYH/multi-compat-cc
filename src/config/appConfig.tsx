@@ -1,7 +1,14 @@
 import React from "react";
 import type { AppId } from "@/lib/api/types";
-import type { PiFamilyAppId } from "@/lib/api/pi";
 import type { VisibleApps } from "@/types";
+import {
+  APP_IDS,
+  APP_IDS_WITH,
+  ROUTE_MODE_APP_IDS,
+  appHas,
+  type AppIdWith,
+} from "./appSpecs";
+export { APP_IDS } from "./appSpecs";
 import {
   ClaudeIcon,
   CodexIcon,
@@ -17,46 +24,10 @@ export interface AppConfig {
   badgeClass: string;
 }
 
-export const APP_IDS: AppId[] = [
-  "claude",
-  "claude-desktop",
-  "codex",
-  "gemini",
-  "grokbuild",
-  "opencode",
-  "openclaw",
-  "hermes",
-  "pi",
-  "mcode",
-  "kimi",
-  "dsh",
-  "agy",
-  "zcode",
-  "omp",
-  "copilot",
-  "workbuddy",
-];
-
-export const DEFAULT_VISIBLE_APPS: VisibleApps = {
-  claude: true,
-  "claude-desktop": true,
-  codex: true,
-  gemini: true,
-  grokbuild: true,
-  opencode: true,
-  openclaw: true,
-  hermes: true,
-  pi: true,
-  mcode: true,
+export const DEFAULT_VISIBLE_APPS = {
+  ...Object.fromEntries(APP_IDS.map((app) => [app, true])),
   qoder: true,
-  dsh: true,
-  kimi: true,
-  agy: true,
-  zcode: true,
-  omp: true,
-  copilot: true,
-  workbuddy: true,
-};
+} as VisibleApps;
 
 /**
  * 应用页和侧栏的应用顺序：先按用户拖出来的顺序（`settings.appOrder`，不认识的 ID 忽略），
@@ -81,157 +52,35 @@ export function orderAppIds(saved: readonly string[] | undefined): AppId[] {
   return ordered;
 }
 
-/** App IDs shown in Skills panels. */
-export type SkillsAppId = Exclude<AppId, "claude-desktop" | "openclaw">;
-export const SKILLS_APP_IDS: SkillsAppId[] = [
-  "claude",
-  "codex",
-  "gemini",
-  "grokbuild",
-  "opencode",
-  "hermes",
-  "pi",
-  "mcode",
-  "kimi",
-  "dsh",
-  "agy",
-  "zcode",
-  "omp",
-  "copilot",
-  "workbuddy",
-];
-
-export type ProxyAppId = Extract<
-  AppId,
-  "claude" | "codex" | "gemini" | "grokbuild"
->;
-
-/** Apps with a complete local gateway + failover data plane. */
-export const PROXY_APP_IDS: ProxyAppId[] = [
-  "claude",
-  "codex",
-  "gemini",
-  "grokbuild",
-];
-
-export function isProxyAppId(appId: string): appId is ProxyAppId {
-  return (PROXY_APP_IDS as string[]).includes(appId);
-}
-
-/**
- * 有直连 / 路由模式的应用（后端 `AppType::has_route_mode`）：上面四个，加上 Claude Desktop。
- * Desktop 经同一个路由服务转发，但没有故障转移和路由设置（不在 `PROXY_APP_IDS` 里）。
- */
-export type ModeAppId = ProxyAppId | "claude-desktop" | "zcode";
-
-export const MODE_APP_IDS: ModeAppId[] = [
-  ...PROXY_APP_IDS,
-  "claude-desktop",
-  "zcode",
-];
-
-export function isModeAppId(appId: string): appId is ModeAppId {
-  return (MODE_APP_IDS as string[]).includes(appId);
-}
-
-/** 支持 Stack 模式的应用（后端 `mode::stack::supports_stack` 的镜像）。 */
-export type StackAppId = Extract<
-  ModeAppId,
-  "claude" | "codex" | "claude-desktop"
->;
-
-export const STACK_APP_IDS: StackAppId[] = [
-  "claude",
-  "codex",
-  "claude-desktop",
-];
-
-export function isStackAppId(appId: string): appId is StackAppId {
-  return (STACK_APP_IDS as string[]).includes(appId);
-}
-
-/**
- * 累加式应用（后端 `AppType::is_additive_mode`）。Copilot CLI 是混合的：自带模型卡累加写进
- * providers.json，官方卡仍是启动式（只有「打开终端」）。
- */
-export type AdditiveAppId = Extract<
-  AppId,
-  | "opencode"
-  | "openclaw"
-  | "hermes"
-  | "pi"
-  | "mcode"
-  | "kimi"
-  | "dsh"
-  | "zcode"
-  | "omp"
-  | "copilot"
-  | "workbuddy"
->;
-
-export const ADDITIVE_APP_IDS: AdditiveAppId[] = [
-  "mcode",
-  "kimi",
-  "dsh",
-  "opencode",
-  "openclaw",
-  "hermes",
-  "pi",
-  "zcode",
-  "omp",
-  "copilot",
-  "workbuddy",
-];
-
-export function isAdditiveAppId(appId: string): appId is AdditiveAppId {
-  return (ADDITIVE_APP_IDS as string[]).includes(appId);
-}
-
-/** Oh My Pi 是 Pi 的分支：供应商表单、启用状态和用量脚本命令与 Pi 共用。 */
-export const PI_FAMILY_APP_IDS: PiFamilyAppId[] = ["pi", "omp"];
-
-export function isPiFamilyApp(appId: string): appId is PiFamilyAppId {
-  return (PI_FAMILY_APP_IDS as string[]).includes(appId);
-}
-
-/**
- * 切换只替换关键字段的应用：供应商编辑器显示「切到这个供应商之后配置文件的样子」，由后端
- * `ProviderService::editor_view` 投影。
- */
-export const EDITOR_VIEW_APP_IDS: AppId[] = [
-  "claude",
-  "codex",
-  "gemini",
-  "grokbuild",
-];
-
-export function usesEditorView(appId: AppId): boolean {
-  return EDITOR_VIEW_APP_IDS.includes(appId);
-}
-
-/** Claude Desktop、OpenClaw 不由 CC Switch 管理 MCP；Pi 1.0 起内置 MCP（`~/.pi/agent/mcp.json`） */
-export type McpAppId = Exclude<AppId, "claude-desktop" | "openclaw">;
-export const MCP_APP_IDS: McpAppId[] = [
-  "claude",
-  "codex",
-  "gemini",
-  "grokbuild",
-  "opencode",
-  "hermes",
-  "pi",
-  "mcode",
-  "kimi",
-  "dsh",
-  "agy",
-  "zcode",
-  "omp",
-  "copilot",
-  "workbuddy",
-];
-
-export function isMcpAppId(appId: string): appId is McpAppId {
-  return (MCP_APP_IDS as string[]).includes(appId);
-}
+// Backward-compatible views, all derived from the upstream capability table.
+export type SkillsAppId = AppIdWith<"skills">;
+export type McpAppId = AppIdWith<"mcp">;
+export type ProxyAppId = AppIdWith<"localProxy">;
+export type ModeAppId = AppIdWith<"routeMode">;
+export type StackAppId = AppIdWith<"stack">;
+export type AdditiveAppId = AppIdWith<"additive">;
+export const SKILLS_APP_IDS = APP_IDS_WITH.skills;
+export const MCP_APP_IDS = APP_IDS_WITH.mcp;
+export const PROXY_APP_IDS = APP_IDS_WITH.localProxy;
+export const MODE_APP_IDS = ROUTE_MODE_APP_IDS;
+export const STACK_APP_IDS = APP_IDS_WITH.stack;
+export const ADDITIVE_APP_IDS = APP_IDS_WITH.additive;
+export const PI_FAMILY_APP_IDS = APP_IDS_WITH.piFamily;
+export const EDITOR_VIEW_APP_IDS = APP_IDS_WITH.editorView;
+export const isProxyAppId = (appId: string): appId is ProxyAppId =>
+  appHas(appId, "localProxy");
+export const isModeAppId = (appId: string): appId is ModeAppId =>
+  appHas(appId, "routeMode");
+export const isStackAppId = (appId: string): appId is StackAppId =>
+  appHas(appId, "stack");
+export const isAdditiveAppId = (appId: string): appId is AdditiveAppId =>
+  appHas(appId, "additive");
+export const isMcpAppId = (appId: string): appId is McpAppId =>
+  appHas(appId, "mcp");
+export const isPiFamilyApp = (appId: string): appId is AppIdWith<"piFamily"> =>
+  appHas(appId, "piFamily");
+export const usesEditorView = (appId: AppId): boolean =>
+  appHas(appId, "editorView");
 
 export function usesGeminiStyleForm(appId: string): boolean {
   return appId === "gemini" || appId === "agy";

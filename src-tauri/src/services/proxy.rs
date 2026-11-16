@@ -113,7 +113,7 @@ impl ProxyService {
     /// returns to direct mode. An explicit stop still closes the listener.
     pub(crate) async fn stop_if_unused(&self) -> Result<(), String> {
         let _lifecycle = self.lifecycle_lock.lock().await;
-        if crate::mode::current::proxy_flags(crate::mode::controller::PROXY_APPS).contains(&true) {
+        if crate::mode::current::any_proxy() {
             return Ok(());
         }
         let (running, dsh_in_use) = {

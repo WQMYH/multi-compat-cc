@@ -88,10 +88,19 @@ static BACKUP_FILE_OPERATION_LOCK: Mutex<()> = Mutex::new(());
 static BACKUP_RETENTION_SUSPENDED: AtomicBool = AtomicBool::new(false);
 type BackupFileOperationGuard = MutexGuard<'static, ()>;
 
-fn lock_backup_file_operations() -> Result<BackupFileOperationGuard, AppError> {
+fn lock_backup_file_operations() -> BackupFileOperationGuard {
     BACKUP_FILE_OPERATION_LOCK
         .lock()
-        .map_err(|e| AppError::Database(format!("Backup file operation lock failed: {e}")))
+        .unwrap_or_else(|poisoned| {
+            // A panic may have interrupted a protected snapshot operation. Match
+            // upstream's recoverable file lock, but defer automatic pruning until
+            // the next process so recovery points from the interrupted operation remain.
+            BACKUP_RETENTION_SUSPENDED.store(true, Ordering::Release);
+            let guard = poisoned.into_inner();
+            BACKUP_FILE_OPERATION_LOCK.clear_poison();
+            log::warn!("Recovered backup file lock after a panic; retention suspended");
+            guard
+        })
 }
 
 fn suspend_retention_on_backup_error(error: AppError) -> AppError {
@@ -460,7 +469,7 @@ impl Database {
         crate::services::provider::icon::strip_invalid_custom_icons(&temp_conn)?;
         on_staging_ready()?;
 
-        let backup_file_guard = lock_backup_file_operations()?;
+        let backup_file_guard = lock_backup_file_operations();
         // Keep one main-DB guard across the safety snapshot, local-table read,
         // and final replacement so neither the rollback point nor preserved
         // device-local rows can miss writes that arrived during staging.
@@ -678,7 +687,7 @@ impl Database {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(AppError::io(&db_path, error)),
         }
-        let backup_file_guard = lock_backup_file_operations()?;
+        let backup_file_guard = lock_backup_file_operations();
         let backup_dir = app_dir.join("backups");
         let backup_dir_exists = match fs::symlink_metadata(&backup_dir) {
             Ok(_) => {
@@ -783,14 +792,14 @@ impl Database {
 
     /// 生成一致性快照备份，返回备份文件路径（不存在主库时返回 None）
     pub(crate) fn backup_database_file(&self) -> Result<Option<PathBuf>, AppError> {
-        let backup_file_guard = lock_backup_file_operations()?;
+        let backup_file_guard = lock_backup_file_operations();
         self.backup_database_file_locked(&backup_file_guard)
     }
 
     /// Publish a safety snapshot without pruning until the caller completes its
     /// database operation. The caller must not start another backup while held.
     pub(crate) fn begin_safety_backup(&self) -> Result<PendingDatabaseBackup, AppError> {
-        let guard = lock_backup_file_operations()?;
+        let guard = lock_backup_file_operations();
         let backup = {
             let conn = lock_conn!(self.conn);
             Self::backup_database_file_from_conn_with_hook(&guard, &conn, |_, _| Ok(()))
@@ -1490,7 +1499,7 @@ impl Database {
 
     /// List all database backup files, sorted by creation time (newest first)
     pub fn list_backups() -> Result<Vec<BackupEntry>, AppError> {
-        let _backup_file_guard = lock_backup_file_operations()?;
+        let _backup_file_guard = lock_backup_file_operations();
         let backup_dir = get_app_config_dir().join("backups");
         if !backup_dir.exists() {
             return Ok(vec![]);
@@ -1538,7 +1547,7 @@ impl Database {
     where
         F: FnOnce(Option<&Path>) -> Result<(), AppError>,
     {
-        let backup_file_guard = lock_backup_file_operations()?;
+        let backup_file_guard = lock_backup_file_operations();
         let backup_dir = get_app_config_dir().join("backups");
         let backup_path = safe_existing_backup_file(&backup_dir, filename)?;
 
@@ -1639,7 +1648,7 @@ impl Database {
             ));
         }
 
-        let _backup_file_guard = lock_backup_file_operations()?;
+        let _backup_file_guard = lock_backup_file_operations();
         let backup_dir = get_app_config_dir().join("backups");
         let old_path = safe_existing_backup_file(&backup_dir, old_filename)?;
         let new_path = backup_dir.join(&new_filename);
@@ -1661,7 +1670,7 @@ impl Database {
 
     /// Delete a backup file permanently.
     pub fn delete_backup(filename: &str) -> Result<(), AppError> {
-        let _backup_file_guard = lock_backup_file_operations()?;
+        let _backup_file_guard = lock_backup_file_operations();
         let backup_dir = get_app_config_dir().join("backups");
         let backup_path = safe_existing_backup_file(&backup_dir, filename)?;
 
@@ -1680,6 +1689,45 @@ mod tests {
     use serial_test::serial;
     use std::path::Path;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    #[serial]
+    fn backups_recover_after_poisoned_file_operation() {
+        if !crate::sync_utils::in_isolated_process(
+            "database::backup::tests::backups_recover_after_poisoned_file_operation",
+        ) {
+            return;
+        }
+        let _home = TestHomeGuard::new();
+        // Real snapshots are intentionally disabled for in-memory databases.
+        // Exercise recovery against an isolated file-backed database instead.
+        let db = Database::init().unwrap();
+        db.set_setting("kept", "yes").unwrap();
+        let previous = db
+            .backup_database_file()
+            .expect("backup before panic")
+            .expect("previous snapshot file");
+        assert!(std::panic::catch_unwind(|| {
+            let _guard = lock_backup_file_operations();
+            panic!("backup operation interrupted");
+        })
+        .is_err());
+        let path = db
+            .backup_database_file()
+            .expect("backup after panic")
+            .expect("snapshot file");
+        assert_ne!(path, previous);
+        assert!(previous.exists(), "recovery must preserve older snapshots");
+        let saved = Connection::open(path).unwrap();
+        let value: String = saved
+            .query_row("SELECT value FROM settings WHERE key = 'kept'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(value, "yes");
+        assert!(!super::BACKUP_FILE_OPERATION_LOCK.is_poisoned());
+        assert!(BACKUP_RETENTION_SUSPENDED.load(Ordering::Acquire));
+    }
 
     struct TestHomeGuard {
         previous_test_home: Option<std::ffi::OsString>,
@@ -2937,7 +2985,7 @@ mod tests {
         visible_before.sort();
 
         let error = {
-            let backup_file_guard = lock_backup_file_operations()?;
+            let backup_file_guard = lock_backup_file_operations();
             let conn = crate::database::lock_conn!(db.conn);
             Database::backup_database_file_from_conn_with_hook(
                 &backup_file_guard,
@@ -3088,7 +3136,7 @@ mod tests {
         std::fs::write(&corrupt, b"not a sqlite database")
             .map_err(|e| AppError::io(&corrupt, e))?;
 
-        let guard = lock_backup_file_operations()?;
+        let guard = lock_backup_file_operations();
         assert!(Database::cleanup_db_backups(&guard, dir, &[]).is_err());
         assert!(completed.exists());
         assert!(older.exists());
@@ -3133,7 +3181,7 @@ mod tests {
         // A restart clears the in-process hold, then normal validation may
         // converge the completed snapshots to the latest one.
         BACKUP_RETENTION_SUSPENDED.store(false, Ordering::Release);
-        let guard = lock_backup_file_operations()?;
+        let guard = lock_backup_file_operations();
         Database::cleanup_db_backups(&guard, successful_operation_safety.parent().unwrap(), &[])?;
         assert!(!previous.exists());
         assert!(!older.exists());
@@ -3160,7 +3208,7 @@ mod tests {
         let sidecar = std::path::PathBuf::from(sidecar_name);
         std::fs::write(&sidecar, b"in use").map_err(|e| AppError::io(&sidecar, e))?;
         {
-            let guard = lock_backup_file_operations()?;
+            let guard = lock_backup_file_operations();
             let error = Database::cleanup_db_backups(&guard, dir, &[])
                 .expect_err("an in-use sidecar must defer retention");
             assert!(error.to_string().contains("正在使用"), "{error}");
@@ -3176,7 +3224,7 @@ mod tests {
             let conn = Connection::open(&future)?;
             Database::set_user_version(&conn, crate::database::SCHEMA_VERSION + 1)?;
         }
-        let guard = lock_backup_file_operations()?;
+        let guard = lock_backup_file_operations();
         let error = Database::cleanup_db_backups(&guard, dir, &[])
             .expect_err("a future-schema snapshot must defer retention");
         assert!(error.to_string().contains("版本过新"), "{error}");
@@ -3209,7 +3257,7 @@ mod tests {
         set_backup_modified(&malformed, next_second)?;
         Database::validate_completed_database_backup(&malformed)?;
 
-        let guard = lock_backup_file_operations()?;
+        let guard = lock_backup_file_operations();
         assert!(Database::cleanup_db_backups(&guard, dir, &[]).is_err());
         assert!(
             completed.exists(),
@@ -3247,7 +3295,7 @@ mod tests {
             .as_secs()
             + 1;
         set_backup_modified(&v25, next_second)?;
-        let guard = lock_backup_file_operations()?;
+        let guard = lock_backup_file_operations();
         Database::cleanup_db_backups(&guard, dir, &[])?;
         assert!(!older.exists());
         assert!(v25.exists());
@@ -3268,7 +3316,7 @@ mod tests {
         let mut claimed_path = None;
 
         let published_path = {
-            let backup_file_guard = lock_backup_file_operations()?;
+            let backup_file_guard = lock_backup_file_operations();
             let conn = crate::database::lock_conn!(db.conn);
             let mut published = Database::backup_database_file_from_conn_with_hook(
                 &backup_file_guard,

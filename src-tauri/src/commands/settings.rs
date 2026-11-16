@@ -67,13 +67,11 @@ fn merge_settings_for_save(
     incoming
 }
 
-/// 获取设置
 #[tauri::command]
 pub async fn get_settings() -> Result<crate::settings::AppSettings, String> {
     Ok(crate::settings::get_settings_for_frontend())
 }
 
-/// 保存设置
 #[tauri::command]
 pub async fn save_settings(
     app: tauri::AppHandle,
@@ -340,7 +338,7 @@ pub async fn restart_app(app: AppHandle) -> Result<bool, String> {
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn require_registered_msi_installation(is_registered: bool) -> Result<(), String> {
+pub(crate) fn require_registered_msi_installation(is_registered: bool) -> Result<(), String> {
     if is_registered {
         Ok(())
     } else {
@@ -352,7 +350,16 @@ fn require_registered_msi_installation(is_registered: bool) -> Result<(), String
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn is_owned_msi_url(url: &url::Url) -> bool {
+fn require_registered_after_exit_cleanup(is_registered: bool) -> Result<(), String> {
+    require_registered_msi_installation(is_registered).map_err(|error| {
+        format!(
+            "{error}。已执行退出前清理，代理或 Live 接管可能已暂停；请重启应用或重新开启代理后再试。"
+        )
+    })
+}
+
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn is_owned_msi_url(url: &url::Url) -> bool {
     url.scheme() == "https"
         && url.host_str() == Some("github.com")
         && url.port().is_none()
@@ -401,30 +408,49 @@ fn require_signed_update_version(signature: &str, expected: &str) -> Result<(), 
     }
 }
 
+/// Call only after the updater has verified the package signature. This same
+/// check is used for freshly downloaded and previously verified cached bytes.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn require_verified_msi_update(
+    url: &url::Url,
+    signature: &str,
+    version: &str,
+    bytes: &[u8],
+    is_registered: bool,
+) -> Result<(), String> {
+    require_registered_msi_installation(is_registered)?;
+    if !is_owned_msi_url(url) {
+        return Err("更新包不是本项目发布的 MSI，已停止安装".to_string());
+    }
+    require_signed_update_version(signature, version)?;
+    if !is_msi_payload(bytes) {
+        return Err("更新包内容不是 MSI，已停止安装".to_string());
+    }
+    Ok(())
+}
+
 /// 下载并安装应用更新，然后由后端直接重启应用。
-/// macOS 更新会原地替换 `.app` bundle，退出清理和重启都由后端完成。
+/// 后台缓存只在版本、签名、下载地址和目标架构均一致时复用。
 #[tauri::command]
 pub async fn install_update_and_restart(app: AppHandle) -> Result<bool, String> {
     #[cfg(target_os = "windows")]
     require_registered_msi_installation(super::misc::is_registered_msi_installation())?;
 
-    let builder = app.updater_builder();
-    // Windows 上 updater 以 `msiexec /passive /promptrestart` 安装 MSI。passive 没有模态框、
-    // 未指定重启选项时，安装目录里有文件被占用，Windows Installer 会不经确认直接重启系统
-    // （#8534）。`/promptrestart` 只对应 REBOOTPROMPT，挡不住这一点，因此显式追加
-    // REBOOT=ReallySuppress（即 `/norestart`）。旧版本的 updater 不带这个参数，
-    // 由 MSI 模板自身的 REBOOT 属性兜底。
-    #[cfg(target_os = "windows")]
-    let builder = builder.installer_arg("REBOOT=ReallySuppress");
-    let updater = builder
-        .build()
-        .map_err(|e| format!("初始化更新器失败: {e}"))?;
-
-    let Some(update) = updater
-        .check()
-        .await
-        .map_err(|e| format!("检查更新失败: {e}"))?
-    else {
+    let Some(_installing) = crate::app_update::begin_install() else {
+        return Err("正在安装更新，请稍候".to_string());
+    };
+    let checked = match crate::app_update::build_updater(&app)?.check().await {
+        Ok(update) => update,
+        Err(e) => {
+            if let Some((update, bytes)) = crate::app_update::any_pending() {
+                log::warn!("检查更新失败（{e}），改装已下载的 {}", update.version);
+                return install_and_restart(app, update, bytes).await;
+            }
+            return Err(format!("检查更新失败: {e}"));
+        }
+    };
+    let Some(update) = checked else {
+        crate::app_update::discard_pending(&app);
         return Ok(false);
     };
 
@@ -433,41 +459,51 @@ pub async fn install_update_and_restart(app: AppHandle) -> Result<bool, String> 
         return Err("更新包不是本项目发布的 MSI，已停止安装".to_string());
     }
 
-    log::info!("开始下载应用更新: {}", update.version);
-    let progress_handle = app.clone();
-    let mut downloaded: u64 = 0;
-    let bytes = update
-        .download(
-            move |chunk_len, content_len| {
-                downloaded = downloaded.saturating_add(chunk_len as u64);
-                let _ = progress_handle.emit(
-                    "update-download-progress",
-                    UpdateDownloadProgress {
-                        downloaded,
-                        total: content_len,
+    let bytes = match crate::app_update::pending_bytes_for(&update) {
+        Some(bytes) => {
+            log::info!("使用已下载的应用更新: {}", update.version);
+            bytes
+        }
+        None => {
+            log::info!("开始下载应用更新: {}", update.version);
+            let progress_handle = app.clone();
+            let mut downloaded: u64 = 0;
+            update
+                .download(
+                    move |chunk_len, content_len| {
+                        downloaded = downloaded.saturating_add(chunk_len as u64);
+                        let _ = progress_handle.emit(
+                            "update-download-progress",
+                            UpdateDownloadProgress {
+                                downloaded,
+                                total: content_len,
+                            },
+                        );
                     },
-                );
-            },
-            || {},
-        )
-        .await
-        .map_err(|e| format!("下载更新失败: {e}"))?;
+                    || {},
+                )
+                .await
+                .map_err(|e| format!("下载更新失败: {e}"))?
+        }
+    };
 
-    // download() verifies the artifact and global signature before returning;
-    // only now may the trusted comment bind this artifact to update.version.
+    install_and_restart(app, update, bytes).await
+}
+
+/// 先验证刚下载或已验签缓存中的安装包，再执行退出清理和安装。
+async fn install_and_restart(
+    app: AppHandle,
+    update: tauri_plugin_updater::Update,
+    bytes: Vec<u8>,
+) -> Result<bool, String> {
     #[cfg(target_os = "windows")]
-    require_signed_update_version(&update.signature, &update.version)?;
-
-    #[cfg(target_os = "windows")]
-    if !is_msi_payload(&bytes) {
-        return Err("更新包内容不是 MSI，已停止安装".to_string());
-    }
-
-    // Registration or portable.ini may have changed while the download ran.
-    // Recheck before any exit cleanup or installer launch.
-    #[cfg(target_os = "windows")]
-    require_registered_msi_installation(super::misc::is_registered_msi_installation())?;
-
+    require_verified_msi_update(
+        &update.download_url,
+        &update.signature,
+        &update.version,
+        &bytes,
+        super::misc::is_registered_msi_installation(),
+    )?;
     log::info!("开始安装应用更新: {}", update.version);
 
     #[cfg(target_os = "windows")]
@@ -478,6 +514,9 @@ pub async fn install_update_and_restart(app: AppHandle) -> Result<bool, String> 
         // 因此清理只能放在 install 前执行，且必须显式移除托盘图标。
         crate::save_window_state_before_exit(&app);
         crate::cleanup_before_exit(&app).await;
+        // Registration may have changed while cleanup was running. Fail before
+        // removing the tray or single-instance lock, and explain the stopped routing.
+        require_registered_after_exit_cleanup(super::misc::is_registered_msi_installation())?;
         crate::remove_tray_icon_before_exit(&app);
         crate::destroy_single_instance_lock(&app);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -503,6 +542,27 @@ pub async fn install_update_and_restart(app: AppHandle) -> Result<bool, String> 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         crate::restart_process(&app);
     }
+}
+
+/// 自动更新的状态：能不能自动安装、是否在下载、已下好待装的版本。
+#[tauri::command]
+pub async fn get_auto_update_status(
+    state: tauri::State<'_, crate::store::AppState>,
+) -> Result<crate::app_update::AutoUpdateStatus, String> {
+    Ok(crate::app_update::status(crate::tray::routing_in_use(
+        state.inner(),
+    )))
+}
+
+/// 立刻在后台检查并下载最新版本（打开自动更新开关时调用）。不支持自动安装的机器直接返回空。
+#[tauri::command]
+pub async fn download_app_update(
+    app: AppHandle,
+) -> Result<Option<crate::app_update::ReadyUpdate>, String> {
+    if !crate::app_update::auto_install_supported() {
+        return Ok(None);
+    }
+    crate::app_update::download_latest(&app).await
 }
 
 /// 检查是否有可用的应用更新，返回可用的新版本号（无更新时返回 None）。
@@ -555,7 +615,6 @@ pub async fn set_app_config_dir_override(
     Ok(true)
 }
 
-/// 设置开机自启
 #[tauri::command]
 pub async fn set_auto_launch(enabled: bool) -> Result<bool, String> {
     if enabled {
@@ -570,7 +629,8 @@ pub async fn set_auto_launch(enabled: bool) -> Result<bool, String> {
 mod tests {
     use super::{
         is_msi_payload, is_owned_msi_url, merge_settings_for_save,
-        require_registered_msi_installation, require_signed_update_version,
+        require_registered_after_exit_cleanup, require_registered_msi_installation,
+        require_signed_update_version, require_verified_msi_update,
     };
     use crate::settings::{
         AppSettings, CodexOfficialHistoryUnifyMigration, CodexProviderTemplateMigration,
@@ -639,6 +699,34 @@ mod tests {
         assert!(require_registered_msi_installation(true).is_ok());
         let error = require_registered_msi_installation(false).unwrap_err();
         assert!(error.contains("https://github.com/WQMYH/multi-compat-cc/releases"));
+    }
+
+    #[test]
+    fn registration_loss_after_cleanup_reports_possible_routing_interruption() {
+        assert!(require_registered_after_exit_cleanup(true).is_ok());
+        let error = require_registered_after_exit_cleanup(false).unwrap_err();
+        assert!(error.contains("当前安装由外部管理"));
+        assert!(error.contains("代理或 Live 接管可能已暂停"));
+        assert!(error.contains("请重启应用或重新开启代理"));
+    }
+
+    #[test]
+    fn downloaded_or_cached_msi_must_pass_every_install_guard() {
+        let owned = url::Url::parse(
+            "https://github.com/WQMYH/multi-compat-cc/releases/download/v4.0.33/cc-switch.msi",
+        )
+        .unwrap();
+        let foreign = url::Url::parse(
+            "https://github.com/farion1231/cc-switch/releases/download/v4.0.33/cc-switch.msi",
+        )
+        .unwrap();
+        let signed = synthetic_signature("timestamp:1\tfile:cc-switch.msi\tversion:4.0.33");
+        let msi = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
+        assert!(require_verified_msi_update(&owned, &signed, "4.0.33", &msi, true).is_ok());
+        assert!(require_verified_msi_update(&owned, &signed, "4.0.33", &msi, false).is_err());
+        assert!(require_verified_msi_update(&foreign, &signed, "4.0.33", &msi, true).is_err());
+        assert!(require_verified_msi_update(&owned, &signed, "4.0.34", &msi, true).is_err());
+        assert!(require_verified_msi_update(&owned, &signed, "4.0.33", b"not-msi", true).is_err());
     }
 
     #[test]
@@ -994,13 +1082,11 @@ mod tests {
     }
 }
 
-/// 获取开机自启状态
 #[tauri::command]
 pub async fn get_auto_launch_status() -> Result<bool, String> {
     crate::auto_launch::is_auto_launch_enabled().map_err(|e| format!("获取开机自启状态失败: {e}"))
 }
 
-/// 获取整流器配置
 #[tauri::command]
 pub async fn get_rectifier_config(
     state: tauri::State<'_, crate::AppState>,
@@ -1008,7 +1094,6 @@ pub async fn get_rectifier_config(
     state.db.get_rectifier_config().map_err(|e| e.to_string())
 }
 
-/// 设置整流器配置
 #[tauri::command]
 pub async fn set_rectifier_config(
     state: tauri::State<'_, crate::AppState>,
@@ -1021,7 +1106,6 @@ pub async fn set_rectifier_config(
     Ok(true)
 }
 
-/// 获取优化器配置
 #[tauri::command]
 pub async fn get_optimizer_config(
     state: tauri::State<'_, crate::AppState>,
@@ -1029,7 +1113,6 @@ pub async fn get_optimizer_config(
     state.db.get_optimizer_config().map_err(|e| e.to_string())
 }
 
-/// 设置优化器配置
 #[tauri::command]
 pub async fn set_optimizer_config(
     state: tauri::State<'_, crate::AppState>,
@@ -1042,7 +1125,6 @@ pub async fn set_optimizer_config(
     Ok(true)
 }
 
-/// 获取隐私过滤器配置
 #[tauri::command]
 pub async fn get_privacy_filter_config(
     state: tauri::State<'_, crate::AppState>,
@@ -1053,7 +1135,6 @@ pub async fn get_privacy_filter_config(
         .map_err(|e| e.to_string())
 }
 
-/// 设置隐私过滤器配置
 #[tauri::command]
 pub async fn set_privacy_filter_config(
     state: tauri::State<'_, crate::AppState>,
@@ -1070,7 +1151,6 @@ pub async fn set_privacy_filter_config(
     Ok(true)
 }
 
-/// 获取 Copilot 优化器配置
 #[tauri::command]
 pub async fn get_copilot_optimizer_config(
     state: tauri::State<'_, crate::AppState>,
@@ -1081,7 +1161,6 @@ pub async fn get_copilot_optimizer_config(
         .map_err(|e| e.to_string())
 }
 
-/// 设置 Copilot 优化器配置
 #[tauri::command]
 pub async fn set_copilot_optimizer_config(
     state: tauri::State<'_, crate::AppState>,
@@ -1094,7 +1173,6 @@ pub async fn set_copilot_optimizer_config(
     Ok(true)
 }
 
-/// 获取日志配置
 #[tauri::command]
 pub async fn get_log_config(
     state: tauri::State<'_, crate::AppState>,
@@ -1102,7 +1180,6 @@ pub async fn get_log_config(
     state.db.get_log_config().map_err(|e| e.to_string())
 }
 
-/// 设置日志配置
 #[tauri::command]
 pub async fn set_log_config(
     state: tauri::State<'_, crate::AppState>,

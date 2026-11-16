@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   APP_IDS,
+  DEFAULT_VISIBLE_APPS,
   orderAppIds,
   isAdditiveAppId,
   SKILLS_APP_IDS,
@@ -9,7 +10,7 @@ import {
   isModeAppId,
   isStackAppId,
 } from "@/config/appConfig";
-import { PROMPT_APP_IDS } from "@/lib/query/prompts";
+import { APP_IDS_WITH } from "@/config/appSpecs";
 
 describe("appConfig provider lifecycle", () => {
   it.each([
@@ -43,7 +44,18 @@ describe("DeepSeek Harness capabilities", () => {
     expect(isAdditiveAppId("dsh")).toBe(true);
     expect(SKILLS_APP_IDS).toContain("dsh");
     expect(MCP_APP_IDS).toContain("dsh");
-    expect(PROMPT_APP_IDS).toContain("dsh");
+    expect(APP_IDS_WITH.prompts).toContain("dsh");
+    expect(APP_IDS_WITH.managedAccount).toContain("dsh");
+  });
+});
+
+describe("local application compatibility", () => {
+  it("keeps ZCode routing and Qoder visibility without inventing a Qoder AppId", () => {
+    expect(isModeAppId("zcode")).toBe(true);
+    expect(isAdditiveAppId("zcode")).toBe(true);
+    expect(APP_IDS).toContain("zcode");
+    expect(APP_IDS).not.toContain("qoder");
+    expect(DEFAULT_VISIBLE_APPS.qoder).toBe(true);
   });
 });
 

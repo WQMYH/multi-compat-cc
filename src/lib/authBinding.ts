@@ -1,3 +1,4 @@
+import { isMac, isWindows } from "@/lib/platform";
 import type { ProviderMeta } from "@/types";
 import type { AppId } from "@/lib/api/types";
 
@@ -11,6 +12,11 @@ export function isDshCodexOAuthProvider(
       meta?.authBinding?.source === "managed_account" ||
       meta?.authBinding?.authProvider === "codex_oauth")
   );
+}
+
+/** 能不能切 agy 的全局登录：和后端 `agy_account::keychain::supported` 一致（macOS 钥匙串、Windows 凭据管理器）。 */
+export function canSwitchAgyAccount(): boolean {
+  return isMac() || isWindows();
 }
 
 export function resolveManagedAccountId(
