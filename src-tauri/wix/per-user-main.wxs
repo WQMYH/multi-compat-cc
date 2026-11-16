@@ -154,7 +154,7 @@
                      After="SetOwnMsiInstallDir" Sequence="first">NOT INSTALLDIR AND CCPREVMSIINSTALLDIR</SetProperty>
         <SetProperty Id="INSTALLDIR" Action="SetPreviousNsisInstallDir" Value="[CCPREVNSISINSTALLDIR]"
                      After="SetPreviousMsiInstallDir" Sequence="first">NOT INSTALLDIR AND CCPREVNSISINSTALLDIR</SetProperty>
-        <SetProperty Id="INSTALLDIR" Action="SetDefaultInstallDir" Value="[LocalAppDataFolder]Programs\{{product_name}}"
+        <SetProperty Id="INSTALLDIR" Action="SetDefaultInstallDir" Value="[LocalAppDataFolder]Programs&#92;{{product_name}}"
                      After="SetPreviousNsisInstallDir" Sequence="first">NOT INSTALLDIR</SetProperty>
 
         <!-- launch app checkbox -->

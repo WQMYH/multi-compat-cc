@@ -129,6 +129,14 @@ jobs:
           pnpm exec tauri build --ci --config $config --target x86_64-pc-windows-msvc --bundles msi -- --locked
           if ($LASTEXITCODE -ne 0) { throw 'Windows package build failed.' }
 
+      - name: Verify MSI installation paths
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msis = @(Get-ChildItem -LiteralPath 'src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi' -Filter '*.msi' -File)
+          if ($msis.Count -ne 1) { throw 'Expected exactly one MSI.' }
+          & ./.github/scripts/verify-msi-install-policy.ps1 -MsiPath $msis[0].FullName
+
       - name: Record Windows packaging tools
         shell: pwsh
         run: |

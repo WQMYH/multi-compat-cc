@@ -62,6 +62,10 @@ describe("Windows installer update policy", () => {
     const defaultSetter = document.querySelector(
       'SetProperty[Action="SetDefaultInstallDir"]',
     );
+    // A raw backslash before {{product_name}} escapes the template expression.
+    expect(source).toContain(
+      "[LocalAppDataFolder]Programs&#92;{{product_name}}",
+    );
     expect(defaultSetter?.getAttribute("Value")).toBe(
       "[LocalAppDataFolder]Programs\\{{product_name}}",
     );
