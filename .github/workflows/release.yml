@@ -89,7 +89,7 @@ jobs:
         run: pnpm run typecheck
 
       - name: Test relevant frontend behavior
-        run: pnpm exec vitest run tests/components/ProviderCard.copilotAccount.test.tsx tests/components/AboutSection.update.test.tsx tests/components/DatabaseUpgrade.test.tsx tests/integration/wix-update-policy.test.ts tests/components/DshAddProviderDialog.test.tsx tests/components/DshAccountCard.test.tsx tests/hooks/useAddProviderMutation.test.tsx tests/config/appSpecs.test.ts
+        run: pnpm exec vitest run tests/components/ProviderCard.copilotAccount.test.tsx tests/components/AboutSection.update.test.tsx tests/components/DatabaseUpgrade.test.tsx tests/integration/wix-update-policy.test.ts tests/components/DshAddProviderDialog.test.tsx tests/components/DshAccountCard.test.tsx tests/hooks/useAddProviderMutation.test.tsx tests/config/appSpecs.test.ts src/config/codexProviderPresets.test.ts tests/components/CodexFormFields.modelFetch.test.tsx
 
       - name: Test usage, storage and updater behavior
         shell: pwsh
@@ -101,7 +101,7 @@ jobs:
             cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc --release --locked --lib --jobs 4 $filter -- --test-threads=1
             if ($LASTEXITCODE -ne 0) { throw "Rust test group failed: $filter" }
           }
-          foreach ($filter in @('guardian_', 'data_paths::tests', 'data_migration::tests', 'auto_launch::tests', 'app_update::tests', 'provider_kind::tests', 'app_specs_match_shared_fixture', 'backups_recover_after_poisoned_file_operation', 'route_mode_apps_keep_desktop_last', 'commands::settings::tests', 'commands::misc::tests')) {
+          foreach ($filter in @('guardian_', 'data_paths::tests', 'data_migration::tests', 'auto_launch::tests', 'app_update::tests', 'provider_kind::tests', 'app_specs_match_shared_fixture', 'backups_recover_after_poisoned_file_operation', 'route_mode_apps_keep_desktop_last', 'commands::settings::tests', 'commands::misc::tests', 'vision_capability_', 'copilot_catalog_uses_declared_vision_capabilities_and_infers_unknowns', 'codex_catalog_modalities_control_image_rectification')) {
             Invoke-TestGroup $filter
           }
           $env:DSH_HOME = Join-Path $env:RUNNER_TEMP 'ccswitch-test-dsh'
