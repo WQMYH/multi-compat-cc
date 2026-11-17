@@ -79,7 +79,15 @@ describe("ProviderCard cached usage expansion", () => {
   it("tracks the DSH ChatGPT route separately from account status", async () => {
     let active = false;
     let accountStatusUnavailable = false;
+    const usageQueries = vi.fn();
     server.use(
+      http.post(
+        "http://tauri.local/queryProviderUsage",
+        async ({ request }) => {
+          usageQueries(await request.json());
+          return HttpResponse.json({ success: true, data: [] });
+        },
+      ),
       http.post("http://tauri.local/auth_get_status", () =>
         accountStatusUnavailable
           ? HttpResponse.json("Fixture account status unavailable", {
@@ -133,6 +141,15 @@ describe("ProviderCard cached usage expansion", () => {
       </QueryClientProvider>,
     );
     await screen.findByText("dsh.codexOAuth.routeInactive");
+    await waitFor(() => {
+      expect(usageQueries).toHaveBeenCalledWith({
+        providerId: "chatgpt",
+        app: "dsh",
+      });
+      expect(
+        queryClient.getQueryData(usageKeys.script("chatgpt", "dsh")),
+      ).toEqual({ success: true, data: [] });
+    });
     expect(screen.queryByText("dsh.codexOAuth.routeActive")).toBeNull();
     expect(screen.queryByText("codex-oauth-quota")).toBeNull();
     const retry = screen.getByRole("button", {
@@ -148,6 +165,7 @@ describe("ProviderCard cached usage expansion", () => {
       });
     });
     await screen.findByText("dsh.codexOAuth.routeActive");
+    expect(screen.getByText("codex-oauth-quota")).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "dsh.codexOAuth.retryActivation" }),
     ).toBeNull();
@@ -160,6 +178,7 @@ describe("ProviderCard cached usage expansion", () => {
     await screen.findByText("codex.accountStatusUnavailable");
     expect(screen.queryByText("dsh.codexOAuth.routeInactive")).toBeNull();
     expect(screen.queryByText("dsh.codexOAuth.routeActive")).toBeNull();
+    expect(screen.queryByText("codex-oauth-quota")).toBeNull();
   });
 
   it("keeps official subscription quota inline despite cached script tiers", () => {

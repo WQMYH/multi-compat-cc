@@ -307,7 +307,7 @@ export function ProviderCard({
     } else {
       dshRouteStatusLabel = dshAccountReady
         ? "dsh.codexOAuth.routeActive"
-        : "codexOauth.selectedAccountNeedsReauth";
+        : "managedAuth.selectedAccountNeedsReauth";
     }
   }
   const presentation: CardPresentation = dshOAuthRoute

@@ -5,9 +5,12 @@ import { describe, expect, it } from "vitest";
 
 const ROOT = path.resolve(__dirname, "../..");
 
-function registeredCommands(): string[] {
-  const lib = readFileSync(path.join(ROOT, "src-tauri/src/lib.rs"), "utf8");
-  const handler = lib.match(/generate_handler!\[([\s\S]*?)\]\)/);
+function registeredCommands(
+  lib = readFileSync(path.join(ROOT, "src-tauri/src/lib.rs"), "utf8"),
+): string[] {
+  // The macro may be assigned to a variable or passed directly to a call.
+  // Its closing bracket is on its own line; comments may contain inline `[]`.
+  const handler = lib.match(/generate_handler!\[([\s\S]*?)^[ \t]*\]/m);
   if (!handler) throw new Error("generate_handler! not found in lib.rs");
   return [...handler[1].matchAll(/^\s*([\w:]+),?\s*$/gm)].map(
     (m) => m[1].split("::").pop()!,
@@ -157,6 +160,36 @@ function commandStrings(files: ts.SourceFile[]) {
 }
 
 describe("Tauri command registry", () => {
+  it("extracts only commands inside an assigned handler", () => {
+    const lib = `
+      let handler = tauri::generate_handler![
+        commands::first,
+        // Documentation may contain brackets, such as data[].id.
+        commands::last,
+      ];
+      consume([
+        unrelated::finish_tombstones_before_exit,
+        state,
+      ]);
+    `;
+
+    expect(registeredCommands(lib)).toEqual(["first", "last"]);
+  });
+
+  it("also extracts a handler passed directly to a call", () => {
+    const lib = `
+      builder.invoke_handler(tauri::generate_handler![
+        commands::first,
+        commands::last,
+      ]);
+    `;
+
+    expect(registeredCommands(lib)).toEqual(["first", "last"]);
+    expect(() => registeredCommands("no handler")).toThrow(
+      "generate_handler! not found in lib.rs",
+    );
+  });
+
   it("registers only commands the frontend reaches through a used wrapper", () => {
     const files = frontendFiles(path.join(ROOT, "src"));
     const sites = commandStrings(files);

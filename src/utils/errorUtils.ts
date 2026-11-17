@@ -70,7 +70,7 @@ export const translateDshOAuthProviderError = (
   switch (code) {
     case "DSH_OAUTH_EXPLICIT_ACCOUNT_REQUIRED":
     case "DSH_OAUTH_ACCOUNT_UNAVAILABLE":
-      return t("codexOauth.selectedAccountNeedsReauth");
+      return t("managedAuth.selectedAccountNeedsReauth");
     case "DSH_OAUTH_MODEL_REQUIRED":
       return t("dsh.codexOAuth.modelRequired");
     case "DSH_OAUTH_MODEL_INVALID":
