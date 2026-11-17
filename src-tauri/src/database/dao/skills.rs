@@ -23,7 +23,7 @@ impl Database {
             .prepare(
                 "SELECT id, name, description, directory, repo_owner, repo_name, repo_branch,
                         readme_url, enabled_claude, enabled_codex, enabled_gemini, enabled_grokbuild,
-                        enabled_opencode, enabled_hermes, installed_at, content_hash, updated_at, enabled_mcode, enabled_agy, enabled_zcode, enabled_kimi, enabled_dsh, enabled_copilot, enabled_workbuddy
+                        enabled_opencode, enabled_hermes, installed_at, content_hash, updated_at, enabled_mcode, enabled_agy, enabled_zcode, enabled_kimi, enabled_dsh, enabled_copilot, enabled_workbuddy, repo_host
                  FROM skills ORDER BY name ASC",
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -35,6 +35,7 @@ impl Database {
                     name: row.get(1)?,
                     description: row.get(2)?,
                     directory: row.get(3)?,
+                    repo_host: row.get(24)?,
                     repo_owner: row.get(4)?,
                     repo_name: row.get(5)?,
                     repo_branch: row.get(6)?,
@@ -78,7 +79,7 @@ impl Database {
             .prepare(
                 "SELECT id, name, description, directory, repo_owner, repo_name, repo_branch,
                         readme_url, enabled_claude, enabled_codex, enabled_gemini, enabled_grokbuild,
-                        enabled_opencode, enabled_hermes, installed_at, content_hash, updated_at, enabled_mcode, enabled_agy, enabled_zcode, enabled_kimi, enabled_dsh, enabled_copilot, enabled_workbuddy
+                        enabled_opencode, enabled_hermes, installed_at, content_hash, updated_at, enabled_mcode, enabled_agy, enabled_zcode, enabled_kimi, enabled_dsh, enabled_copilot, enabled_workbuddy, repo_host
                  FROM skills WHERE id = ?1",
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -89,6 +90,7 @@ impl Database {
                 name: row.get(1)?,
                 description: row.get(2)?,
                 directory: row.get(3)?,
+                repo_host: row.get(24)?,
                 repo_owner: row.get(4)?,
                 repo_name: row.get(5)?,
                 repo_branch: row.get(6)?,
@@ -130,8 +132,8 @@ impl Database {
             "INSERT OR REPLACE INTO skills
              (id, name, description, directory, repo_owner, repo_name, repo_branch,
               readme_url, enabled_claude, enabled_codex, enabled_gemini, enabled_grokbuild, enabled_opencode, enabled_hermes,
-              installed_at, content_hash, updated_at, enabled_mcode, enabled_agy, enabled_zcode, enabled_kimi, enabled_dsh, enabled_copilot, enabled_workbuddy)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+              installed_at, content_hash, updated_at, enabled_mcode, enabled_agy, enabled_zcode, enabled_kimi, enabled_dsh, enabled_copilot, enabled_workbuddy, repo_host)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
             params![
                 skill.id,
                 skill.name,
@@ -157,6 +159,7 @@ impl Database {
                 skill.apps.dsh,
                 skill.apps.copilot,
                 skill.apps.workbuddy,
+                skill.repo_host,
             ],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -182,8 +185,9 @@ impl Database {
                      readme_url = ?7,
                      installed_at = ?8,
                      content_hash = ?9,
-                     updated_at = ?10
-                 WHERE id = ?11 AND installed_at = ?12",
+                     updated_at = ?10,
+                     repo_host = ?11
+                 WHERE id = ?12 AND installed_at = ?13",
                 params![
                     skill.name,
                     skill.description,
@@ -195,6 +199,7 @@ impl Database {
                     skill.installed_at,
                     skill.content_hash,
                     skill.updated_at,
+                    skill.repo_host,
                     skill.id,
                     skill.installed_at,
                 ],
@@ -256,13 +261,14 @@ impl Database {
         let conn = lock_conn!(self.conn);
         let mut stmt = conn
             .prepare(
-                "SELECT owner, name, branch, enabled FROM skill_repos ORDER BY owner ASC, name ASC",
+                "SELECT owner, name, branch, enabled, host FROM skill_repos ORDER BY owner ASC, name ASC",
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         let repo_iter = stmt
             .query_map([], |row| {
                 Ok(SkillRepo {
+                    host: row.get(4)?,
                     owner: row.get(0)?,
                     name: row.get(1)?,
                     branch: row.get(2)?,
@@ -282,8 +288,8 @@ impl Database {
     pub fn save_skill_repo(&self, repo: &SkillRepo) -> Result<(), AppError> {
         let conn = lock_conn!(self.conn);
         conn.execute(
-            "INSERT OR REPLACE INTO skill_repos (owner, name, branch, enabled) VALUES (?1, ?2, ?3, ?4)",
-            params![repo.owner, repo.name, repo.branch, repo.enabled],
+            "INSERT OR REPLACE INTO skill_repos (owner, name, branch, enabled, host) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![repo.owner, repo.name, repo.branch, repo.enabled, repo.host],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
         Ok(())
@@ -339,6 +345,7 @@ mod tests {
             name: name.to_string(),
             description: Some(format!("{name} description")),
             directory: format!("{name}-directory"),
+            repo_host: None,
             repo_owner: Some("owner".to_string()),
             repo_name: Some("repo".to_string()),
             repo_branch: Some("main".to_string()),
@@ -351,6 +358,60 @@ mod tests {
     }
 
     #[test]
+    fn repo_and_skill_hosts_round_trip() {
+        let db = Database::memory().expect("memory db");
+
+        db.save_skill_repo(&SkillRepo {
+            host: "gitlab.example.com:8443".to_string(),
+            owner: "group/subgroup".to_string(),
+            name: "skills".to_string(),
+            branch: "main".to_string(),
+            enabled: true,
+        })
+        .expect("save gitlab repo");
+        db.save_skill_repo(&SkillRepo {
+            host: "gitea.example.org".to_string(),
+            owner: "other".to_string(),
+            name: "tools".to_string(),
+            branch: "main".to_string(),
+            enabled: true,
+        })
+        .expect("save gitea repo");
+        let repos = db.get_skill_repos().expect("get repos");
+        assert_eq!(repos.len(), 2);
+        assert!(repos.iter().any(|repo| {
+            repo.host == "gitlab.example.com:8443" && repo.owner == "group/subgroup"
+        }));
+        assert!(repos
+            .iter()
+            .any(|repo| { repo.host == "gitea.example.org" && repo.owner == "other" }));
+
+        let mut apps = SkillApps::default();
+        apps.zcode = true;
+        apps.dsh = true;
+        apps.workbuddy = true;
+        let mut gitlab_skill = skill("group/subgroup/skills:demo", "demo", apps.clone());
+        gitlab_skill.repo_host = Some("gitlab.example.com:8443".to_string());
+        db.save_skill(&gitlab_skill).expect("save gitlab skill");
+        db.save_skill(&skill("owner/repo:plain", "plain", SkillApps::default()))
+            .expect("save github skill");
+
+        let stored = db.get_all_installed_skills().expect("get skills");
+        assert_eq!(
+            stored[&gitlab_skill.id].repo_host.as_deref(),
+            Some("gitlab.example.com:8443")
+        );
+        assert_eq!(stored["owner/repo:plain"].repo_host, None);
+        assert_eq!(stored[&gitlab_skill.id].apps, apps);
+        let single = db
+            .get_installed_skill(&gitlab_skill.id)
+            .expect("get skill")
+            .expect("skill exists");
+        assert_eq!(single.repo_host.as_deref(), Some("gitlab.example.com:8443"));
+        assert_eq!(single.apps, apps);
+    }
+
+    #[test]
     fn update_skill_metadata_preserves_enabled_apps() {
         let db = Database::memory().expect("memory db");
         let installed_apps = SkillApps::only(&AppType::Codex);
@@ -358,6 +419,7 @@ mod tests {
         db.save_skill(&original).expect("seed skill");
 
         let mut candidate = skill(&original.id, "updated", SkillApps::only(&AppType::Claude));
+        candidate.repo_host = Some("gitlab.example.com:8443".to_string());
         candidate.repo_branch = Some("next".to_string());
         candidate.updated_at = 42;
 
@@ -373,6 +435,7 @@ mod tests {
         assert_eq!(stored.description, candidate.description);
         assert_eq!(stored.directory, candidate.directory);
         assert_eq!(stored.repo_branch, candidate.repo_branch);
+        assert_eq!(stored.repo_host, candidate.repo_host);
         assert_eq!(stored.readme_url, candidate.readme_url);
         assert_eq!(stored.content_hash, candidate.content_hash);
         assert_eq!(stored.updated_at, candidate.updated_at);

@@ -28,5 +28,13 @@ async fn responses(
         )
             .into_response());
     }
-    handlers::handle_responses_for_app(state, request, AppType::ZCode, "ZCode", "zcode").await
+    handlers::handle_responses_for_app(
+        state,
+        request,
+        AppType::ZCode,
+        "ZCode",
+        "zcode",
+        handlers::ResponsesEndpoint::Responses,
+    )
+    .await
 }

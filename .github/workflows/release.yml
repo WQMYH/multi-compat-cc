@@ -89,7 +89,7 @@ jobs:
         run: pnpm run typecheck
 
       - name: Test relevant frontend behavior
-        run: pnpm exec vitest run tests/components/ProviderCard.copilotAccount.test.tsx tests/components/AboutSection.update.test.tsx tests/components/DatabaseUpgrade.test.tsx tests/integration/wix-update-policy.test.ts tests/components/DshAddProviderDialog.test.tsx tests/components/DshAccountCard.test.tsx tests/hooks/useAddProviderMutation.test.tsx tests/config/appSpecs.test.ts src/config/codexProviderPresets.test.ts tests/components/CodexFormFields.modelFetch.test.tsx
+        run: pnpm exec vitest run tests/components/ProviderCard.copilotAccount.test.tsx tests/components/AboutSection.update.test.tsx tests/contexts/UpdateContext.autoUpdate.test.tsx tests/components/DatabaseUpgrade.test.tsx tests/integration/wix-update-policy.test.ts tests/components/DshAddProviderDialog.test.tsx tests/components/DshAccountCard.test.tsx tests/hooks/useAddProviderMutation.test.tsx tests/config/appSpecs.test.ts tests/config/tools.test.ts src/config/codexProviderPresets.test.ts tests/components/CodexFormFields.modelFetch.test.tsx
 
       - name: Test usage, storage and updater behavior
         shell: pwsh
@@ -101,12 +101,12 @@ jobs:
             cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc --release --locked --lib --jobs 4 $filter -- --test-threads=1
             if ($LASTEXITCODE -ne 0) { throw "Rust test group failed: $filter" }
           }
-          foreach ($filter in @('guardian_', 'data_paths::tests', 'data_migration::tests', 'auto_launch::tests', 'app_update::tests', 'provider_kind::tests', 'app_specs_match_shared_fixture', 'backups_recover_after_poisoned_file_operation', 'route_mode_apps_keep_desktop_last', 'commands::settings::tests', 'commands::misc::tests', 'vision_capability_', 'copilot_catalog_uses_declared_vision_capabilities_and_infers_unknowns', 'codex_catalog_modalities_control_image_rectification')) {
+          foreach ($filter in @('guardian_', 'data_paths::tests', 'data_migration::tests', 'auto_launch::tests', 'app_update::tests', 'provider_kind::tests', 'app_specs_match_shared_fixture', 'backups_recover_after_poisoned_file_operation', 'periodic_retention_keeps_one_managed_backup', 'migration_backup_policy_preserves_only_the_v25_to_v26_exception', 'v26_skill_host_migration_preserves_existing_flags_and_rows', 'v25_startup_migrates_to_v27', 'v25_migration_failure_rolls_back', 'repo_and_skill_hosts_round_trip', 'update_skill_metadata_preserves_enabled_apps', 'route_mode_apps_keep_desktop_last', 'commands::settings::tests', 'commands::misc::tests', 'tools_match_shared_fixture', 'zcode_version_uses_latest_runtime_under_supplied_home', 'zcode_lifecycle_opens_the_official_desktop_download', 'codex_compaction_item_is_added_on_responses_but_not_on_compact', 'vision_capability_', 'copilot_catalog_uses_declared_vision_capabilities_and_infers_unknowns', 'codex_catalog_modalities_control_image_rectification')) {
             Invoke-TestGroup $filter
           }
           $env:DSH_HOME = Join-Path $env:RUNNER_TEMP 'ccswitch-test-dsh'
           $env:CC_SWITCH_TEST_HOME = Join-Path $env:RUNNER_TEMP 'ccswitch-test-home'
-          foreach ($filter in @('dsh_config::tests', 'dsh_oauth_workflow_tests')) {
+          foreach ($filter in @('dsh_config::tests', 'dsh_oauth_workflow_tests', 'proxy::dsh::tests')) {
             Invoke-TestGroup $filter
           }
 
@@ -225,8 +225,21 @@ jobs:
     needs: package
     runs-on: ubuntu-24.04
     permissions:
+      actions: read
       contents: write
     steps:
+      - name: Require successful main CI for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: WQMYH/multi-compat-cc
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_id=$(gh run list --repo "$GH_REPO" --workflow ci.yml --branch main --commit "$GITHUB_SHA" --event push --limit 1 --json databaseId,status,conclusion --jq '.[0] | select(.status == "completed" and .conclusion == "success") | .databaseId')
+          test -n "$run_id" || { echo 'Main CI has not passed for this commit.'; exit 1; }
+          gate=$(gh run view "$run_id" --repo "$GH_REPO" --json jobs --jq 'any(.jobs[]; .name == "CI gate" and .conclusion == "success")')
+          test "$gate" = true || { echo 'The main CI gate did not pass.'; exit 1; }
+
       - name: Download verified build artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -243,6 +256,7 @@ jobs:
           set -euo pipefail
           test -f release-assets/latest.json
           test -f release-assets/SHA256SUMS.txt
+          test "$RELEASE_TAG" = "v$(jq -r '.version' release-assets/latest.json)" || { echo 'Tag and package version differ.'; exit 1; }
           gh release create "$RELEASE_TAG" release-assets/* \
             --repo "$GH_REPO" --verify-tag \
             --title "CC Switch $RELEASE_TAG" \

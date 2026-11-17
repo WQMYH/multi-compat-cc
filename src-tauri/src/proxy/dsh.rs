@@ -310,7 +310,15 @@ async fn responses(
     request
         .extensions_mut()
         .insert(AuthorizedDshProvider(provider));
-    handlers::handle_responses_for_app(state, request, AppType::Dsh, "DSH", "dsh").await
+    handlers::handle_responses_for_app(
+        state,
+        request,
+        AppType::Dsh,
+        "DSH",
+        "dsh",
+        handlers::ResponsesEndpoint::Responses,
+    )
+    .await
 }
 
 #[cfg(test)]

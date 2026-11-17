@@ -1685,6 +1685,7 @@ mod tests {
     use super::{lock_backup_file_operations, Database, BACKUP_RETENTION_SUSPENDED};
     use crate::error::AppError;
     use crate::settings::{get_settings, update_settings, AppSettings};
+    use crate::test_support::EnvVars;
     use rusqlite::Connection;
     use serial_test::serial;
     use std::path::Path;
@@ -1730,7 +1731,7 @@ mod tests {
     }
 
     struct TestHomeGuard {
-        previous_test_home: Option<std::ffi::OsString>,
+        _env: EnvVars,
         temp_dir: tempfile::TempDir,
     }
 
@@ -1738,8 +1739,7 @@ mod tests {
         fn new() -> Self {
             BACKUP_RETENTION_SUSPENDED.store(false, Ordering::Release);
             let temp_dir = tempfile::tempdir().expect("create isolated test home");
-            let previous_test_home = std::env::var_os("CC_SWITCH_TEST_HOME");
-            std::env::set_var("CC_SWITCH_TEST_HOME", temp_dir.path());
+            let env = EnvVars::new().set("CC_SWITCH_TEST_HOME", temp_dir.path());
             // Prevent the Windows legacy-HOME fallback without mutating HOME:
             // an existing default DB keeps get_app_config_dir() anchored under
             // CC_SWITCH_TEST_HOME and makes import exercise its safety backup.
@@ -1748,7 +1748,7 @@ mod tests {
             std::fs::File::create(config_dir.join("cc-switch.db"))
                 .expect("create isolated database sentinel");
             let guard = Self {
-                previous_test_home,
+                _env: env,
                 temp_dir,
             };
             let resolved = crate::config::get_app_config_dir();
@@ -1768,10 +1768,6 @@ mod tests {
     impl Drop for TestHomeGuard {
         fn drop(&mut self) {
             BACKUP_RETENTION_SUSPENDED.store(false, Ordering::Release);
-            match self.previous_test_home.as_ref() {
-                Some(previous) => std::env::set_var("CC_SWITCH_TEST_HOME", previous),
-                None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
-            }
         }
     }
 

@@ -11,10 +11,13 @@ pub fn validate_directory(_path: &std::path::Path) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-pub use windows::{secure_directory, validate_directory};
+pub use windows::secure_directory;
+#[cfg(all(windows, test))]
+pub use windows::validate_directory;
 
 #[cfg(windows)]
 mod windows {
+    #[cfg(test)]
     use std::collections::BTreeSet;
     use std::ffi::c_void;
     use std::io;
@@ -27,17 +30,24 @@ mod windows {
     use windows_sys::Win32::Foundation::{
         CloseHandle, LocalFree, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE,
     };
+    #[cfg(test)]
+    use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        GetNamedSecurityInfoW, SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+        SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    #[cfg(test)]
+    use windows_sys::Win32::Security::{
+        GetAce, GetSecurityDescriptorControl, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
+        CONTAINER_INHERIT_ACE, INHERIT_ONLY_ACE, OBJECT_INHERIT_ACE, SE_DACL_PROTECTED,
     };
     use windows_sys::Win32::Security::{
-        GetAce, GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetTokenInformation,
-        TokenUser, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, CONTAINER_INHERIT_ACE,
-        DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE, OBJECT_INHERIT_ACE,
-        PROTECTED_DACL_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+        GetSecurityDescriptorDacl, GetTokenInformation, TokenUser, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSID, TOKEN_QUERY, TOKEN_USER,
     };
-    use windows_sys::Win32::Storage::FileSystem::{FILE_ALL_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT};
+    #[cfg(test)]
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     struct TokenHandle(HANDLE);
@@ -188,6 +198,7 @@ mod windows {
         Ok(())
     }
 
+    #[cfg(test)]
     fn directory_acl(path: &[u16]) -> io::Result<(LocalAllocation, *mut ACL, u16)> {
         let mut descriptor = null_mut();
         let mut dacl = null_mut();
@@ -221,6 +232,7 @@ mod windows {
         Ok((allocation, dacl, control))
     }
 
+    #[cfg(test)]
     fn allowed_entries(dacl: *mut ACL) -> io::Result<Vec<(String, u32, u8)>> {
         let mut entries = Vec::new();
         // GetNamedSecurityInfoW returns a valid ACL and owns all its ACE storage.
@@ -244,6 +256,7 @@ mod windows {
     }
 
     /// Check an existing root without rewriting its ACL or its children's ACLs.
+    #[cfg(test)]
     pub fn validate_directory(path: &Path) -> io::Result<()> {
         let path_wide = directory_path(path)?;
         let (_descriptor, dacl, control) = directory_acl(&path_wide)?;

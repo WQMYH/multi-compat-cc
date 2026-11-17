@@ -80,7 +80,7 @@ pub fn remove_server_from_zcode(id: &str) -> Result<(), AppError> {
 
 /// Import MCP servers from ZCode config to unified structure.
 ///
-/// Existing servers will have the ZCode app enabled without overwriting other
+/// Existing servers keep ZCode's native enabled state without overwriting other
 /// fields. Connection fields use the standard format; the embedded enabled
 /// flag is removed because CC Switch stores that state in `apps.zcode`.
 pub fn import_from_zcode(config: &mut MultiAppConfig) -> Result<usize, AppError> {
@@ -105,8 +105,8 @@ pub fn import_from_zcode(config: &mut MultiAppConfig) -> Result<usize, AppError>
         }
 
         if let Some(existing) = servers.get_mut(&id) {
-            // Existing server: enable ZCode and clean up any legacy embedded
-            // enabled flag without overwriting its other connection fields.
+            // Existing server: retain the native enabled state and clean up any
+            // legacy embedded flag without overwriting other connection fields.
             let mut server_changed = existing
                 .server
                 .as_object_mut()
@@ -120,7 +120,7 @@ pub fn import_from_zcode(config: &mut MultiAppConfig) -> Result<usize, AppError>
                 log::info!("MCP server '{id}' normalized for ZCode (enabled={zcode_enabled})");
             }
         } else {
-            // New server: default to only ZCode enabled
+            // New server: retain its ZCode state without enabling other apps.
             servers.insert(
                 id.clone(),
                 McpServer {

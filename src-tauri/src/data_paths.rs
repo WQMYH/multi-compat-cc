@@ -435,16 +435,12 @@ pub fn tauri_dir() -> PathBuf {
         .join("com.ccswitch.desktop")
 }
 
+#[cfg(windows)]
 pub fn webview_dir() -> PathBuf {
     if let Some(root) = test_root() {
         return root.join("webview2");
     }
-    #[cfg(windows)]
-    return selected_storage_roots().data.join("webview2");
-    #[cfg(not(windows))]
-    dirs::data_local_dir()
-        .unwrap_or_else(device_dir)
-        .join("com.ccswitch.desktop")
+    selected_storage_roots().data.join("webview2")
 }
 
 pub fn cache_dir() -> PathBuf {
@@ -639,6 +635,7 @@ pub fn prepare() -> io::Result<()> {
 }
 
 /// Called after single-instance ownership, before migration or persistence.
+#[cfg(windows)]
 pub fn ensure_storage_ready() -> io::Result<()> {
     #[cfg(windows)]
     {

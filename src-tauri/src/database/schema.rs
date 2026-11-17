@@ -160,7 +160,8 @@ impl Database {
             enabled_zcode BOOLEAN NOT NULL DEFAULT 0,
             installed_at INTEGER NOT NULL DEFAULT 0,
             content_hash TEXT,
-            updated_at INTEGER NOT NULL DEFAULT 0
+            updated_at INTEGER NOT NULL DEFAULT 0,
+            repo_host TEXT
         )",
             [],
         )
@@ -170,7 +171,8 @@ impl Database {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS skill_repos (
             owner TEXT NOT NULL, name TEXT NOT NULL, branch TEXT NOT NULL DEFAULT 'main',
-            enabled BOOLEAN NOT NULL DEFAULT 1, PRIMARY KEY (owner, name)
+            enabled BOOLEAN NOT NULL DEFAULT 1, host TEXT NOT NULL DEFAULT 'github.com',
+            PRIMARY KEY (owner, name)
         )",
             [],
         )
@@ -203,7 +205,7 @@ impl Database {
         //
         // 兼容旧数据库：
         // - 老版本 proxy_config 是单例表（没有 app_type 列），此时不能执行三行 seed insert；
-        // - 旧表会在 apply_schema_migrations() 中迁移为三行结构后再插入。
+        // - 旧表会在应用 Schema 迁移时转为三行结构后再插入。
         if Self::has_column(conn, "proxy_config", "app_type")? {
             conn.execute(
                 "INSERT OR IGNORE INTO proxy_config (app_type, max_retries,
@@ -498,12 +500,6 @@ impl Database {
         Ok(())
     }
 
-    /// 应用 Schema 迁移
-    pub(crate) fn apply_schema_migrations(&self) -> Result<(), AppError> {
-        let conn = lock_conn!(self.conn);
-        Self::apply_schema_migrations_on_conn(&conn)
-    }
-
     /// 在指定连接上应用 Schema 迁移
     pub(crate) fn apply_schema_migrations_on_conn(conn: &Connection) -> Result<(), AppError> {
         conn.execute("SAVEPOINT schema_migration;", [])
@@ -732,6 +728,23 @@ impl Database {
                             }
                         }
                         Self::set_user_version(conn, 26)?;
+                    }
+                    26 => {
+                        // 技能仓库支持 GitLab：仓库和已安装的技能各记一个主机。
+                        // 老行不用回填——skill_repos.host 靠列默认值就是 github.com，
+                        // skills.repo_host 为 NULL 也按 github.com 读。
+                        if Self::table_exists(conn, "skill_repos")? {
+                            Self::add_column_if_missing(
+                                conn,
+                                "skill_repos",
+                                "host",
+                                "TEXT NOT NULL DEFAULT 'github.com'",
+                            )?;
+                        }
+                        if Self::table_exists(conn, "skills")? {
+                            Self::add_column_if_missing(conn, "skills", "repo_host", "TEXT")?;
+                        }
+                        Self::set_user_version(conn, 27)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -2825,6 +2838,9 @@ impl Database {
                 "0",
             ),
             // Qwen 系列 (阿里巴巴)
+            // 2026-11-16：https://www.qwencloud.com/models/qwen4-max（新加坡，USD/百万 token）；
+            // 无阶梯，思考/非思考同价；缓存写入取默认 5 分钟档（1 小时档 $3）。
+            ("qwen4-max", "Qwen4 Max", "1.50", "4.50", "0.075", "1.875"),
             ("qwen3.8-max", "Qwen3.8 Max", "2", "6", "0.25", "2.50"),
             // 2026-09-06：阿里国际站价页 0.15/0.47 全区间（0<Token≤1M）平价、无阶梯；
             // 缓存两列官方只注明"非常规比例"未给数字，取 models.dev（与 qwen3.8-max 同口径）
@@ -4406,16 +4422,73 @@ mod tests {
     }
 
     #[test]
+    fn migration_backup_policy_preserves_only_the_v25_to_v26_exception() {
+        use crate::database::needs_pre_migration_backup;
+
+        assert!(!needs_pre_migration_backup(0, 27));
+        assert!(!needs_pre_migration_backup(25, 26));
+        assert!(needs_pre_migration_backup(25, 27));
+        assert!(needs_pre_migration_backup(26, 27));
+        assert!(!needs_pre_migration_backup(27, 27));
+    }
+
+    #[test]
+    fn v26_skill_host_migration_preserves_existing_flags_and_rows() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE skills (
+                 id TEXT PRIMARY KEY, enabled_zcode BOOLEAN NOT NULL DEFAULT 0,
+                 enabled_dsh BOOLEAN NOT NULL DEFAULT 0,
+                 enabled_workbuddy BOOLEAN NOT NULL DEFAULT 0, marker TEXT NOT NULL
+             );
+             INSERT INTO skills VALUES ('kept-skill', 1, 1, 0, 'keep-me');
+             CREATE TABLE skill_repos (
+                 owner TEXT NOT NULL, name TEXT NOT NULL, branch TEXT NOT NULL DEFAULT 'main',
+                 enabled BOOLEAN NOT NULL DEFAULT 1, PRIMARY KEY (owner, name)
+             );
+             INSERT INTO skill_repos VALUES ('owner', 'repo', 'main', 1);",
+        )?;
+        Database::set_user_version(&conn, 26)?;
+
+        for _ in 0..2 {
+            Database::apply_schema_migrations_on_conn(&conn)?;
+            assert_eq!(Database::get_user_version(&conn)?, 27);
+            let skill: (i64, i64, i64, String, Option<String>) = conn.query_row(
+                "SELECT enabled_zcode, enabled_dsh, enabled_workbuddy, marker, repo_host
+                 FROM skills WHERE id = 'kept-skill'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )?;
+            assert_eq!(skill, (1, 1, 0, "keep-me".into(), None));
+            let repo: (String, String, i64) = conn.query_row(
+                "SELECT host, branch, enabled FROM skill_repos WHERE owner = 'owner' AND name = 'repo'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            assert_eq!(repo, ("github.com".into(), "main".into(), 1));
+        }
+        Ok(())
+    }
+
+    #[test]
     #[serial_test::serial]
-    fn v25_startup_migrates_without_a_pre_migration_backup() -> Result<(), AppError> {
+    fn v25_startup_migrates_to_v27_with_a_pre_migration_backup() -> Result<(), AppError> {
         const FIXTURE_ENV: &str = "CC_SWITCH_TEST_V25_STARTUP_FIXTURE";
         if let Some(fixture) = std::env::var_os(FIXTURE_ENV).map(std::path::PathBuf::from) {
             let app_dir = fixture.join(".cc-switch");
             assert_eq!(crate::config::get_app_config_dir(), app_dir);
-            assert_eq!(SCHEMA_VERSION, 26);
+            assert_eq!(SCHEMA_VERSION, 27);
             let db = Database::init()?;
             let conn = lock_conn!(db.conn);
-            assert_eq!(Database::get_user_version(&conn)?, 26);
+            assert_eq!(Database::get_user_version(&conn)?, 27);
             let row = conn.query_row(
                 "SELECT id, name, server_config, enabled_copilot, enabled_workbuddy
                  FROM mcp_servers",
@@ -4431,7 +4504,17 @@ mod tests {
                 },
             )?;
             assert_eq!(row, ("v25-mcp".into(), "V25 MCP".into(), "{}".into(), 1, 0));
-            assert!(!app_dir.join("backups").exists());
+            let backups: Vec<_> = std::fs::read_dir(app_dir.join("backups"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "db"))
+                .collect();
+            assert_eq!(backups.len(), 1);
+            let backup = Connection::open_with_flags(
+                &backups[0],
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            assert_eq!(Database::get_user_version(&backup)?, 25);
             return Ok(());
         }
 
@@ -4440,13 +4523,15 @@ mod tests {
         std::fs::create_dir(&app_dir).unwrap();
         let conn = Connection::open(app_dir.join("cc-switch.db"))?;
         // Start in INCREMENTAL mode so this test isolates the pre-migration backup.
+        conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")?;
+        Database::create_tables_on_conn(&conn)?;
         conn.execute_batch(
-            "PRAGMA auto_vacuum = INCREMENTAL;
-             CREATE TABLE mcp_servers (
-                 id TEXT PRIMARY KEY, name TEXT NOT NULL, server_config TEXT NOT NULL,
-                 enabled_copilot BOOLEAN NOT NULL DEFAULT 0
-             );
-             INSERT INTO mcp_servers VALUES ('v25-mcp', 'V25 MCP', '{}', 1);",
+            "ALTER TABLE mcp_servers DROP COLUMN enabled_workbuddy;
+             ALTER TABLE skills DROP COLUMN enabled_workbuddy;
+             ALTER TABLE skills DROP COLUMN repo_host;
+             ALTER TABLE skill_repos DROP COLUMN host;
+             INSERT INTO mcp_servers (id, name, server_config, enabled_copilot)
+             VALUES ('v25-mcp', 'V25 MCP', '{}', 1);",
         )?;
         Database::set_user_version(&conn, 25)?;
         drop(conn);
@@ -4454,7 +4539,7 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "database::schema::tests::v25_startup_migrates_without_a_pre_migration_backup",
+                "database::schema::tests::v25_startup_migrates_to_v27_with_a_pre_migration_backup",
                 "--nocapture",
             ])
             .env(FIXTURE_ENV, fixture.path())
@@ -4538,17 +4623,17 @@ mod tests {
         )?;
         Database::set_user_version(&conn, 25)?;
 
-        let version_26_written = Arc::new(AtomicBool::new(false));
-        let observed_version = Arc::clone(&version_26_written);
+        let version_27_written = Arc::new(AtomicBool::new(false));
+        let observed_version = Arc::clone(&version_27_written);
         conn.authorizer(Some(move |context: AuthContext<'_>| match context.action {
             AuthAction::Pragma {
                 pragma_name: "user_version",
-                pragma_value: Some("26"),
+                pragma_value: Some("27"),
             } => {
                 observed_version.store(true, Ordering::Relaxed);
                 Authorization::Allow
             }
-            // Deny the additive repair that runs after setting user_version to 26.
+            // Deny the additive repair that runs after setting user_version to 27.
             AuthAction::AlterTable { .. } if observed_version.load(Ordering::Relaxed) => {
                 Authorization::Deny
             }
@@ -4558,7 +4643,7 @@ mod tests {
             .expect_err("the post-version repair must fail");
         conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
 
-        assert!(version_26_written.load(Ordering::Relaxed));
+        assert!(version_27_written.load(Ordering::Relaxed));
         assert!(error.to_string().contains("enabled_kimi"), "{error}");
         assert!(conn.is_autocommit(), "the migration savepoint was released");
         assert_eq!(Database::get_user_version(&conn)?, 25);
@@ -4566,6 +4651,7 @@ mod tests {
             assert!(!Database::has_column(&conn, table, "enabled_workbuddy")?);
             assert!(!Database::has_column(&conn, table, "enabled_dsh")?);
         }
+        assert!(!Database::has_column(&conn, "skills", "repo_host")?);
         let mcp: (String, i32) =
             conn.query_row("SELECT id, enabled_copilot FROM mcp_servers", [], |row| {
                 Ok((row.get(0)?, row.get(1)?))
@@ -4578,7 +4664,7 @@ mod tests {
         assert_eq!(skill, ("s".into(), 1));
 
         Database::apply_schema_migrations_on_conn(&conn)?;
-        assert_eq!(Database::get_user_version(&conn)?, 26);
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
         assert!(Database::has_column(
             &conn,
             "mcp_servers",

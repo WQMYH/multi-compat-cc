@@ -11,18 +11,18 @@ fn quote_windows_argument(value: &str) -> String {
         match character {
             '\\' => backslashes += 1,
             '"' => {
-                result.extend(std::iter::repeat('\\').take(backslashes * 2 + 1));
+                result.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
                 result.push('"');
                 backslashes = 0;
             }
             _ => {
-                result.extend(std::iter::repeat('\\').take(backslashes));
+                result.extend(std::iter::repeat_n('\\', backslashes));
                 result.push(character);
                 backslashes = 0;
             }
         }
     }
-    result.extend(std::iter::repeat('\\').take(backslashes * 2));
+    result.extend(std::iter::repeat_n('\\', backslashes * 2));
     result.push('"');
     result
 }
@@ -109,14 +109,6 @@ pub fn disable_auto_launch() -> Result<(), AppError> {
         .map_err(|e| AppError::Message(format!("禁用开机自启失败: {e}")))?;
     log::info!("已禁用开机自启");
     Ok(())
-}
-
-/// 检查是否已启用开机自启
-pub fn is_auto_launch_enabled() -> Result<bool, AppError> {
-    let auto_launch = get_auto_launch()?;
-    auto_launch
-        .is_enabled()
-        .map_err(|e| AppError::Message(format!("检查开机自启状态失败: {e}")))
 }
 
 #[cfg(test)]

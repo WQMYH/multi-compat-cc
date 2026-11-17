@@ -51,7 +51,13 @@ use std::sync::{Mutex, MutexGuard};
 
 /// 当前 Schema 版本号
 /// 每次修改表结构时递增，并在 schema.rs 中添加相应的迁移逻辑
-pub(crate) const SCHEMA_VERSION: i32 = 26;
+pub(crate) const SCHEMA_VERSION: i32 = 27;
+
+/// The user's one-time exception applied only to the additive v25 → v26
+/// migration. Later migrations retain the normal, single-snapshot policy.
+fn needs_pre_migration_backup(current: i32, target: i32) -> bool {
+    current > 0 && current < target && (current, target) != (25, 26)
+}
 
 /// 安全地序列化 JSON，避免 unwrap panic
 pub(crate) fn to_json_string<T: Serialize>(value: &T) -> Result<String, AppError> {
@@ -181,12 +187,12 @@ impl Database {
             conn: Mutex::new(conn),
             log_count_cache: Mutex::new(None),
         };
-        // Skip the extra snapshot for the additive v25 → v26 migration.
+        // Skip the extra snapshot only for the additive v25 → v26 migration.
         let pending_migration_backup = {
             let conn = lock_conn!(db.conn);
             let version = Self::get_user_version(&conn)?;
             drop(conn);
-            if version > 0 && version < SCHEMA_VERSION && (version, SCHEMA_VERSION) != (25, 26) {
+            if needs_pre_migration_backup(version, SCHEMA_VERSION) {
                 log::info!(
                     "Creating pre-migration database backup (v{version} → v{SCHEMA_VERSION})"
                 );
@@ -321,10 +327,6 @@ impl Database {
         conn.execute("PRAGMA foreign_keys = ON;", [])
             .map_err(|e| AppError::Database(format!("恢复 foreign_keys 失败: {e}")))?;
         Ok(true)
-    }
-
-    pub(crate) fn ensure_incremental_auto_vacuum(&self) -> Result<bool, AppError> {
-        self.ensure_incremental_auto_vacuum_inner(false)
     }
 
     fn ensure_incremental_auto_vacuum_inner(

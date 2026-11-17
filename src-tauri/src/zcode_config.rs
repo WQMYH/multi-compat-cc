@@ -42,7 +42,6 @@
 use crate::config::atomic_write_private;
 use crate::error::AppError;
 use crate::provider::{Provider, ZCodeProviderConfig};
-use crate::settings::get_zcode_override_dir;
 use indexmap::IndexMap;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -142,7 +141,9 @@ pub(crate) fn with_zcode_file_lock<T>(
 
 /// 获取 ZCode 配置根目录（`~/.zcode`），支持 settings 覆盖
 pub fn get_zcode_dir() -> PathBuf {
-    if let Some(override_dir) = get_zcode_override_dir() {
+    if let Some(override_dir) =
+        crate::settings::get_override_dir(&crate::app_config::AppType::ZCode)
+    {
         return override_dir;
     }
 

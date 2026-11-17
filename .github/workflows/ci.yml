@@ -17,13 +17,9 @@ concurrency:
   group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-env:
-  # 测试失败时有文件名和行号就够了。完整调试信息让链接变慢（Windows 尤甚）、target 和缓存变大。
-  CARGO_PROFILE_DEV_DEBUG: line-tables-only
-
 jobs:
   changes:
-    if: github.repository == 'farion1231/cc-switch'
+    if: github.repository == 'WQMYH/multi-compat-cc'
     name: Detect changed areas
     runs-on: ubuntu-latest
     permissions:
@@ -333,7 +329,7 @@ jobs:
     name: CI gate
     runs-on: ubuntu-latest
     needs: [changes, frontend, frontend-tests, backend, backend-windows-wsl2]
-    if: always() && github.repository == 'farion1231/cc-switch'
+    if: always() && github.repository == 'WQMYH/multi-compat-cc'
     permissions: {}
     steps:
       - name: Require every job to pass or be skipped

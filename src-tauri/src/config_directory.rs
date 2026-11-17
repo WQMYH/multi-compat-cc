@@ -206,11 +206,11 @@ fn desktop_dir() -> Result<PathBuf, AppError> {
             .filter(|path| local_directory_exists(path) == Some(true))
             .collect::<Vec<_>>();
         candidates.sort();
-        return Ok(candidates
+        Ok(candidates
             .into_iter()
             .next()
             .unwrap_or(exact)
-            .join("configLibrary"));
+            .join("configLibrary"))
     }
     #[cfg(not(windows))]
     crate::claude_desktop_config::get_config_library_path()

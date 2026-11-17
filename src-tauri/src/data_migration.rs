@@ -323,7 +323,7 @@ fn migrate_prompted(
         && fs::canonicalize(&source_app)? == fs::canonicalize(&source.device)?;
     let same_target = app_target == targets.device;
     let copy_known_device = !(same_target && same_source) && (same_target || same_source);
-    if !(same_target && same_source) && !copy_known_device {
+    if !(copy_known_device || same_target && same_source) {
         trees.push((&source.device, &targets.device, None, true));
     }
     trees.push((&source.tauri, &targets.tauri, Some(STORE_FILE), false));
@@ -552,7 +552,9 @@ fn store_override_matches(
     }
 }
 
-fn read_legacy_store(directory: &Path) -> io::Result<(Map<String, Value>, Option<Vec<u8>>)> {
+type LegacyStore = (Map<String, Value>, Option<Vec<u8>>);
+
+fn read_legacy_store(directory: &Path) -> io::Result<LegacyStore> {
     if metadata_if_present(directory)?.is_none() {
         return Ok((Map::new(), None));
     }

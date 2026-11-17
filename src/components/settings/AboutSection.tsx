@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  CheckCircle2,
   Download,
   ExternalLink,
   Github,
@@ -76,8 +77,14 @@ export function AboutSection({
     resetDismiss,
     isChecking,
     autoUpdateSupported,
+    autoUpdateDownloading,
+    readyUpdate,
     refreshAutoUpdate,
+    startAutoDownload,
   } = useUpdate();
+  // An externally managed EXE also lacks a matching MSI registration: its
+  // updates must be applied through the existing management workflow.
+  const manualUpdate = isPortable || !autoUpdateSupported;
 
   const handleAutoUpdateChange = useCallback(
     async (enabled: boolean) => {
@@ -88,15 +95,9 @@ export function AboutSection({
       await refreshAutoUpdate();
       // 托盘里的「重启并更新」跟着开关出现 / 消失
       providersApi.updateTrayMenu().catch(console.error);
-      if (enabled) {
-        settingsApi
-          .downloadAppUpdate()
-          .catch((error) =>
-            console.error("[AboutSection] Auto update download failed", error),
-          );
-      }
+      if (enabled && autoUpdateSupported) void startAutoDownload();
     },
-    [onAutoSave, refreshAutoUpdate],
+    [onAutoSave, refreshAutoUpdate, startAutoDownload, autoUpdateSupported],
   );
 
   useEffect(() => {
@@ -166,7 +167,7 @@ export function AboutSection({
 
   const handleCheckUpdate = useCallback(async () => {
     if (hasUpdate) {
-      if (isPortable) {
+      if (manualUpdate) {
         try {
           await settingsApi.openPortableUpdateDownload(
             updateInfo?.availableVersion ?? "",
@@ -219,7 +220,7 @@ export function AboutSection({
   }, [
     checkUpdate,
     hasUpdate,
-    isPortable,
+    manualUpdate,
     resetDismiss,
     t,
     updateInfo?.availableVersion,
@@ -260,12 +261,12 @@ export function AboutSection({
             </>
           ) : hasUpdate ? (
             <>
-              {isPortable ? (
+              {manualUpdate ? (
                 <ExternalLink className="h-3.5 w-3.5" />
               ) : (
                 <Download className="h-3.5 w-3.5" />
               )}
-              {isPortable
+              {manualUpdate
                 ? t("dbUpgrade.openReleases")
                 : t("settings.updateTo", {
                     version: updateInfo?.availableVersion ?? "",
@@ -294,6 +295,22 @@ export function AboutSection({
           </p>
           {updateInfo.notes && (
             <p className="line-clamp-3 text-fg-2">{updateInfo.notes}</p>
+          )}
+          {/* 开关开着时说明后台下载到哪一步了，不然看上去和没开一样 */}
+          {autoUpdateEnabled && autoUpdateSupported && !isPortable && (
+            <>
+              {readyUpdate?.version === updateInfo.availableVersion ? (
+                <p className="flex items-center gap-1.5 text-fg-2">
+                  <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-success-text" />
+                  {t("autoUpdate.downloadedInline")}
+                </p>
+              ) : autoUpdateDownloading ? (
+                <p className="flex items-center gap-1.5 text-fg-2">
+                  <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+                  {t("autoUpdate.downloadingInline")}
+                </p>
+              ) : null}
+            </>
           )}
         </div>
       )}
