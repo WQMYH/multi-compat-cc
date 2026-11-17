@@ -245,9 +245,19 @@ mod tests {
 
     #[test]
     fn test_crash_log_path() {
-        let path = get_crash_log_path();
-        assert!(path.ends_with("crash.log"));
-        assert!(path.to_string_lossy().contains(".cc-switch"));
+        if !crate::sync_utils::in_isolated_process("panic_hook::tests::test_crash_log_path") {
+            return;
+        }
+
+        let home = PathBuf::from(std::env::var_os("CC_SWITCH_TEST_HOME").unwrap());
+        assert_eq!(
+            get_crash_log_path(),
+            home.join(".cc-switch").join("crash.log")
+        );
+
+        let configured = home.join("selected-data").join("app");
+        init_app_config_dir(configured.clone());
+        assert_eq!(get_crash_log_path(), configured.join("crash.log"));
     }
 
     #[test]

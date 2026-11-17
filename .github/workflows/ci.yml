@@ -196,6 +196,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
 
+      # macOS /var is a symlink; backup tests reject symlinks in every ancestor.
+      - name: Use physical temporary directory on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          physical_temp="$(cd "$RUNNER_TEMP" && pwd -P)"
+          echo "TMPDIR=$physical_temp" >> "$GITHUB_ENV"
+
       # 每个测试一个进程，单测超时见 src-tauri/.config/nextest.toml。doctest 目前只有两个
       # ignored，nextest 不跑 doctest 也不漏。
       - name: Run tests
