@@ -139,7 +139,7 @@ async fn account_card_preserves_native_data_and_stores_no_route_key_in_cc() {
         .is_none());
     let saved = state
         .db
-        .get_provider_by_id("chatgpt-card", "dsh")
+        .get_provider_by_id("chatgpt-card", &AppType::Dsh)
         .unwrap()
         .unwrap();
     assert_eq!(saved.settings_config, returned.settings_config);
@@ -223,7 +223,7 @@ fn missing_authoritative_node_does_not_hide_a_conflicting_profile() {
     let state = AppState::new(Arc::new(Database::memory().unwrap()));
     let mut card = account_card();
     card.meta.as_mut().unwrap().live_config_managed = Some(true);
-    state.db.save_provider("dsh", &card).unwrap();
+    state.db.save_provider(&AppType::Dsh, &card).unwrap();
     let base = "http://127.0.0.1:15721/dsh/oauth/chatgpt-card/v1";
     let key = format!("ccsw-dsh-v1-{}", "a".repeat(64));
     let projection = super::dsh_oauth::project(&card, base, &key).unwrap();
@@ -263,7 +263,7 @@ fn missing_authoritative_node_does_not_hide_a_conflicting_profile() {
     ProviderService::remove_from_live_config(&state, AppType::Dsh, &card.id).unwrap();
     let saved = state
         .db
-        .get_provider_by_id(&card.id, "dsh")
+        .get_provider_by_id(&card.id, &AppType::Dsh)
         .unwrap()
         .unwrap();
     assert_eq!(saved.meta.unwrap().live_config_managed, Some(false));
@@ -272,7 +272,7 @@ fn missing_authoritative_node_does_not_hide_a_conflicting_profile() {
     ProviderService::delete(&state, AppType::Dsh, &card.id).unwrap();
     assert!(state
         .db
-        .get_provider_by_id(&card.id, "dsh")
+        .get_provider_by_id(&card.id, &AppType::Dsh)
         .unwrap()
         .is_none());
     assert_eq!(paths.each_ref().map(|path| fs::read(path).unwrap()), before);
@@ -315,7 +315,7 @@ fn orphaned_route_credential_is_not_imported_or_returned_as_live_settings() {
     );
     assert!(state
         .db
-        .get_provider_by_id(&card.id, "dsh")
+        .get_provider_by_id(&card.id, &AppType::Dsh)
         .unwrap()
         .is_none());
 
@@ -356,7 +356,7 @@ async fn removing_the_selected_account_revokes_the_route_but_keeps_dsh_data() {
     assert_eq!(fs::read(&web).unwrap(), before);
     let card = state
         .db
-        .get_provider_by_id("chatgpt-card", "dsh")
+        .get_provider_by_id("chatgpt-card", &AppType::Dsh)
         .unwrap()
         .unwrap();
     assert_eq!(

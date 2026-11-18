@@ -1,4 +1,5 @@
 //! ZCode's native document adapter; accounts, routing and transactions stay in CC.
+use crate::app_config::AppType;
 use crate::database::Database;
 use crate::error::AppError;
 use crate::live::engine::{digest, read_current, LiveFile};
@@ -617,7 +618,7 @@ pub(crate) async fn route_projection(
             .map_err(|_| ())
         }
         .await;
-        let current = db.get_provider_by_id(&provider.id, "zcode")?;
+        let current = db.get_provider_by_id(&provider.id, &AppType::ZCode)?;
         if current.as_ref().is_none_or(|current| {
             current.settings_config != provider.settings_config
                 || serde_json::to_value(&current.meta).ok()

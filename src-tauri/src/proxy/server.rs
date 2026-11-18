@@ -485,7 +485,7 @@ impl ProxyServer {
 
     pub async fn update_circuit_breaker_config_for_app(
         &self,
-        app_type: &str,
+        app_type: &crate::app_config::AppType,
         config: super::circuit_breaker::CircuitBreakerConfig,
     ) {
         self.state
@@ -498,6 +498,7 @@ impl ProxyServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app_config::AppType;
     use crate::provider::{Provider, ProviderMeta};
     use crate::AppError;
     use axum::http::{header, HeaderMap, StatusCode};
@@ -664,8 +665,9 @@ mod tests {
                 is_full_url: Some(full_url),
                 ..ProviderMeta::default()
             });
-            db.save_provider("codex", &provider).unwrap();
-            db.set_current_provider("codex", &provider.id).unwrap();
+            db.save_provider(&AppType::Codex, &provider).unwrap();
+            db.set_current_provider(&AppType::Codex, &provider.id)
+                .unwrap();
             let before = proxy.get_status().await.total_requests;
             let request = client
                 .post(format!(
@@ -827,9 +829,9 @@ mod tests {
                 }),
                 None,
             );
-            db.save_provider("codex", &provider)
+            db.save_provider(&AppType::Codex, &provider)
                 .expect("save pasted base URL provider");
-            db.set_current_provider("codex", &provider.id)
+            db.set_current_provider(&AppType::Codex, &provider.id)
                 .expect("select pasted base URL provider");
 
             let response = client
@@ -914,8 +916,9 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
             }),
             None,
         );
-        db.save_provider("codex", &provider).expect("save provider");
-        db.set_current_provider("codex", &provider.id)
+        db.save_provider(&AppType::Codex, &provider)
+            .expect("save provider");
+        db.set_current_provider(&AppType::Codex, &provider.id)
             .expect("select provider");
         let proxy = ProxyServer::new(
             ProxyConfig {
@@ -1039,9 +1042,9 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
             }),
             None,
         );
-        db.save_provider("codex", &provider)
+        db.save_provider(&AppType::Codex, &provider)
             .expect("save test provider");
-        db.set_current_provider("codex", &provider.id)
+        db.set_current_provider(&AppType::Codex, &provider.id)
             .expect("select test provider");
 
         let proxy = ProxyServer::new(
@@ -1127,9 +1130,9 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
             is_full_url: Some(true),
             ..ProviderMeta::default()
         });
-        db.save_provider("codex", &full_url_provider)
+        db.save_provider(&AppType::Codex, &full_url_provider)
             .expect("save full URL images provider");
-        db.set_current_provider("codex", &full_url_provider.id)
+        db.set_current_provider(&AppType::Codex, &full_url_provider.id)
             .expect("select full URL images provider");
 
         let response = client
@@ -1248,9 +1251,9 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
             }),
             None,
         );
-        db.save_provider("codex", &provider)
+        db.save_provider(&AppType::Codex, &provider)
             .expect("save test provider");
-        db.set_current_provider("codex", &provider.id)
+        db.set_current_provider(&AppType::Codex, &provider.id)
             .expect("select test provider");
 
         let proxy = ProxyServer::new(
@@ -1339,9 +1342,9 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
             is_full_url: Some(true),
             ..ProviderMeta::default()
         });
-        db.save_provider("codex", &full_url_provider)
+        db.save_provider(&AppType::Codex, &full_url_provider)
             .expect("save full URL images edit provider");
-        db.set_current_provider("codex", &full_url_provider.id)
+        db.set_current_provider(&AppType::Codex, &full_url_provider.id)
             .expect("select full URL images edit provider");
 
         let response = client
@@ -1472,9 +1475,9 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
             }),
             None,
         );
-        db.save_provider("codex", &provider)
+        db.save_provider(&AppType::Codex, &provider)
             .expect("save test provider");
-        db.set_current_provider("codex", &provider.id)
+        db.set_current_provider(&AppType::Codex, &provider.id)
             .expect("select test provider");
 
         let proxy = ProxyServer::new(
@@ -1543,9 +1546,9 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
             is_full_url: Some(true),
             ..ProviderMeta::default()
         });
-        db.save_provider("codex", &full_url_provider)
+        db.save_provider(&AppType::Codex, &full_url_provider)
             .expect("save full URL provider");
-        db.set_current_provider("codex", &full_url_provider.id)
+        db.set_current_provider(&AppType::Codex, &full_url_provider.id)
             .expect("select full URL provider");
 
         let response = client

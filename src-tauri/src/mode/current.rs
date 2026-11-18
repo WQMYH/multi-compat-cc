@@ -67,7 +67,7 @@ pub fn provider_for(
         let Some(id) = crate::services::provider::zcode_direct::direct_provider_id()? else {
             return Ok(None);
         };
-        let provider = db.get_provider_by_id(&id, app.as_str())?.or(
+        let provider = db.get_provider_by_id(&id, app)?.or(
             crate::zcode_config::get_native_official_providers()?
                 .into_iter()
                 .find(|provider| provider.id == id),
@@ -79,12 +79,9 @@ pub fn provider_for(
     let direct = crate::settings::get_effective_current_provider(db, app)?;
     if *app == AppType::ZCode {
         if let Some(id) = &direct {
-            if db
-                .get_provider_by_id(id, app.as_str())?
-                .is_some_and(|provider| {
-                    crate::services::provider::zcode_direct::needs_routing(&provider)
-                })
-            {
+            if db.get_provider_by_id(id, app)?.is_some_and(|provider| {
+                crate::services::provider::zcode_direct::needs_routing(&provider)
+            }) {
                 return Ok(None);
             }
         }
@@ -110,7 +107,7 @@ fn proxy_route_row(db: &Database, app: &AppType) -> Result<Option<Provider>, App
     let Some(route) = mode.proxy_route else {
         return Ok(None);
     };
-    let row = db.get_provider_by_id(&route, app.as_str())?;
+    let row = db.get_provider_by_id(&route, app)?;
     if row.is_none() {
         log::warn!(
             "{} 的代理路由 {route} 在数据库中不存在，按直连指针处理",
@@ -124,7 +121,7 @@ fn proxy_route_row(db: &Database, app: &AppType) -> Result<Option<Provider>, App
 pub fn direct_provider(db: &Database, app: &AppType) -> Result<Option<Provider>, AppError> {
     match provider_for(db, app, Purpose::Direct)? {
         Some(id) => {
-            let row = db.get_provider_by_id(&id, app.as_str())?;
+            let row = db.get_provider_by_id(&id, app)?;
             if row.is_none() && *app == AppType::ZCode {
                 return Ok(crate::zcode_config::get_native_official_providers()?
                     .into_iter()
@@ -144,7 +141,7 @@ pub fn local_direct_pointer(app: &AppType) -> Option<String> {
 
 /// 数据库原样保存的直连指针；只用于只读预览和原生网关的独立命名空间。
 /// 不读取本机设置或代理路由；普通应用的当前供应商仍经 `provider_for` 读取。
-pub fn stored_direct_pointer(db: &Database, app: &str) -> Result<Option<String>, AppError> {
+pub fn stored_direct_pointer(db: &Database, app: &AppType) -> Result<Option<String>, AppError> {
     db.get_current_provider(app)
 }
 

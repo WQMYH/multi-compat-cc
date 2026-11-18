@@ -263,7 +263,7 @@ fn draft_digest(provider: &Provider, account_id: &str) -> [u8; 32] {
 
 fn current_provider(db: &Database, binding: &DshOAuthRouteBinding) -> Result<Provider, ProxyError> {
     let provider = db
-        .get_provider_by_id(&binding.provider_id, AppType::Dsh.as_str())
+        .get_provider_by_id(&binding.provider_id, &AppType::Dsh)
         .map_err(|_| auth_error())?
         .ok_or_else(auth_error)?;
     if bound_account(&provider) != Some(binding.account_id.as_str())
@@ -385,7 +385,7 @@ mod tests {
         let projection = dsh_oauth::project(provider, &url, key).unwrap();
         let binding = bindings.prepare(provider, &projection).unwrap();
         provider.meta.as_mut().unwrap().live_config_managed = Some(true);
-        db.save_provider("dsh", provider).unwrap();
+        db.save_provider(&AppType::Dsh, provider).unwrap();
         bindings.activate(db, binding.clone()).unwrap();
         binding
     }
@@ -424,7 +424,7 @@ mod tests {
         let path = "/dsh/oauth/first-card/v1/responses";
         let key = new_dsh_oauth_route_key();
         let mut provider = draft("first-card", "fixture-account-one");
-        db.save_provider("dsh", &provider).unwrap();
+        db.save_provider(&AppType::Dsh, &provider).unwrap();
         assert_eq!(
             request(&mut app, path, &key, peer, "fixture-one").await,
             StatusCode::UNAUTHORIZED
@@ -464,7 +464,7 @@ mod tests {
         );
 
         provider.settings_config["models"]["fixture-two"]["reasoning"] = json!(false);
-        db.save_provider("dsh", &provider).unwrap();
+        db.save_provider(&AppType::Dsh, &provider).unwrap();
         assert!(!bindings.has_active(&db));
         assert!(!bindings.is_active(&db, &provider.id));
         assert_eq!(
@@ -507,7 +507,7 @@ mod tests {
             request(&mut app, path, &new_key, old_peer, "unlisted").await,
             StatusCode::UNAUTHORIZED
         );
-        db.delete_provider("dsh", &provider.id).unwrap();
+        db.delete_provider(&AppType::Dsh, &provider.id).unwrap();
         assert!(!bindings.has_active(&db));
         assert_eq!(
             request(&mut app, path, &new_key, peer, "unlisted").await,

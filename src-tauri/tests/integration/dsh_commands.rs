@@ -87,7 +87,7 @@ fn dsh_provider_lifecycle_preserves_native_plugins_and_reusable_profiles() {
     ProviderService::delete(&state, AppType::Dsh, "draft").unwrap();
     assert!(state
         .db
-        .get_provider_by_id("draft", "dsh")
+        .get_provider_by_id("draft", &AppType::Dsh)
         .unwrap()
         .is_none());
 }
@@ -105,7 +105,7 @@ fn dsh_provider_listing_bootstraps_official_profiles_and_preserves_legacy_rows()
         live_config_managed: Some(true),
         ..Default::default()
     });
-    state.db.save_provider("dsh", &managed).unwrap();
+    state.db.save_provider(&AppType::Dsh, &managed).unwrap();
 
     let mut current = provider("native-current:web");
     current.settings_config = json!({"nativeRef": true, "profile": "web"});
@@ -122,7 +122,7 @@ fn dsh_provider_listing_bootstraps_official_profiles_and_preserves_legacy_rows()
     toml.settings_config = json!({"config": "model = \"legacy-model\""});
     for legacy in [&mut current, &mut inventory, &mut toml] {
         legacy.meta = managed.meta.clone();
-        state.db.save_provider("dsh", legacy).unwrap();
+        state.db.save_provider(&AppType::Dsh, legacy).unwrap();
     }
 
     let listed = ProviderService::list(&state, AppType::Dsh).unwrap();
@@ -142,7 +142,7 @@ fn dsh_provider_listing_bootstraps_official_profiles_and_preserves_legacy_rows()
         assert!(!profile.contains(&legacy.id));
         let saved = state
             .db
-            .get_provider_by_id(&legacy.id, "dsh")
+            .get_provider_by_id(&legacy.id, &AppType::Dsh)
             .unwrap()
             .unwrap();
         assert_eq!(saved.settings_config, legacy.settings_config);

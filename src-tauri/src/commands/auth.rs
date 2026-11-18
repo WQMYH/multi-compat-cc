@@ -602,7 +602,7 @@ pub(crate) async fn remove_codex_oauth_account_with_switch_lock(
     let db = app_state.db.clone();
     let removed_account = account_id.to_owned();
     let dsh_cards = tauri::async_runtime::spawn_blocking(move || {
-        db.get_all_providers("dsh").map(|providers| {
+        db.get_all_providers(&AppType::Dsh).map(|providers| {
             providers
                 .into_iter()
                 .filter_map(|(id, provider)| {
