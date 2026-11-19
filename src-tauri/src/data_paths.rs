@@ -13,10 +13,21 @@ static LEGACY_WEBVIEW_DIR: OnceLock<PathBuf> = OnceLock::new();
 static STORAGE_ROOTS: OnceLock<StorageRoots> = OnceLock::new();
 
 #[cfg(windows)]
+const INSTALLATION_PATHS_FILE: &str = "cc-switch.paths.json";
+
+#[cfg(windows)]
 #[derive(Debug, Clone, Default)]
 struct StorageOptions {
     data: Option<PathBuf>,
     cache: Option<PathBuf>,
+}
+
+#[cfg(windows)]
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InstallationPaths {
+    data_dir: PathBuf,
+    cache_dir: PathBuf,
 }
 
 #[cfg(windows)]
@@ -238,19 +249,69 @@ fn parse_storage_options(args: &[OsString]) -> io::Result<StorageOptions> {
         let value = value.filter(|value| !value.is_empty()).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "数据或缓存目录参数缺少路径")
         })?;
-        let path = PathBuf::from(value);
-        if !path.is_absolute()
-            || path
-                .components()
-                .any(|part| matches!(part, std::path::Component::ParentDir))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "数据和缓存目录参数必须是绝对路径，且不能包含上级目录",
-            ));
-        }
-        *slot = Some(path);
+        *slot = Some(validate_storage_path(PathBuf::from(value))?);
     }
+    Ok(options)
+}
+
+#[cfg(windows)]
+fn validate_storage_path(path: PathBuf) -> io::Result<PathBuf> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "数据和缓存目录必须是绝对路径，且不能包含上级目录",
+        ));
+    }
+    Ok(path)
+}
+
+#[cfg(windows)]
+fn startup_storage_options(exe: &Path, args: &[OsString]) -> io::Result<StorageOptions> {
+    use std::os::windows::fs::MetadataExt;
+
+    let mut options = parse_storage_options(args)?;
+    // An explicit data root keeps its own default cache. This also allows
+    // recovery with the launcher if the installation's saved paths are invalid.
+    if options.data.is_some() {
+        return Ok(options);
+    }
+
+    let file = exe.with_file_name(INSTALLATION_PATHS_FILE);
+    let metadata = match std::fs::symlink_metadata(&file) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(options),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() || metadata.file_attributes() & 0x400 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} 必须是普通文件", file.display()),
+        ));
+    }
+    let saved: InstallationPaths = serde_json::from_slice(&std::fs::read(&file)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let data = validate_storage_path(saved.data_dir)?;
+    let cache = validate_storage_path(saved.cache_dir)?;
+    if !std::fs::metadata(&data)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("已保存的数据目录 {} 不可用：{error}", data.display()),
+            )
+        })?
+        .is_dir()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("已保存的数据路径 {} 不是目录", data.display()),
+        ));
+    }
+    options.data = Some(data);
+    options.cache = options.cache.or(Some(cache));
     Ok(options)
 }
 
@@ -287,7 +348,7 @@ fn storage_roots() -> io::Result<&'static StorageRoots> {
     }
     let exe = std::env::current_exe()?;
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    let roots = roots_from(&exe, parse_storage_options(&args)?)?;
+    let roots = roots_from(&exe, startup_storage_options(&exe, &args)?)?;
     let _ = STORAGE_ROOTS.set(roots);
     STORAGE_ROOTS
         .get()
@@ -738,7 +799,7 @@ mod tests {
     fn defaults_to_exe_directory_and_supports_explicit_independent_roots() {
         let fixture = tempfile::tempdir().unwrap();
         let exe = fixture.path().join("program").join("cc-switch.exe");
-        let defaults = roots_from(&exe, parse_storage_options(&[]).unwrap()).unwrap();
+        let defaults = roots_from(&exe, startup_storage_options(&exe, &[]).unwrap()).unwrap();
         assert_eq!(defaults.data, fixture.path().join("program").join("data"));
         assert_eq!(defaults.cache, fixture.path().join("program").join("cache"));
         assert!(!defaults.explicit_data && !defaults.explicit_cache);
@@ -787,6 +848,89 @@ mod tests {
         .unwrap();
         assert_eq!(only_data.cache, data.join("cache"));
         assert!(!only_data.explicit_cache);
+    }
+
+    #[test]
+    fn argumentless_start_uses_saved_paths_even_with_an_exe_local_database() {
+        let fixture = tempfile::tempdir().unwrap();
+        let program = fixture.path().join("program");
+        let exe = program.join("cc-switch.exe");
+        let beside_exe = program.join("data");
+        let data = fixture.path().join("adopted data");
+        let cache = fixture.path().join("adopted cache");
+        std::fs::create_dir_all(&beside_exe).unwrap();
+        std::fs::write(beside_exe.join("cc-switch.db"), b"other database").unwrap();
+        std::fs::create_dir_all(data.join("app")).unwrap();
+        std::fs::write(data.join("app").join("cc-switch.db"), b"adopted database").unwrap();
+        std::fs::write(
+            program.join(INSTALLATION_PATHS_FILE),
+            serde_json::json!({ "dataDir": data, "cacheDir": cache }).to_string(),
+        )
+        .unwrap();
+
+        let roots = roots_from(&exe, startup_storage_options(&exe, &[]).unwrap()).unwrap();
+        assert_eq!(roots.app(), data.join("app"));
+        assert_eq!(roots.cache, cache);
+        assert_eq!(
+            storage_arguments_for(&roots),
+            vec![
+                OsString::from("--data-dir"),
+                data.as_os_str().to_os_string(),
+                OsString::from("--cache-dir"),
+                cache.as_os_str().to_os_string(),
+            ]
+        );
+
+        let explicit_cache = fixture.path().join("alternate cache");
+        let only_cache = startup_storage_options(
+            &exe,
+            &[
+                OsString::from("--cache-dir"),
+                explicit_cache.as_os_str().to_os_string(),
+            ],
+        )
+        .unwrap();
+        let roots = roots_from(&exe, only_cache).unwrap();
+        assert_eq!(roots.data, data);
+        assert_eq!(roots.cache, explicit_cache);
+    }
+
+    #[test]
+    fn unavailable_saved_paths_report_an_error_and_allow_explicit_data_recovery() {
+        let fixture = tempfile::tempdir().unwrap();
+        let exe = fixture.path().join("cc-switch.exe");
+        let file = fixture.path().join(INSTALLATION_PATHS_FILE);
+        let data = fixture.path().join("explicit data");
+        std::fs::write(&file, b"invalid JSON").unwrap();
+        assert_eq!(
+            startup_storage_options(&exe, &[]).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let explicit = startup_storage_options(
+            &exe,
+            &[
+                OsString::from("--data-dir"),
+                data.as_os_str().to_os_string(),
+            ],
+        )
+        .unwrap();
+        let roots = roots_from(&exe, explicit).unwrap();
+        assert_eq!(roots.data, data);
+        assert_eq!(roots.cache, data.join("cache"));
+
+        std::fs::write(
+            &file,
+            serde_json::json!({
+                "dataDir": fixture.path().join("missing saved data"),
+                "cacheDir": fixture.path().join("saved cache"),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            startup_storage_options(&exe, &[]).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
     }
 
     #[test]
